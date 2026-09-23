@@ -82,7 +82,13 @@ Result<Engine> Engine::create(const Context& context, std::string_view peer_name
             if (SSL_set1_host(impl->ssl, name.c_str()) != 1)
                 return fail(make_error_code(Errc::configuration_error));
             ERR_clear_error();
-            if (SSL_set_tlsext_host_name(impl->ssl, name.c_str()) != 1)
+            // The convenience macro expands to a C-style cast on OpenSSL 3.0.
+            // Use its underlying control call with an explicit C++ cast so
+            // GCC's -Wold-style-cast remains enabled for our own code.
+            if (SSL_ctrl(impl->ssl,
+                         SSL_CTRL_SET_TLSEXT_HOSTNAME,
+                         TLSEXT_NAMETYPE_host_name,
+                         const_cast<char*>(name.c_str())) != 1)
                 return fail(make_error_code(Errc::configuration_error));
         }
     } else {
