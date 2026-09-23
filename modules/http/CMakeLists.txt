@@ -7,6 +7,7 @@
 add_library(continuo_http
     src/message.cpp
     src/parser.cpp
+    src/serializer.cpp
 )
 
 add_library(continuo::http ALIAS continuo_http)

@@ -44,7 +44,11 @@ namespace continuo::http {
 
 /// What the parser did, and what it wants next.
 enum class ParseStep {
-    /// Not enough bytes to make progress; read more and call again.
+    /// Genuinely out of bytes: read more from the stream and call again.
+    ///
+    /// This means *only* that. The parser advances its own state machine
+    /// internally, so receiving `need_more` while the buffer still holds a
+    /// complete message is not possible.
     need_more,
     /// Start line and headers are parsed; the head is ready to inspect.
     head,
@@ -139,14 +143,27 @@ private:
         done,
     };
 
+    /// Outcome of one internal state-machine step.
+    ///
+    /// Distinct from `ParseStep` on purpose: `advanced` means "state moved,
+    /// keep going without reading", which the public API deliberately does not
+    /// expose. Conflating it with `need_more` is what made callers read on a
+    /// buffer that already held a complete request.
+    enum class Progress {
+        need_data,
+        advanced,
+        emitted_body,
+        finished,
+    };
+
     /// Parse the request line. Returns false when more bytes are needed.
     [[nodiscard]] Result<bool> parse_start_line(Buffer& input);
     [[nodiscard]] Result<bool> parse_headers(Buffer& input);
     [[nodiscard]] Result<void> decide_framing();
     [[nodiscard]] Result<ParseStep> read_length_body(Buffer& input);
-    [[nodiscard]] Result<ParseStep> read_chunk_header(Buffer& input);
-    [[nodiscard]] Result<ParseStep> read_chunk_data(Buffer& input);
-    [[nodiscard]] Result<ParseStep> read_chunk_trailer(Buffer& input);
+    [[nodiscard]] Result<Progress> read_chunk_header(Buffer& input);
+    [[nodiscard]] Result<Progress> read_chunk_data(Buffer& input);
+    [[nodiscard]] Result<Progress> read_chunk_trailer(Buffer& input);
 
     Limits limits_{};
     State state_{State::start_line};

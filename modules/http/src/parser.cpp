@@ -251,65 +251,113 @@ Result<ParseStep> RequestParser::parse(Buffer& input) {
     }
     body_ = {};
 
-    switch (state_) {
-    case State::start_line: {
-        Result<bool> parsed = parse_start_line(input);
-        if (!parsed) {
-            return fail(parsed.error());
+    // Drive the state machine until it either produces something for the
+    // caller or genuinely runs out of bytes.
+    //
+    // This loop is the reason `need_more` means exactly one thing: "read more
+    // from the stream". An earlier version also returned it after an internal
+    // step succeeded, which left callers unable to tell "I advanced, call me
+    // again" from "I am blocked" — so a connection loop would read on a buffer
+    // that still had a complete request in it, and treat the resulting eof as
+    // a closed connection. Collapsing that ambiguity here keeps every caller
+    // from having to rediscover it.
+    for (;;) {
+        switch (state_) {
+        case State::start_line: {
+            const Result<bool> parsed = parse_start_line(input);
+            if (!parsed) {
+                return fail(parsed.error());
+            }
+            if (!*parsed) {
+                return ParseStep::need_more;
+            }
+            state_ = State::headers;
+            continue;
         }
-        if (!*parsed) {
-            return ParseStep::need_more;
+
+        case State::headers: {
+            const Result<bool> parsed = parse_headers(input);
+            if (!parsed) {
+                return fail(parsed.error());
+            }
+            if (!*parsed) {
+                return ParseStep::need_more;
+            }
+
+            const Result<void> framing = decide_framing();
+            if (!framing) {
+                return fail(framing.error());
+            }
+
+            switch (request_.body_kind) {
+            case BodyKind::none:
+                state_ = State::done;
+                break;
+            case BodyKind::length:
+                body_remaining_ = request_.content_length;
+                state_ = body_remaining_ == 0 ? State::done : State::body_length;
+                break;
+            case BodyKind::chunked:
+                state_ = State::body_chunk_header;
+                break;
+            }
+            return ParseStep::head;
         }
-        state_ = State::headers;
-        return ParseStep::need_more;
+
+        case State::body_length: {
+            const Result<ParseStep> step = read_length_body(input);
+            if (!step) {
+                return fail(step.error());
+            }
+            if (*step == ParseStep::need_more) {
+                return ParseStep::need_more;
+            }
+            return *step;
+        }
+
+        case State::body_chunk_header: {
+            const Result<Progress> step = read_chunk_header(input);
+            if (!step) {
+                return fail(step.error());
+            }
+            if (*step == Progress::need_data) {
+                return ParseStep::need_more;
+            }
+            continue;  // advanced into chunk data or the trailer section
+        }
+
+        case State::body_chunk_data: {
+            const Result<Progress> step = read_chunk_data(input);
+            if (!step) {
+                return fail(step.error());
+            }
+            if (*step == Progress::need_data) {
+                return ParseStep::need_more;
+            }
+            if (*step == Progress::emitted_body) {
+                return ParseStep::body;
+            }
+            continue;  // consumed the chunk's trailing CRLF
+        }
+
+        case State::body_chunk_trailer: {
+            const Result<Progress> step = read_chunk_trailer(input);
+            if (!step) {
+                return fail(step.error());
+            }
+            if (*step == Progress::need_data) {
+                return ParseStep::need_more;
+            }
+            if (*step == Progress::finished) {
+                return ParseStep::complete;
+            }
+            continue;  // a trailer field was recorded
+        }
+
+        case State::done:
+            return ParseStep::complete;
+        }
     }
-
-    case State::headers: {
-        Result<bool> parsed = parse_headers(input);
-        if (!parsed) {
-            return fail(parsed.error());
-        }
-        if (!*parsed) {
-            return ParseStep::need_more;
-        }
-
-        Result<void> framing = decide_framing();
-        if (!framing) {
-            return fail(framing.error());
-        }
-
-        switch (request_.body_kind) {
-        case BodyKind::none:
-            state_ = State::done;
-            break;
-        case BodyKind::length:
-            body_remaining_ = request_.content_length;
-            state_ = body_remaining_ == 0 ? State::done : State::body_length;
-            break;
-        case BodyKind::chunked:
-            state_ = State::body_chunk_header;
-            break;
-        }
-        return ParseStep::head;
-    }
-
-    case State::body_length:
-        return read_length_body(input);
-
-    case State::body_chunk_header:
-        return read_chunk_header(input);
-
-    case State::body_chunk_data:
-        return read_chunk_data(input);
-
-    case State::body_chunk_trailer:
-        return read_chunk_trailer(input);
-
-    case State::done:
-        return ParseStep::complete;
-    }
-
-    return fail(ParseError::malformed_start_line);
 }
 
 Result<bool> RequestParser::parse_start_line(Buffer& input) {
@@ -561,7 +609,7 @@ Result<ParseStep> RequestParser::read_length_body(Buffer& input) {
     return ParseStep::body;
 }
 
-Result<ParseStep> RequestParser::read_chunk_header(Buffer& input) {
+Result<RequestParser::Progress> RequestParser::read_chunk_header(Buffer& input) {
     Result<std::optional<Line>> located = next_line(input.readable(), limits_.allow_bare_lf);
     if (!located) {
         return fail(located.error());
@@ -570,7 +618,7 @@ Result<ParseStep> RequestParser::read_chunk_header(Buffer& input) {
         if (input.size() > limits_.max_chunk_extension + 32) {
             return fail(ParseError::limit_exceeded);
         }
-        return ParseStep::need_more;
+        return Progress::need_data;
     }
 
     const Line line = **located;
@@ -602,18 +650,18 @@ Result<ParseStep> RequestParser::read_chunk_header(Buffer& input) {
     if (*size == 0) {
         saw_last_chunk_ = true;
         state_ = State::body_chunk_trailer;
-        return ParseStep::need_more;
+        return Progress::advanced;
     }
 
     chunk_remaining_ = *size;
     state_ = State::body_chunk_data;
-    return ParseStep::need_more;
+    return Progress::advanced;
 }
 
-Result<ParseStep> RequestParser::read_chunk_data(Buffer& input) {
+Result<RequestParser::Progress> RequestParser::read_chunk_data(Buffer& input) {
     if (chunk_remaining_ > 0) {
         if (input.empty()) {
-            return ParseStep::need_more;
+            return Progress::need_data;
         }
         const std::span<const std::byte> available = input.readable();
         const std::size_t take = static_cast<std::size_t>(std::min<std::uint64_t>(
@@ -623,7 +671,7 @@ Result<ParseStep> RequestParser::read_chunk_data(Buffer& input) {
         body_seen_ += take;
         chunk_remaining_ -= take;
         pending_consume_ = take;
-        return ParseStep::body;
+        return Progress::emitted_body;
     }
 
     // Chunk data is followed by its own CRLF, which must be present.
@@ -632,17 +680,17 @@ Result<ParseStep> RequestParser::read_chunk_data(Buffer& input) {
         return fail(located.error());
     }
     if (!located->has_value()) {
-        return ParseStep::need_more;
+        return Progress::need_data;
     }
     if (!(*located)->text.empty()) {
         return fail(ParseError::malformed_chunk);
     }
     input.consume((*located)->consumed);
     state_ = State::body_chunk_header;
-    return ParseStep::need_more;
+    return Progress::advanced;
 }
 
-Result<ParseStep> RequestParser::read_chunk_trailer(Buffer& input) {
+Result<RequestParser::Progress> RequestParser::read_chunk_trailer(Buffer& input) {
     for (;;) {
         Result<std::optional<Line>> located = next_line(input.readable(), limits_.allow_bare_lf);
         if (!located) {
@@ -652,14 +700,14 @@ Result<ParseStep> RequestParser::read_chunk_trailer(Buffer& input) {
             if (input.size() > limits_.max_header_line) {
                 return fail(ParseError::limit_exceeded);
             }
-            return ParseStep::need_more;
+            return Progress::need_data;
         }
 
         const Line line = **located;
         if (line.text.empty()) {
             input.consume(line.consumed);
             state_ = State::done;
-            return ParseStep::complete;
+            return Progress::finished;
         }
 
         if (line.text.size() > limits_.max_header_line) {
@@ -686,6 +734,7 @@ Result<ParseStep> RequestParser::read_chunk_trailer(Buffer& input) {
 
         trailers_.append(std::string{name}, std::string{trim_ows(line.text.substr(colon + 1))});
         input.consume(line.consumed);
+        return Progress::advanced;
     }
 }
 
