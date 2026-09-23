@@ -14,7 +14,7 @@ worth building on top of a solid layer below.
 | Layer | Concern | status |
 |---|---|---|
 | 1 Protocol correctness | RFC 9110 semantics, reject smuggling ambiguity, no guessing on malformed input | **HTTP/1.1 parser done** |
-| 2 Transport & concurrency | transport × protocol decoupling, I/O backends, backpressure | **backends done (kqueue / epoll / IOCP); sockets reserved** |
+| 2 Transport & concurrency | transport × protocol decoupling, I/O backends, backpressure | **backends + TCP done; UDP reserved** |
 | 3 Execution model | coroutine-native API, host-owned thread policy | **done (`Task`, `Executor`, `EventLoop`)** |
 | 4 API & abstraction | streaming bodies, value-based errors, composable helpers | **done (`Result`, `Buffer`, stream concepts)** |
 | 5 Safety & robustness | TLS seam, limits closed by default, continuous fuzzing | reserved |
@@ -174,6 +174,29 @@ requirements on implementers.
 The core test suite asserts this claim in code: `write_all` drives a
 `MemoryStream` that is not a socket, unchanged.
 
+## What CI found that local testing could not
+
+Both bugs below built cleanly and passed every test on the development machine.
+Both would also have passed a Windows job that only compiled — which is the
+argument for running tests on every platform rather than building on them.
+
+1. **Winsock numbers are not Win32 numbers.** MSVC's `std::system_category()`
+   maps part of the Winsock space: `WSAEADDRINUSE` is in the table, so the
+   exclusive-bind test passed, but `WSAECONNREFUSED` is not. A refused
+   connection therefore compared equal to `std::errc::connection_refused` on
+   POSIX and to nothing at all on Windows. Fixed by `continuo::socket_error`,
+   which translates the Winsock codes that have a portable equivalent.
+
+2. **IOCP completions report NTSTATUS — a third numbering space.**
+   `OVERLAPPED_ENTRY::Internal` holds an NTSTATUS
+   (`STATUS_CONNECTION_REFUSED` is `0xC0000236`), not a Winsock error. So
+   fixing (1) alone changed nothing: the value never reached the translation.
+   `WSAGetOverlappedResult` is the documented way back to a Winsock number.
+
+The pattern is worth naming, because it will recur: **the dangerous
+portability bug is the one where every platform builds and runs, and one of
+them silently fails to match the condition callers switch on.**
+
 ## Decisions on record
 
 | Decision | Choice | Why |
@@ -211,7 +234,17 @@ evidence.
 smuggling vectors. 119 checks, and the byte-at-a-time tests assert that network
 slicing cannot change the parse.
 
-**Deliberately absent.** Real sockets (`modules/transport`), TLS, response
-serialisation, a `Server` type, HTTP/2, cancellation tokens, and multi-threaded
-loops. The parser came before sockets because it needs none of them — it moves
-bytes, and an in-memory buffer exercises it fully.
+**v0.4 — TCP.** `Endpoint`, `Listener`, `Socket`, `connect`, and the bind
+semantics that started this project: `ListenOptions::exclusive` makes a second
+bind to a live port fail on *every* platform, because `SO_REUSEADDR` means
+"reuse a dead socket" on POSIX and "steal a live one" on Windows. The option
+exposes the intent; each backend picks whatever flag actually produces it.
+
+This milestone also proved the Windows backend for the first time. The
+event-loop tests used `socketpair()`, which Winsock lacks, so every socket case
+had been skipped there and IOCP's read/write path had never run. Loopback TCP
+runs everywhere, and it immediately found two bugs unreachable from a macOS
+machine — see "What CI found" below.
+
+**Deliberately absent.** UDP, TLS, response serialisation, a `Server` type,
+HTTP/2, cancellation tokens, and multi-threaded loops.

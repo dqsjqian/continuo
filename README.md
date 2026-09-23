@@ -6,9 +6,9 @@ ride on it.
 > *Basso continuo*: the continuously played bass line that supplies the
 > harmonic foundation a Baroque work is built over. Aria sings on top of it.
 
-**Status: v0.3 — parser lands.** Seams settled, event loop running on all three
-I/O backends, and a strict incremental HTTP/1.1 parser. No sockets and no
-`Server` type yet. See
+**Status: v0.4 — real connections.** Seams settled, event loop on all three I/O
+backends, a strict incremental HTTP/1.1 parser, and TCP transport. No TLS and
+no `Server` type yet. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the roadmap and the
 reasoning behind each decision.
 
@@ -16,7 +16,7 @@ reasoning behind each decision.
 |---|---|---|
 | macOS · iOS · BSD | kqueue | built + tested |
 | Linux · Android | epoll | built + tested in CI |
-| Windows | IOCP | built + tested in CI |
+| Windows | IOCP | built + tested in CI, real loopback TCP |
 
 One public API across all of them, because it is **completion-shaped** rather
 than readiness-shaped — the only shape that maps onto IOCP as directly as onto
@@ -93,7 +93,10 @@ modules/http/        HTTP/1.1
   include/…/message.hpp    RFC 9110 semantics — shared with h2/h3 later
   include/…/limits.hpp     bounds, closed by default
   src/parser.cpp           incremental, strict
-modules/transport/   tcp / udp / unix          (reserved slot)
+modules/transport/   TCP
+  include/…/endpoint.hpp   numeric addresses, no DNS
+  include/…/tcp.hpp        Listener / Socket / connect
+  src/socket_compat.hpp    the only OS-networking include in the module
 tools/ci/            architectural discipline scripts
 docs/ARCHITECTURE.md what "complete" means, and every decision on record
 ```
