@@ -6,8 +6,9 @@ ride on it.
 > *Basso continuo*: the continuously played bass line that supplies the
 > harmonic foundation a Baroque work is built over. Aria sings on top of it.
 
-**Status: v0.2 — the loop runs.** Seams are settled and the event loop works on
-all three I/O backends. No sockets and no HTTP parser yet. See
+**Status: v0.3 — parser lands.** Seams settled, event loop running on all three
+I/O backends, and a strict incremental HTTP/1.1 parser. No sockets and no
+`Server` type yet. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the roadmap and the
 reasoning behind each decision.
 
@@ -88,8 +89,11 @@ modules/core/        EventLoop, Buffer, Task, executor & stream seams, errors
   include/…/platform.hpp   the only file that detects a platform
   src/event_loop_posix.cpp kqueue / epoll backend
   src/event_loop_iocp.cpp  Windows backend
+modules/http/        HTTP/1.1
+  include/…/message.hpp    RFC 9110 semantics — shared with h2/h3 later
+  include/…/limits.hpp     bounds, closed by default
+  src/parser.cpp           incremental, strict
 modules/transport/   tcp / udp / unix          (reserved slot)
-modules/http/        HTTP/1.1                  (reserved slot)
 tools/ci/            architectural discipline scripts
 docs/ARCHITECTURE.md what "complete" means, and every decision on record
 ```

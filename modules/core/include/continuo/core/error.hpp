@@ -12,11 +12,14 @@
 //     so that C++20 remains a supported baseline.
 //
 // The portable subset is deliberately small: `has_value()`, `operator bool`,
-// `value()`, `error()`, `value_or()`, and construction from either a value or
-// an `Error`. Monadic helpers (`and_then`, `transform`, ...) exist only on the
-// C++23 path — CI builds both standards, so accidental use of a C++23-only
-// member on a C++20-supported path fails the build instead of the user.
+// `value()`, `error()`, `value_or()`, `operator*`, `operator->`, and
+// construction from either a value or an `Error`. Monadic helpers (`and_then`,
+// `transform`, ...) exist only on the C++23 path — CI builds both standards,
+// so accidental use of a C++23-only member on a C++20-supported path fails the
+// build instead of the user. That has already happened once, which is the
+// argument for keeping both jobs.
 
+#include <memory>
 #include <system_error>
 #include <type_traits>
 #include <utility>
@@ -162,6 +165,24 @@ public:
         requires(!std::is_void_v<T>)
     {
         return std::get<0>(storage_);
+    }
+
+    decltype(auto) operator*() &&
+        requires(!std::is_void_v<T>)
+    {
+        return std::move(std::get<0>(storage_));
+    }
+
+    auto operator->()
+        requires(!std::is_void_v<T>)
+    {
+        return std::addressof(std::get<0>(storage_));
+    }
+
+    auto operator->() const
+        requires(!std::is_void_v<T>)
+    {
+        return std::addressof(std::get<0>(storage_));
     }
 
 private:

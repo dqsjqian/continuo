@@ -58,9 +58,13 @@ endif()
 # core knows nothing about transports; transports know nothing about protocols.
 # `transport/` and `http/` are reserved slots in v0.1 and carry no code yet.
 
-add_subdirectory(modules/core)
-
 if(CONTINUO_BUILD_TESTS)
     enable_testing()
+endif()
+
+add_subdirectory(modules/core)
+add_subdirectory(modules/http)
+
+if(CONTINUO_BUILD_TESTS)
     add_subdirectory(modules/core/tests)
 endif()

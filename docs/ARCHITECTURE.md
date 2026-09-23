@@ -13,7 +13,7 @@ worth building on top of a solid layer below.
 
 | Layer | Concern | status |
 |---|---|---|
-| 1 Protocol correctness | RFC 9110 semantics, reject smuggling ambiguity, no guessing on malformed input | reserved |
+| 1 Protocol correctness | RFC 9110 semantics, reject smuggling ambiguity, no guessing on malformed input | **HTTP/1.1 parser done** |
 | 2 Transport & concurrency | transport × protocol decoupling, I/O backends, backpressure | **backends done (kqueue / epoll / IOCP); sockets reserved** |
 | 3 Execution model | coroutine-native API, host-owned thread policy | **done (`Task`, `Executor`, `EventLoop`)** |
 | 4 API & abstraction | streaming bodies, value-based errors, composable helpers | **done (`Result`, `Buffer`, stream concepts)** |
@@ -60,6 +60,37 @@ Readiness is still exposed, but fenced: `wait_readable` / `wait_writable` exist
 behind `#if CONTINUO_HAS_READINESS_API` for embedding a descriptor owned by
 another library. Code that calls them does not compile on Windows — the honest
 outcome, and better than an emulation whose semantics quietly differ.
+
+## Why HTTP/1.1 first, and not HTTP/2
+
+A fair question in 2026: HTTP/2 is 51% of requests and HTTP/1.x is 28%
+(Cloudflare Radar, mid-2026). Why build the old one?
+
+Because those percentages describe *browser* traffic, and an embeddable server
+library is mostly not talking to browsers.
+
+1. **Non-browser clients speak HTTP/1.1.** Cloudflare's own breakdown notes
+   that bots, `curl` invocations, language SDKs, CI pipelines and
+   server-to-server API calls overwhelmingly default to HTTP/1.1 — filtering
+   bots out moves HTTP/1.x from 28% to 9.7%, which is the measurement saying
+   plainly where HTTP/1.1 lives. That machine-to-machine traffic is exactly
+   what a library like this serves.
+2. **HTTP/2 in practice requires TLS.** The spec permits cleartext `h2c`, but
+   no browser implements it, so real HTTP/2 means TLS 1.2+ with ALPN
+   negotiation. "Start at HTTP/2" therefore means "build a TLS stack first" —
+   a larger project than the parser, and one that cannot be tested with a
+   string literal.
+3. **Reverse proxies terminate at the edge.** A CDN or nginx front-end speaks
+   h2/h3 to the browser and HTTP/1.1 to the origin. The origin is precisely
+   where an embedded C++ server sits.
+4. **The semantics are shared, so the work is not wasted.** RFC 9110 defines
+   HTTP semantics; RFC 9112 defines the HTTP/1.1 *syntax*. HTTP/2 (RFC 9113)
+   reuses 9110 wholesale. Everything in `message.hpp` — methods, header
+   handling, status codes, body-framing rules — is the semantic layer h2 and h3
+   also need. Only the line-oriented parser in `parser.cpp` is 1.1-specific.
+
+So the order is not nostalgia; it is dependency order. HTTP/2 lands after TLS,
+and it lands on top of the semantic layer built here.
 
 ## Layering
 
@@ -174,8 +205,13 @@ The epoll and IOCP backends are validated by CI only — no Linux or Windows
 machine was available here, and saying otherwise would be a claim without
 evidence.
 
-**Deliberately absent.** Real sockets (`modules/transport`), TLS, HTTP parsing,
-cancellation tokens, multi-threaded loops, and detached task launching. The
-loop was worth building before sockets because the I/O model dictates what a
-socket API can look like; building sockets first is how a poll loop ends up
-welded to one protocol.
+**v0.3 — the parser.** Incremental, strict HTTP/1.1 request parsing:
+`message.hpp` (the RFC 9110 semantic layer, reusable by h2/h3), `limits.hpp`
+(bounds closed by default), and a parser whose test suite is mostly published
+smuggling vectors. 119 checks, and the byte-at-a-time tests assert that network
+slicing cannot change the parse.
+
+**Deliberately absent.** Real sockets (`modules/transport`), TLS, response
+serialisation, a `Server` type, HTTP/2, cancellation tokens, and multi-threaded
+loops. The parser came before sockets because it needs none of them — it moves
+bytes, and an in-memory buffer exercises it fully.
