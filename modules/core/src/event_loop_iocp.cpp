@@ -114,6 +114,10 @@ public:
         /// the operation is submitted, and writes both endpoint addresses into
         /// a caller-supplied buffer that must stay alive until completion —
         /// hence both living here, owned by the loop.
+        /// The socket this operation was submitted on. Needed because an IOCP
+        /// completion reports an NTSTATUS, and only WSAGetOverlappedResult can
+        /// turn that back into a Winsock error number.
+        SOCKET socket{INVALID_SOCKET};
         SOCKET accepted{INVALID_SOCKET};
         SOCKET listener{INVALID_SOCKET};
         /// Two sockaddr slots plus the 16-byte padding AcceptEx demands.
@@ -196,6 +200,7 @@ public:
         }
 
         Operation* operation = acquire_operation(coroutine, result);
+        operation->socket = static_cast<SOCKET>(handle);
         operation->buffer.buf = reinterpret_cast<CHAR*>(destination.data());
         operation->buffer.len = static_cast<ULONG>(destination.size());
 
@@ -227,6 +232,7 @@ public:
         }
 
         Operation* operation = acquire_operation(coroutine, result);
+        operation->socket = static_cast<SOCKET>(handle);
         operation->buffer.buf = const_cast<CHAR*>(reinterpret_cast<const CHAR*>(source.data()));
         operation->buffer.len = static_cast<ULONG>(source.size());
 
@@ -274,6 +280,7 @@ public:
 
         Operation* operation = acquire_operation(coroutine, result);
         operation->is_accept = true;
+        operation->socket = listening;
         operation->accepted = accepted;
         operation->listener = listening;
 
@@ -332,6 +339,7 @@ public:
 
         Operation* operation = acquire_operation(coroutine, result);
         operation->is_connect = true;
+        operation->socket = socket;
 
         const BOOL ok = connect_ex_(socket,
                                     target,
@@ -428,6 +436,22 @@ public:
                     return fail(Errc::cancelled);
                 }
                 if (status != 0) {
+                    // `entry.Internal` is an NTSTATUS (STATUS_CONNECTION_REFUSED
+                    // is 0xC0000236), which is a third numbering space on top of
+                    // Win32 and Winsock. Only WSAGetOverlappedResult maps it back
+                    // to the Winsock number a caller can reason about — feeding
+                    // the raw NTSTATUS to system_category() produces an error
+                    // that matches no std::errc at all.
+                    DWORD ignored_bytes = 0;
+                    DWORD ignored_flags = 0;
+                    if (operation->socket != INVALID_SOCKET &&
+                        ::WSAGetOverlappedResult(operation->socket,
+                                                 &operation->overlapped,
+                                                 &ignored_bytes,
+                                                 FALSE,
+                                                 &ignored_flags) == FALSE) {
+                        return fail(socket_error(::WSAGetLastError()));
+                    }
                     return fail(std::error_code{static_cast<int>(status), std::system_category()});
                 }
                 if (operation->is_accept) {
