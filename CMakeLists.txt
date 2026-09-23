@@ -1,0 +1,66 @@
+cmake_minimum_required(VERSION 3.20)
+
+project(continuo
+    VERSION 0.1.0
+    DESCRIPTION "Coroutine-native C++20 networking library — transport, protocols, and nothing else"
+    LANGUAGES CXX
+)
+
+# ── Standard ────────────────────────────────────────────────────────────────
+#
+# C++20 is the floor and it is a real floor, not an aspiration: CI builds both
+# 20 and 23. The only standard-dependent piece is `Result<T>`, which uses
+# `std::expected` when the library provides it and a documented subset
+# otherwise (see modules/core/include/continuo/core/error.hpp).
+
+set(CMAKE_CXX_STANDARD 20 CACHE STRING "C++ standard used to build Continuo")
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+if(PROJECT_IS_TOP_LEVEL)
+    set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+endif()
+
+option(CONTINUO_BUILD_TESTS "Build Continuo tests" ${PROJECT_IS_TOP_LEVEL})
+option(CONTINUO_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
+
+# ── Warning policy ──────────────────────────────────────────────────────────
+#
+# Applied through an interface target rather than global flags so that a
+# consumer pulling Continuo in via add_subdirectory() does not inherit our
+# warning policy for their own sources.
+
+add_library(continuo_warnings INTERFACE)
+add_library(continuo::warnings ALIAS continuo_warnings)
+
+if(MSVC)
+    target_compile_options(continuo_warnings INTERFACE /W4 /permissive-)
+    if(CONTINUO_WARNINGS_AS_ERRORS)
+        target_compile_options(continuo_warnings INTERFACE /WX)
+    endif()
+else()
+    target_compile_options(continuo_warnings INTERFACE
+        -Wall -Wextra -Wpedantic
+        -Wconversion -Wsign-conversion
+        -Wshadow -Wnon-virtual-dtor -Wold-style-cast
+    )
+    if(CONTINUO_WARNINGS_AS_ERRORS)
+        target_compile_options(continuo_warnings INTERFACE -Werror)
+    endif()
+endif()
+
+# ── Modules ─────────────────────────────────────────────────────────────────
+#
+# Dependency direction is one-way and enforced by tools/ci/check_layering.py:
+#
+#   http / ws / ... (protocol)  →  tcp / udp / unix (transport)  →  core
+#
+# core knows nothing about transports; transports know nothing about protocols.
+# `transport/` and `http/` are reserved slots in v0.1 and carry no code yet.
+
+add_subdirectory(modules/core)
+
+if(CONTINUO_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(modules/core/tests)
+endif()

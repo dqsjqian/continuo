@@ -1,0 +1,16 @@
+# Build trees
+build/
+cmake-build-*/
+
+# Compiler / tooling artefacts
+compile_commands.json
+*.o
+*.a
+*.so
+*.dylib
+*.dSYM/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
