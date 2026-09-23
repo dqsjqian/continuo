@@ -64,6 +64,19 @@ enum class Errc {
 /// Failure type carried by `Result<T>`.
 using Error = std::error_code;
 
+/// Wrap a native socket error code as a portable `Error`.
+///
+/// Exists because Winsock error numbers are a *separate* namespace from Win32
+/// error numbers, and `std::system_category()` on MSVC maps only some of them.
+/// `WSAEADDRINUSE` happens to be in that table; `WSAECONNREFUSED` is not — so
+/// a refused connection compares equal to `std::errc::connection_refused` on
+/// POSIX and to nothing at all on Windows. Code that switches on error
+/// conditions would then be quietly wrong on one platform, which is the kind
+/// of difference that survives code review and fails in production.
+///
+/// On POSIX this is `errno` in the system category, unchanged.
+[[nodiscard]] Error socket_error(int native_code) noexcept;
+
 #if defined(__cpp_lib_expected) && __cpp_lib_expected >= 202202L
 
 template<typename T>

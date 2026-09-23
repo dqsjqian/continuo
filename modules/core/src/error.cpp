@@ -1,6 +1,14 @@
 #include "continuo/core/error.hpp"
 
+#include "continuo/core/platform.hpp"
+
 #include <string>
+
+#if CONTINUO_PLATFORM_WINDOWS
+// clang-format off
+    #include <winsock2.h>
+// clang-format on
+#endif
 
 namespace continuo {
 namespace {
@@ -64,6 +72,79 @@ const std::error_category& continuo_category() noexcept {
 
 std::error_code make_error_code(Errc e) noexcept {
     return {static_cast<int>(e), continuo_category()};
+}
+
+Error socket_error(int native_code) noexcept {
+#if CONTINUO_PLATFORM_WINDOWS
+    // Translate the Winsock numbers that have a portable equivalent, so that
+    // `ec == std::errc::connection_refused` means the same thing on every
+    // platform. Anything unlisted keeps its native value — losing information
+    // would be worse than an error a caller has to inspect by number.
+    switch (native_code) {
+    case WSAEINTR:
+        return std::make_error_code(std::errc::interrupted);
+    case WSAEACCES:
+        return std::make_error_code(std::errc::permission_denied);
+    case WSAEFAULT:
+        return std::make_error_code(std::errc::bad_address);
+    case WSAEINVAL:
+        return std::make_error_code(std::errc::invalid_argument);
+    case WSAEMFILE:
+        return std::make_error_code(std::errc::too_many_files_open);
+    case WSAEWOULDBLOCK:
+        return std::make_error_code(std::errc::operation_would_block);
+    case WSAEINPROGRESS:
+        return std::make_error_code(std::errc::operation_in_progress);
+    case WSAEALREADY:
+        return std::make_error_code(std::errc::connection_already_in_progress);
+    case WSAENOTSOCK:
+        return std::make_error_code(std::errc::not_a_socket);
+    case WSAEDESTADDRREQ:
+        return std::make_error_code(std::errc::destination_address_required);
+    case WSAEMSGSIZE:
+        return std::make_error_code(std::errc::message_size);
+    case WSAEPROTOTYPE:
+        return std::make_error_code(std::errc::wrong_protocol_type);
+    case WSAENOPROTOOPT:
+        return std::make_error_code(std::errc::no_protocol_option);
+    case WSAEPROTONOSUPPORT:
+        return std::make_error_code(std::errc::protocol_not_supported);
+    case WSAEOPNOTSUPP:
+        return std::make_error_code(std::errc::operation_not_supported);
+    case WSAEAFNOSUPPORT:
+        return std::make_error_code(std::errc::address_family_not_supported);
+    case WSAEADDRINUSE:
+        return std::make_error_code(std::errc::address_in_use);
+    case WSAEADDRNOTAVAIL:
+        return std::make_error_code(std::errc::address_not_available);
+    case WSAENETDOWN:
+        return std::make_error_code(std::errc::network_down);
+    case WSAENETUNREACH:
+        return std::make_error_code(std::errc::network_unreachable);
+    case WSAENETRESET:
+        return std::make_error_code(std::errc::network_reset);
+    case WSAECONNABORTED:
+        return std::make_error_code(std::errc::connection_aborted);
+    case WSAECONNRESET:
+        return std::make_error_code(std::errc::connection_reset);
+    case WSAENOBUFS:
+        return std::make_error_code(std::errc::no_buffer_space);
+    case WSAEISCONN:
+        return std::make_error_code(std::errc::already_connected);
+    case WSAENOTCONN:
+        return std::make_error_code(std::errc::not_connected);
+    case WSAETIMEDOUT:
+        return std::make_error_code(std::errc::timed_out);
+    case WSAECONNREFUSED:
+        return std::make_error_code(std::errc::connection_refused);
+    case WSAEHOSTUNREACH:
+        return std::make_error_code(std::errc::host_unreachable);
+    default:
+        return std::error_code{native_code, std::system_category()};
+    }
+#else
+    return std::error_code{native_code, std::system_category()};
+#endif
 }
 
 }  // namespace continuo

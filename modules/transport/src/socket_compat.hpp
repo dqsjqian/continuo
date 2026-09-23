@@ -45,9 +45,9 @@ inline constexpr socket_t invalid_socket = -1;
 /// Last socket error as an `std::error_code` in the system category.
 [[nodiscard]] inline Error last_socket_error() noexcept {
 #if CONTINUO_PLATFORM_WINDOWS
-    return std::error_code{::WSAGetLastError(), std::system_category()};
+    return socket_error(::WSAGetLastError());
 #else
-    return std::error_code{errno, std::system_category()};
+    return socket_error(errno);
 #endif
 }
 

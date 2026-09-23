@@ -48,7 +48,7 @@ namespace {
 }
 
 [[nodiscard]] Error last_socket_error() noexcept {
-    return std::error_code{::WSAGetLastError(), std::system_category()};
+    return socket_error(::WSAGetLastError());
 }
 
 /// Completions drained per iteration — bounded so that one busy socket cannot
