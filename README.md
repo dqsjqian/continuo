@@ -6,9 +6,10 @@ ride on it.
 > *Basso continuo*: the continuously played bass line that supplies the
 > harmonic foundation a Baroque work is built over. Aria sings on top of it.
 
-**Status: v0.4 — real connections.** Seams settled, event loop on all three I/O
-backends, a strict incremental HTTP/1.1 parser, and TCP transport. No TLS and
-no `Server` type yet. See
+**Status: v0.5 — it serves HTTP.** Event loop on all three I/O backends, TCP
+transport, a strict incremental HTTP/1.1 parser, response serialisation, and a
+connection loop. A real client gets a real response over a real socket. No TLS
+and no routing layer yet. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the roadmap and the
 reasoning behind each decision.
 
@@ -40,26 +41,35 @@ ergonomics, and an API that was coroutine-shaped from the first commit.
 ## What it looks like
 
 ```cpp
-#include <continuo/core/event_loop.hpp>
+#include <continuo/http/connection.hpp>
+#include <continuo/transport/tcp.hpp>
 
-continuo::Task<continuo::Result<void>> echo_once(continuo::EventLoop& loop,
-                                                 continuo::NativeHandle handle) {
-    std::array<std::byte, 4096> scratch{};
+using namespace continuo;
 
-    // "tell me when this read finished" — identical on kqueue, epoll, IOCP.
-    continuo::Result<std::size_t> read = co_await loop.read(handle, scratch);
-    if (!read) {
-        co_return continuo::fail(read.error());   // Errc::eof on a clean close
+Task<Result<void>> serve(tcp::Listener& listener) {
+    auto handler = [](const http::Request& request, auto& writer,
+                      std::span<const std::byte> body) -> Task<Result<void>> {
+        http::Response response;
+        response.status = 200;
+        response.headers.append("Content-Type", "text/plain");
+        co_return co_await writer.send(response, body);   // echo it back
+    };
+
+    for (;;) {
+        Result<tcp::Socket> peer = co_await listener.accept();
+        if (!peer) {
+            co_return fail(peer.error());
+        }
+        // One connection, many requests: keep-alive, pipelining, and body
+        // draining are handled by the loop, not by the handler.
+        co_await http::serve_connection(*peer, handler);
     }
-
-    co_await loop.write(handle, std::span{scratch}.first(*read));
-    co_return continuo::Result<void>{};
 }
 ```
 
 Failures are values (`Result<T>` over `std::error_code`), the host decides
-which thread resumes a coroutine (`Executor`), and a protocol written against
-the stream concepts runs over TCP, TLS, or an in-memory pipe unchanged.
+which thread resumes a coroutine (`Executor`), and `serve_connection` is
+generic over the stream — the same handler will serve TLS unchanged.
 
 ## Build
 

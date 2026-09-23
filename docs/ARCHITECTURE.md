@@ -13,7 +13,7 @@ worth building on top of a solid layer below.
 
 | Layer | Concern | status |
 |---|---|---|
-| 1 Protocol correctness | RFC 9110 semantics, reject smuggling ambiguity, no guessing on malformed input | **HTTP/1.1 parser done** |
+| 1 Protocol correctness | RFC 9110 semantics, reject smuggling ambiguity, no guessing on malformed input | **HTTP/1.1 parse + serialise + connection loop done** |
 | 2 Transport & concurrency | transport × protocol decoupling, I/O backends, backpressure | **backends + TCP done; UDP reserved** |
 | 3 Execution model | coroutine-native API, host-owned thread policy | **done (`Task`, `Executor`, `EventLoop`)** |
 | 4 API & abstraction | streaming bodies, value-based errors, composable helpers | **done (`Result`, `Buffer`, stream concepts)** |
@@ -246,5 +246,20 @@ had been skipped there and IOCP's read/write path had never run. Loopback TCP
 runs everywhere, and it immediately found two bugs unreachable from a macOS
 machine — see "What CI found" below.
 
-**Deliberately absent.** UDP, TLS, response serialisation, a `Server` type,
-HTTP/2, cancellation tokens, and multi-threaded loops.
+**v0.5 — a working server.** Response serialisation and `serve_connection`,
+generic over the stream. The stack runs end to end over a real socket. Three
+rules live in the loop rather than in handlers, because breaking any of them
+corrupts the *next* request rather than the current one: the body is always
+drained, one response per request with one framing, and a HEAD response
+carries its Content-Length but no bytes.
+
+An API defect surfaced here and is worth recording, because it is the kind
+only an integration reveals: `ParseStep::need_more` meant both "out of bytes"
+and "state advanced, call me again". A caller cannot tell those apart, so the
+connection loop read from the socket while the buffer still held a complete
+request, hit eof, and closed. The parser now advances its own state machine
+and `need_more` means exactly one thing. **A state machine must not export an
+ambiguous "try again".**
+
+**Deliberately absent.** UDP, TLS, routing, HTTP/2, cancellation tokens, and
+multi-threaded loops.
