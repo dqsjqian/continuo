@@ -2,30 +2,48 @@
 
 ## What this library is
 
-A coroutine-native networking library for C++20: a transport core, and
-protocols that ride on it. HTTP/1.1 is the first protocol, not the purpose.
+An independent, coroutine-native C++23 networking library: a transport core,
+and protocols that ride on it. HTTP is one protocol family, not the purpose.
 
-## What "complete" means here
+### Design mandate (2026-09-23)
 
-Feature lists are a poor definition of completeness for a protocol library.
-Continuo uses six layers instead, and the order matters — each one is only
-worth building on top of a solid layer below.
+- Design from networking requirements, not cpp-httplib feature parity or an
+  existing consumer's API. Neither cpp-httplib nor a host framework constrains
+  the public interface. Consumers adapt later; breaking changes are permitted.
+- C++23 is the minimum baseline. The build requires C++23 and `Result<T>`
+  aliases `std::expected<T, Error>` directly. C++20 compatibility is removed;
+  each target toolchain still needs explicit validation.
+- Prioritize explicit ownership, structured task lifetimes, cancellation and
+  deadlines, bounded buffering/backpressure, composable transports/protocols,
+  and consistent cross-platform semantics. These are acceptance criteria to
+  implement and verify, not claims that the current code already meets them.
+- Evaluate correctness, API usability, performance and resource bounds through
+  executable tests, interoperability checks and reproducible benchmarks.
+  Existing libraries are comparison evidence, not the specification.
+- Current phase develops Continuo only. Consumer migration, removal of old
+  dependencies, and public release are later phases; keep this repository
+  private for now.
 
-| Layer | Concern | status |
+## Acceptance criteria, not a completeness score
+
+The existence of a type or a passing integration test is not evidence that its
+lifetime, concurrency and resource contracts are complete. Current foundations
+and remaining acceptance work must be described separately.
+
+| Concern | Current foundation | Remaining acceptance work |
 |---|---|---|
-| 1 Protocol correctness | RFC 9110 semantics, reject smuggling ambiguity, no guessing on malformed input | **HTTP/1.1 parse + serialise + connection loop done** |
-| 2 Transport & concurrency | transport × protocol decoupling, I/O backends, backpressure | **backends + TCP done; UDP reserved** |
-| 3 Execution model | coroutine-native API, host-owned thread policy | **done (`Task`, `Executor`, `EventLoop`)** |
-| 4 API & abstraction | streaming bodies, value-based errors, composable helpers | **done (`Result`, `Buffer`, stream concepts)** |
-| 5 Safety & robustness | TLS seam, limits closed by default, continuous fuzzing | reserved |
-| 6 Engineering quality | conformance suites, interop benchmarks, ABI policy, docs | **CI across 3 backends + 4 discipline checks** |
+| Execution and ownership | Lazy, move-only `Task`, executor seam, single-threaded `EventLoop` | Structured child-task lifetimes, explicit operation/buffer ownership, safe cancellation and join/drain semantics |
+| Cancellation and deadlines | Timers and loop stop are available | Propagated cancellation and operation deadlines; deterministic outcomes for completion/close/timeout races; `stop()` is not cancellation |
+| Transport and composition | TCP and completion-shaped kqueue/epoll/IOCP implementations; stream concepts | Equivalent observable semantics across backends, verified teardown, bounded queues; datagram contracts before UDP expansion |
+| Protocols and data flow | HTTP/1.1 parser, serializer and connection loop; buffered request bodies | Protocol conformance evidence, streamed bodies, slow-consumer backpressure and bounded aggregate memory |
+| Security and robustness | Optional OpenSSL TLS stream, parser limits and negative-input tests | Lifecycle-safe TLS cancellation, broader fuzzing, failure injection and resource-exhaustion tests |
+| Engineering evidence | Desktop runtime CI and mobile cross-compilation jobs exist | C++23 baseline migration, mobile runtime evidence, reproducible interop/performance/resource measurements; no current stable ABI promise |
 
-The first principle behind layer 1 is worth stating plainly, because it drives
-API shape everywhere else: **the value of a protocol library is concentrated in
-its negative space** — the completeness with which it says *no* to malformed
-input. Continuo does not guess on a `Content-Length`/`Transfer-Encoding`
-conflict; it rejects. Limits are closed by default and opened by configuration,
-never the reverse.
+Rejecting ambiguous or malformed input is part of protocol correctness, not a
+substitute for the other contracts. The HTTP parser rejects conflicting
+`Content-Length`/`Transfer-Encoding`; parser limits do not establish bounded
+memory for every queue, task tree or complete connection. Such bounds need to
+be specified and measured end to end.
 
 ## The decision everything else follows from: completion, not readiness
 
@@ -44,13 +62,14 @@ first-class POSIX path and a Windows path nobody can reason about:
 - A **readiness-shaped** public API (`wait_readable(fd)`) cannot be implemented
   on IOCP without badly emulating it — IOCP never answers "is it ready?".
 - A **completion-shaped** public API (`read(handle, buffer)`) maps onto IOCP
-  *directly*, and is trivially emulated on a reactor: try the syscall, and on
-  `EAGAIN` wait for readiness and retry.
+  submission/completion, and onto a reactor by trying the syscall, waiting for
+  readiness on `EAGAIN`, and retrying. Cancellation, close and buffer lifetime
+  still require explicit backend-specific handling.
 
 So **the public API is completion-shaped on every platform**, and readiness is
-an implementation detail of the POSIX backends. This is the conclusion asio
-reached, and the direction io_uring has since taken Linux — a future io_uring
-backend fits this API without changing a line of it.
+an implementation detail of the POSIX backends. Future backends such as
+io_uring must satisfy the same ownership, cancellation and completion contract;
+matching the I/O shape alone does not establish substitutability.
 
 ```cpp
 std::size_t n = (co_await loop.read(handle, buffer)).value();   // all platforms
@@ -61,53 +80,46 @@ behind `#if CONTINUO_HAS_READINESS_API` for embedding a descriptor owned by
 another library. Code that calls them does not compile on Windows — the honest
 outcome, and better than an emulation whose semantics quietly differ.
 
-## Why HTTP/1.1 first, and not HTTP/2
+## HTTP/1.1 as the first protocol exercise
 
-A fair question in 2026: HTTP/2 is 51% of requests and HTTP/1.x is 28%
-(Cloudflare Radar, mid-2026). Why build the old one?
+HTTP/1.1 is a concrete way to exercise incremental parsing, short transfers,
+connection reuse and bounded request handling over the transport core. It is
+not the product boundary, and another library's HTTP feature list is not the
+acceptance plan.
 
-Because those percentages describe *browser* traffic, and an embeddable server
-library is mostly not talking to browsers.
-
-1. **Non-browser clients speak HTTP/1.1.** Cloudflare's own breakdown notes
-   that bots, `curl` invocations, language SDKs, CI pipelines and
-   server-to-server API calls overwhelmingly default to HTTP/1.1 — filtering
-   bots out moves HTTP/1.x from 28% to 9.7%, which is the measurement saying
-   plainly where HTTP/1.1 lives. That machine-to-machine traffic is exactly
-   what a library like this serves.
-2. **HTTP/2 in practice requires TLS.** The spec permits cleartext `h2c`, but
-   no browser implements it, so real HTTP/2 means TLS 1.2+ with ALPN
-   negotiation. "Start at HTTP/2" therefore means "build a TLS stack first" —
-   a larger project than the parser, and one that cannot be tested with a
-   string literal.
-3. **Reverse proxies terminate at the edge.** A CDN or nginx front-end speaks
-   h2/h3 to the browser and HTTP/1.1 to the origin. The origin is precisely
-   where an embedded C++ server sits.
-4. **The semantics are shared, so the work is not wasted.** RFC 9110 defines
-   HTTP semantics; RFC 9112 defines the HTTP/1.1 *syntax*. HTTP/2 (RFC 9113)
-   reuses 9110 wholesale. Everything in `message.hpp` — methods, header
-   handling, status codes, body-framing rules — is the semantic layer h2 and h3
-   also need. Only the line-oriented parser in `parser.cpp` is 1.1-specific.
-
-So the order is not nostalgia; it is dependency order. HTTP/2 lands after TLS,
-and it lands on top of the semantic layer built here.
+RFC 9110 supplies shared HTTP semantics; RFC 9112 defines HTTP/1.1 framing.
+Future HTTP/2 or HTTP/3 work may reuse semantic types where appropriate, but
+must define its own framing, multiplexing, flow-control and transport needs.
+In particular, HTTP/1.1 connection/body framing is not a generic HTTP contract.
+These protocols are possible extensions, not completed modules or release
+commitments. TLS integration tests are useful composition evidence, not a
+reason to postpone the core lifetime and backpressure work.
 
 ## Layering
 
 ```
-protocol   continuo::http   continuo::ws    continuo::h2   …   (each independent)
-                  │               │               │
-                  └───────────────┴───────────────┘
-                                  ↓  reads/writes through stream concepts only
-transport  continuo::tcp   continuo::udp   continuo::unix
-                                  ↓
-core       EventLoop · Buffer · Task · Executor seam · TLS seam · limits
-                                  ↓
-backend    kqueue (macOS/iOS/BSD) · epoll (Linux/Android) · IOCP (Windows)
+protocol   HTTP/1.1              future protocol modules
+                  │                    │
+                  └────────────────────┘
+                      core I/O concepts
+                  ┌───────────┴───────────┐
+adapter       optional TLS          direct transport
+                  │                       │
+transport        TCP             future datagram/local transports
+                  └───────────┬───────────┘
+core       EventLoop · Buffer · Task · Executor · errors
+                              │
+backend                kqueue · epoll · IOCP
 ```
 
-Four invariants, all enforced by `tools/ci/check_layering.py` rather than by
-convention:
+This diagram describes runtime composition, not concrete header dependencies.
+Protocols and TLS depend on core concepts; application composition connects
+TLS to a transport. Stream protocols must not assume every future transport is
+a byte stream: datagrams need their own message-boundary and truncation
+contracts. A protocol only composes with a transport whose semantics it needs.
+
+Four dependency invariants are checked by `tools/ci/check_layering.py`.
+These static checks do not prove lifetime safety or runtime substitutability:
 
 1. **Dependencies point downwards only.** `core` must not include transport or
    protocol headers; transport must not include protocol headers. Reaching *up*
@@ -130,16 +142,17 @@ time, and by the time it hurts, the fix is a rewrite.
 
 ### TCP and UDP are transport, not "more protocols"
 
-A common way to phrase the roadmap is "HTTP first, then TCP/UDP". That
-mis-files them. TCP and UDP are *transports* — the listener and connector that
-HTTP already needs in order to accept a connection at all. They are not future
-work; they are foundation work. The only open question is when they become
-public API rather than internal plumbing. DNS and QUIC, by contrast, really are
-protocols that ride on UDP.
+TCP and UDP belong to the transport layer, not a checklist of HTTP features.
+TCP currently supplies stream connections. UDP remains unimplemented and needs
+a distinct datagram contract rather than a stream-shaped wrapper. DNS and QUIC
+are examples of protocols that may use datagrams; their requirements must not
+be imposed on the TCP API or treated as existing functionality.
 
 ## Core seams
 
-Two concepts carry the whole design. Both live in `modules/core`.
+The executor and stream concepts live in `modules/core`. They establish useful
+composition seams but do not yet express the full lifetime, cancellation,
+thread-affinity and backpressure contracts below.
 
 ### `Executor` — who resumes a coroutine
 
@@ -151,10 +164,12 @@ concept Executor = requires(E& e, void (*work)()) {
 ```
 
 One function, because `post` is the smallest thing every scheduler already has.
-Continuo owns no thread policy: a GUI main loop, a per-core event loop, and a
-thread pool are all valid hosts, and none needs to know about the others.
-`co_await schedule_on(executor)` moves the rest of a coroutine onto a chosen
-executor.
+The host chooses scheduling policy; this does not make loop-bound objects
+thread-safe. `EventLoop` is single-threaded except for its documented `post()`
+and `stop()` entry points. `co_await schedule_on(executor)` schedules a
+continuation on the chosen executor; subsequent scheduling may move it again.
+Executor/loop lifetime and permitted thread transitions must be explicit before
+claiming arbitrary GUI-loop or thread-pool integration is safe.
 
 ### `AsyncStream` — what a protocol reads and writes
 
@@ -165,14 +180,39 @@ concept AsyncReadStream = requires(S& s, std::span<std::byte> d) {
 };
 ```
 
-Short-transfer semantics, matching the syscalls underneath. A protocol module
-never names a socket type, so the same parser runs over TCP, a Unix socket, a
-TLS session, or an in-memory pipe in tests. Richer operations (`write_all`,
-`read_until`) are free functions composed on the minimal contract — never new
-requirements on implementers.
+Short-transfer semantics match the underlying I/O. Protocol code depends on a
+stream contract rather than a concrete socket type; TCP, TLS and in-memory
+streams exercise this seam. Unix-domain sockets are a possible future
+transport, not an implemented capability. Richer operations can be composed
+on the minimal contract; the existing `write_all` helper is tested with a
+non-socket `MemoryStream`.
 
-The core test suite asserts this claim in code: `write_all` drives a
-`MemoryStream` that is not a socket, unchanged.
+An asynchronous byte stream is not the same as a streamed HTTP body. Request
+bodies are currently buffered before handler delivery. End-to-end streaming
+must additionally define buffer ownership, incremental consumption, early
+termination and the way slow consumers suspend producers.
+
+### Required lifetime and resource contracts
+
+These are design/acceptance requirements, not claims about the current API:
+
+- **Structured concurrency:** child operations belong to an explicit scope.
+  Leaving that scope must stop and join/drain its children before releasing
+  their coroutine frames or buffers; silently detached work is not a default.
+- **Ownership:** distinguish owned sockets, operation state and coroutine
+  frames from borrowed streams and spans. Specify the destruction order of
+  task, stream and loop, and which objects must survive kernel completion.
+- **Cancellation and deadlines:** propagate a caller's cancellation request and
+  monotonic deadline through composed I/O, including TLS. Define the outcome
+  of close/completion/cancellation/timeout races, exactly-once completion, and
+  resource reclamation. A timer API or `stop()` alone does not provide this.
+- **Backpressure:** bound outstanding operations, buffered bytes and work
+  queues; define whether reaching each limit suspends or rejects a producer.
+  Test slow peers and stalled consumers. A parser size limit or bounded TLS
+  BIO alone is not an end-to-end resource bound.
+- **Thread affinity:** identify each operation's owner executor and permitted
+  handoff points. Scheduling elsewhere must not leave callbacks able to resume
+  a destroyed task or access a loop-bound object from the wrong thread.
 
 ## What CI found that local testing could not
 
@@ -201,18 +241,59 @@ them silently fails to match the condition callers switch on.**
 
 | Decision | Choice | Why |
 |---|---|---|
-| **I/O model** | **completion-shaped public API** | The only shape that maps onto IOCP *and* reactors; see the section above |
-| Platform support | macOS, Linux, Windows, iOS, Android — all first-class | Hosts ship on all of them; a compile-only platform is not supported |
-| Readiness API | POSIX-only, behind an explicit macro | No IOCP equivalent; a fenced gap beats a misleading emulation |
-| Execution model | coroutine-native, lazy `Task<T>` | The market gap: asio predates coroutines, cpp-httplib is thread-per-connection |
-| Library form | compiled library, not header-only | 22k lines in one header costs every consumer compile time; a compiled target can carry an ABI policy |
-| Error model | `std::error_code` + `Result<T>` | Standard, interoperable; failures are values, not exceptions |
-| Standard floor | C++20, CI also builds C++23 | `std::expected` is C++23-only, so `Result<T>` has a documented C++20 subset |
-| Buffer shape | single contiguous region | HTTP/1.1 header parsing wants unbroken `memchr`; h2 framing brings its own chained type |
-| Framework coupling | zero — Aria depends on Continuo, never the reverse | Keeps the library usable by anyone; adapters live on the host side |
-| Protocol scope | transport + HTTP/1.1 solid; ws/h2/h3 are slots, not promises | Breadth without depth is how protocol libraries get unsafe |
+| **I/O model** | **completion-shaped public API** | A common operation contract for IOCP and reactor implementations |
+| Platform scope | macOS, Linux and Windows runtime targets; iOS/Android targets currently cross-compiled | Runtime correctness must be demonstrated per platform; BSD has no dedicated CI evidence |
+| Readiness API | POSIX-only, behind an explicit macro | A platform extension, not part of the portable operation contract |
+| Execution model | Coroutine-native with lazy `Task<T>` as the current foundation | Structured lifetimes and cancellation still need implementation and verification |
+| Library form | Compiled library with modular public headers | Keep implementation boundaries explicit; an ABI policy must be decided before stabilization |
+| Error model | `std::error_code` + `Result<T>` for operational failures | `Task` can still propagate body exceptions; this is not a no-exceptions guarantee |
+| Standard floor | Target C++23; current build still supports C++20 | Migrate build/toolchain and standard-library usage deliberately; no legacy-baseline compatibility mandate |
+| Buffer shape | Current `Buffer` is contiguous | Future segmented or borrowed-buffer designs need measured benefit and an explicit ownership contract |
+| Framework coupling | No host-framework dependency or old Aria API compatibility promise | Consumers adapt to the independent library after its contracts are established |
+| Protocol scope | HTTP/1.1 and optional TLS exercise the core; later protocols remain proposals | Stabilize lifecycle and resource semantics before broadening scope |
 
-## Scope so far
+## Staged acceptance
+
+Stages are gates, not completion percentages or release dates. Each gate needs
+recorded evidence identifying the tested revision, toolchains, platforms and
+configuration; the historical milestones below do not certify these gates.
+
+1. **C++23 foundation and contracts.** Move the build baseline and selected
+   standard-library facilities to C++23. Document ownership, thread affinity,
+   error and short-transfer semantics. Compile independent minimal consumers
+   without Aria or compatibility adapters.
+2. **Lifecycle and structured execution.** Implement scope-owned tasks,
+   cancellation/deadline propagation and safe join/drain. Test destruction and
+   close with pending read/write/accept/connect/timer work, nested task failure,
+   repeated cancellation and simultaneous completion. Require exactly-once
+   completion and no dangling kernel buffers, resumptions or resource leaks
+   across kqueue, epoll and IOCP, using applicable sanitizers and fault injection.
+3. **Bounded composable data flow.** Add incremental body consumption and
+   explicit producer/consumer limits. Verify short transfers, partial failures,
+   early termination and slow peers over memory streams, TCP and TLS; measure
+   peak memory and outstanding work against configured bounds. Define separate
+   datagram semantics before introducing UDP-based modules.
+4. **Cross-platform and protocol correctness.** Run protocol negative cases,
+   fuzzing and interoperability checks; test normalized error/EOF/cancel/close
+   outcomes on each desktop backend. Obtain mobile runtime evidence before
+   promoting cross-compilation to runtime support. Keep TLS/mobile/BSD gaps
+   explicit rather than borrowing another platform's results.
+5. **Performance and API validation.** Publish reproducible benchmark inputs,
+   hardware, compiler/options and limits. Measure latency distributions,
+   throughput, CPU, allocations and peak memory under steady load, overload,
+   connection churn and cancellation. Compare identical workloads with suitable
+   baselines; do not infer performance from coroutine syntax or API shape.
+   Exercise independent client/server examples and review API clarity before
+   considering stabilization or additional protocol families.
+
+Consumer migration and public release require separate approval after these
+contracts and evidence are established. This plan promises neither old Aria
+interfaces nor another library's feature parity.
+
+## Implementation history, not readiness certification
+
+The following records implementation milestones. Test counts are historical
+snapshots, not current totals or evidence of complete protocol/lifecycle safety.
 
 **v0.1 — seams.** Error model, `Task<T>`, `Buffer`, executor and stream
 concepts, warning policy, layering discipline, CI across C++20/C++23 and
@@ -223,28 +304,30 @@ completion-shaped `read`/`write`, timers, cross-thread `post`, and a
 `platform.hpp` that is the single home for platform detection. CI now builds
 and *runs* tests on all three backends, and cross-compiles for iOS and Android.
 
-Verified locally on kqueue: 118 checks across C++20, C++23, and ASan/UBSan.
-The epoll and IOCP backends are validated by CI only — no Linux or Windows
-machine was available here, and saying otherwise would be a claim without
-evidence.
+The historical local kqueue run recorded 118 checks across C++20, C++23 and
+ASan/UBSan. Desktop epoll/IOCP runtime coverage comes from CI, not that local
+run. Neither the check count nor the existence of a CI job establishes current
+revision health or full backend lifecycle correctness.
 
 **v0.3 — the parser.** Incremental, strict HTTP/1.1 request parsing:
-`message.hpp` (the RFC 9110 semantic layer, reusable by h2/h3), `limits.hpp`
-(bounds closed by default), and a parser whose test suite is mostly published
+`message.hpp` (HTTP message types, subject to review for future protocol reuse),
+`limits.hpp` (parser bounds), and a parser whose test suite is mostly published
 smuggling vectors. 119 checks, and the byte-at-a-time tests assert that network
 slicing cannot change the parse.
 
-**v0.4 — TCP.** `Endpoint`, `Listener`, `Socket`, `connect`, and the bind
-semantics that started this project: `ListenOptions::exclusive` makes a second
-bind to a live port fail on *every* platform, because `SO_REUSEADDR` means
-"reuse a dead socket" on POSIX and "steal a live one" on Windows. The option
-exposes the intent; each backend picks whatever flag actually produces it.
+**v0.4 — TCP.** `Endpoint`, `Listener`, `Socket`, `connect`, and an explicit
+exclusive-bind policy. `ListenOptions::exclusive` expresses the intent to
+reject a second bind to an occupied endpoint; each backend must implement and
+test that intent using its platform's socket options. `SO_REUSEADDR` has
+platform-specific semantics, so copying the option name is not a portable
+contract. Existing loopback tests are evidence for their tested configurations,
+not a proof covering every platform, address family and socket option mix.
 
-This milestone also proved the Windows backend for the first time. The
+This milestone first exercised the Windows socket path in these tests. The
 event-loop tests used `socketpair()`, which Winsock lacks, so every socket case
 had been skipped there and IOCP's read/write path had never run. Loopback TCP
 runs everywhere, and it immediately found two bugs unreachable from a macOS
-machine — see "What CI found" below.
+machine — see "What CI found" above.
 
 **v0.5 — a working server.** Response serialisation and `serve_connection`,
 generic over the stream. The stack runs end to end over a real socket. Three

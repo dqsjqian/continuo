@@ -17,7 +17,7 @@ target_include_directories(continuo_http PUBLIC
     $<INSTALL_INTERFACE:include>
 )
 
-target_compile_features(continuo_http PUBLIC cxx_std_20)
+target_compile_features(continuo_http PUBLIC cxx_std_23)
 target_link_libraries(continuo_http
     PUBLIC continuo::core
     PRIVATE continuo::warnings

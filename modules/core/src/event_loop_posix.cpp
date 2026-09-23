@@ -69,12 +69,19 @@ public:
     Impl& operator=(const Impl&) = delete;
 
     ~Impl() {
+        shutdown();
+        if (wake_read_ >= 0) ::close(wake_read_);
+        if (wake_write_ >= 0) ::close(wake_write_);
+    }
+
+    void shutdown() {
         // Wake everything still suspended so those coroutine frames unwind
         // rather than leak. They observe `cancelled` and are expected to
         // return promptly — the loop is already unusable by then.
-        shutting_down_.store(true, std::memory_order_release);
+        if (shutting_down_.exchange(true, std::memory_order_acq_rel)) return;
 
         std::vector<detail::VoidSuspension> orphans;
+        std::vector<std::function<void()>> discarded_work;
         {
             const std::lock_guard lock{mutex_};
             for (auto& [fd, waiters] : fd_waiters_) {
@@ -87,19 +94,12 @@ public:
             }
             fd_waiters_.clear();
             timers_.extract_all(orphans);
-            posted_.clear();
+            posted_.drain_into(discarded_work);
         }
 
         // Resume outside the lock: a resumed coroutine may call back in.
         for (const detail::VoidSuspension& orphan : orphans) {
             orphan.complete(fail(Errc::cancelled));
-        }
-
-        if (wake_read_ >= 0) {
-            ::close(wake_read_);
-        }
-        if (wake_write_ >= 0) {
-            ::close(wake_write_);
         }
     }
 
@@ -109,6 +109,7 @@ public:
     /// EAGAIN-retry loop depends on. A blocking descriptor would stall the
     /// whole loop inside a single `read()`.
     [[nodiscard]] Result<void> attach(int fd) noexcept {
+        if (shutting_down()) return fail(Errc::cancelled);
         if (fd < 0) {
             return fail(Errc::invalid_argument);
         }
@@ -123,8 +124,10 @@ public:
     }
 
     void detach(int fd) noexcept {
-        fail_waiters(fd, make_error_code(Errc::cancelled));
+        // Remove kernel interest before cancellation resumes user code, which
+        // can register another operation. Never disarm that new registration.
         (void)poller_.disarm(fd);
+        fail_waiters(fd, make_error_code(Errc::cancelled));
     }
 
     // ── suspension ──────────────────────────────────────────────────────────
@@ -170,19 +173,26 @@ public:
         return Result<void>{};
     }
 
-    void add_timer(detail::Clock::time_point deadline,
-                   std::coroutine_handle<> handle,
-                   Result<void>* result) {
+    [[nodiscard]] bool shutting_down() const noexcept {
+        return shutting_down_.load(std::memory_order_acquire);
+    }
+
+    Result<void> add_timer(detail::Clock::time_point deadline,
+                           std::coroutine_handle<> handle,
+                           Result<void>* result) {
+        if (shutting_down()) return fail(Errc::cancelled);
         {
             const std::lock_guard lock{mutex_};
             timers_.add(deadline, detail::VoidSuspension{handle, result});
         }
         wake();  // a nearer deadline may shorten the current wait
+        return Result<void>{};
     }
 
     void post(std::function<void()> work) {
         {
             const std::lock_guard lock{mutex_};
+            if (shutting_down()) return;
             posted_.push(std::move(work));
         }
         wake();
@@ -213,6 +223,7 @@ public:
     // ── driving ─────────────────────────────────────────────────────────────
 
     Result<void> run_once(Duration timeout) {
+        if (shutting_down()) return fail(Errc::cancelled);
         std::array<detail::ReadyEvent, kEventBatch> events{};
 
         int timeout_ms = 0;
@@ -373,8 +384,17 @@ private:
 
 EventLoop::EventLoop(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 EventLoop::EventLoop(EventLoop&&) noexcept = default;
-EventLoop& EventLoop::operator=(EventLoop&&) noexcept = default;
-EventLoop::~EventLoop() = default;
+EventLoop& EventLoop::operator=(EventLoop&& other) noexcept {
+    if (this != &other) {
+        if (impl_) impl_->shutdown();
+        impl_ = std::move(other.impl_);
+    }
+    return *this;
+}
+EventLoop::~EventLoop() {
+    // Complete callbacks while impl_ still refers to the live implementation.
+    if (impl_) impl_->shutdown();
+}
 
 Result<EventLoop> EventLoop::create() {
     Result<detail::Poller> poller = detail::Poller::create();
@@ -446,6 +466,7 @@ Result<void> EventLoop::run() {
 // ── portable completion API, emulated on readiness ───────────────────────────
 
 Task<Result<std::size_t>> EventLoop::read(NativeHandle handle, std::span<std::byte> destination) {
+    if (!impl_ || impl_->shutting_down()) co_return fail(Errc::cancelled);
     if (destination.empty()) {
         co_return std::size_t{0};
     }
@@ -473,6 +494,7 @@ Task<Result<std::size_t>> EventLoop::read(NativeHandle handle, std::span<std::by
 }
 
 Task<Result<std::size_t>> EventLoop::write(NativeHandle handle, std::span<const std::byte> source) {
+    if (!impl_ || impl_->shutting_down()) co_return fail(Errc::cancelled);
     if (source.empty()) {
         co_return std::size_t{0};
     }
@@ -495,6 +517,7 @@ Task<Result<std::size_t>> EventLoop::write(NativeHandle handle, std::span<const 
 }
 
 Task<Result<NativeHandle>> EventLoop::accept(NativeHandle listener, int address_family) {
+    if (!impl_ || impl_->shutting_down()) co_return fail(Errc::cancelled);
     // address_family is only needed by IOCP, which must pre-create the socket.
     // accept() reports the family itself, so POSIX ignores it.
     static_cast<void>(address_family);
@@ -531,6 +554,7 @@ Task<Result<NativeHandle>> EventLoop::accept(NativeHandle listener, int address_
 }
 
 Task<Result<void>> EventLoop::connect(NativeHandle handle, std::span<const std::byte> address) {
+    if (!impl_ || impl_->shutting_down()) co_return fail(Errc::cancelled);
     if (address.empty()) {
         co_return fail(Errc::invalid_argument);
     }
@@ -584,8 +608,7 @@ Task<Result<void>> EventLoop::wait_for(NativeHandle handle, bool writable) {
 Task<Result<void>> EventLoop::sleep_until(Clock::time_point deadline) {
     Impl* impl = impl_.get();
     auto submit = [impl, deadline](std::coroutine_handle<> coroutine, Result<void>* result) {
-        impl->add_timer(deadline, coroutine, result);
-        return Result<void>{};
+        return impl->add_timer(deadline, coroutine, result);
     };
     co_return co_await detail::OperationAwaiter<Result<void>, decltype(submit)>{submit};
 }
@@ -595,6 +618,7 @@ Task<Result<void>> EventLoop::sleep_for(Duration delay) {
 }
 
 Task<void> EventLoop::yield() {
+    if (!impl_ || impl_->shutting_down()) co_return;
     Impl* impl = impl_.get();
     auto submit = [impl](std::coroutine_handle<> coroutine, Result<void>* result) {
         impl->post([coroutine, result]() mutable {

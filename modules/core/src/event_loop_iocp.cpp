@@ -31,6 +31,7 @@
 
     #include <array>
     #include <atomic>
+    #include <exception>
     #include <memory>
     #include <mswsock.h>
     #include <mutex>
@@ -124,6 +125,7 @@ public:
         std::array<std::byte, 2 * (sizeof(SOCKADDR_STORAGE) + 16)> address_scratch{};
         bool is_accept{false};
         bool is_connect{false};
+        bool cancel_requested{false};
     };
 
     explicit Impl(HANDLE port) noexcept : port_(port) {}
@@ -131,25 +133,60 @@ public:
     Impl(const Impl&) = delete;
     Impl& operator=(const Impl&) = delete;
 
-    ~Impl() {
-        shutting_down_.store(true, std::memory_order_release);
+    ~Impl() { shutdown(); }
+
+    void shutdown() noexcept {
+        if (shutting_down_.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        stop_requested_.store(true, std::memory_order_release);
 
         std::vector<detail::VoidSuspension> orphan_timers;
         std::vector<Operation*> orphan_ops;
+        std::vector<std::function<void()>> discarded_work;
         {
             const std::lock_guard lock{mutex_};
             timers_.extract_all(orphan_timers);
-            posted_.clear();
+            posted_.drain_into(discarded_work);
             for (auto& [pointer, owned] : operations_) {
                 orphan_ops.push_back(pointer);
             }
         }
 
-        // Resume outside the lock so a resumed coroutine may call back in.
-        for (const detail::VoidSuspension& timer : orphan_timers) {
-            timer.complete(fail(Errc::cancelled));
-        }
+        // CancelIoEx 只提出取消请求；完成包到达前，内核仍可访问
+        // OVERLAPPED、AcceptEx 地址缓冲和调用方的读写缓冲。
         for (Operation* operation : orphan_ops) {
+            ::CancelIoEx(reinterpret_cast<HANDLE>(operation->socket), &operation->overlapped);
+        }
+
+        // 即使取消返回 ERROR_NOT_FOUND，操作也可能已完成但尚未出队。
+        // 排空全部 I/O 后才能释放 posted 捕获或恢复任何可能回收缓冲的协程。
+        std::size_t remaining = orphan_ops.size();
+        while (remaining != 0) {
+            DWORD transferred = 0;
+            ULONG_PTR key = 0;
+            OVERLAPPED* overlapped = nullptr;
+            const BOOL ok =
+                ::GetQueuedCompletionStatus(port_, &transferred, &key, &overlapped, INFINITE);
+            if (overlapped == nullptr) {
+                if (ok == FALSE) {
+                    // 无法确认内核已结束访问时，不能继续析构并造成 UAF。
+                    std::terminate();
+                }
+                continue;
+            }
+            if (key == kWakeupKey) {
+                continue;
+            }
+            // 失败的 I/O 同样返回非空 OVERLAPPED，必须计入已排空数量。
+            --remaining;
+        }
+
+        // 在锁外恢复；shutdown 标记阻止恢复后的协程再次提交操作。
+        for (Operation* operation : orphan_ops) {
+            if (operation->accepted != INVALID_SOCKET) {
+                ::closesocket(operation->accepted);
+            }
             if (operation->result) {
                 *operation->result = fail(Errc::cancelled);
             }
@@ -157,9 +194,13 @@ public:
             release_operation(operation);
             handle.resume();
         }
+        for (const detail::VoidSuspension& timer : orphan_timers) {
+            timer.complete(fail(Errc::cancelled));
+        }
+        discarded_work.clear();
 
         if (port_ != nullptr) {
-            ::CloseHandle(port_);
+            ::CloseHandle(std::exchange(port_, nullptr));
         }
     }
 
@@ -168,6 +209,9 @@ public:
     /// Associate the handle with the completion port. Required exactly once
     /// per handle before any overlapped operation on it.
     [[nodiscard]] Result<void> attach(NativeHandle handle) noexcept {
+        if (shutting_down_.load(std::memory_order_acquire)) {
+            return fail(Errc::cancelled);
+        }
         if (handle == invalid_handle) {
             return fail(Errc::invalid_argument);
         }
@@ -186,6 +230,14 @@ public:
         // outstanding operations is the closest equivalent, and the
         // completions still arrive (as ERROR_OPERATION_ABORTED) so no
         // operation leaks.
+        {
+            const std::lock_guard lock{mutex_};
+            for (auto& [pointer, owned] : operations_) {
+                if (owned->socket == static_cast<SOCKET>(handle)) {
+                    owned->cancel_requested = true;
+                }
+            }
+        }
         ::CancelIoEx(reinterpret_cast<HANDLE>(handle), nullptr);
     }
 
@@ -357,22 +409,30 @@ public:
         return fail(error);
     }
 
-    void add_timer(detail::Clock::time_point deadline,
-                   std::coroutine_handle<> coroutine,
-                   Result<void>* result) {
+    [[nodiscard]] Result<void> add_timer(detail::Clock::time_point deadline,
+                                         std::coroutine_handle<> coroutine,
+                                         Result<void>* result) {
         {
             const std::lock_guard lock{mutex_};
+            if (shutting_down_.load(std::memory_order_acquire)) {
+                return fail(Errc::cancelled);
+            }
             timers_.add(deadline, detail::VoidSuspension{coroutine, result});
         }
         wake();
+        return Result<void>{};
     }
 
-    void post(std::function<void()> work) {
+    [[nodiscard]] Result<void> post(std::function<void()> work) {
         {
             const std::lock_guard lock{mutex_};
+            if (shutting_down_.load(std::memory_order_acquire)) {
+                return fail(Errc::cancelled);
+            }
             posted_.push(std::move(work));
         }
         wake();
+        return Result<void>{};
     }
 
     void stop() {
@@ -392,6 +452,9 @@ public:
     // ── driving ─────────────────────────────────────────────────────────────
 
     Result<void> run_once(Duration timeout) {
+        if (shutting_down_.load(std::memory_order_acquire)) {
+            return fail(Errc::cancelled);
+        }
         std::array<OVERLAPPED_ENTRY, kEventBatch> entries{};
 
         int timeout_ms = 0;
@@ -432,7 +495,9 @@ public:
             const DWORD transferred = entry.dwNumberOfBytesTransferred;
 
             Result<std::size_t> outcome = [&]() -> Result<std::size_t> {
-                if (status == ERROR_OPERATION_ABORTED) {
+                // detach may have closed the socket before its completion
+                // arrived. Do not query Winsock with a stale/reused handle.
+                if (operation->cancel_requested) {
                     return fail(Errc::cancelled);
                 }
                 if (status != 0) {
@@ -573,8 +638,22 @@ private:
 
 EventLoop::EventLoop(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 EventLoop::EventLoop(EventLoop&&) noexcept = default;
-EventLoop& EventLoop::operator=(EventLoop&&) noexcept = default;
-EventLoop::~EventLoop() = default;
+EventLoop& EventLoop::operator=(EventLoop&& other) noexcept {
+    if (this != &other) {
+        if (impl_) {
+            impl_->shutdown();
+        }
+        impl_ = std::move(other.impl_);
+    }
+    return *this;
+}
+EventLoop::~EventLoop() {
+    // 恢复回调可能经由 socket.close() 再调用 loop.detach()；
+    // 必须在 unique_ptr 开始销毁并清空 impl_ 之前完成 shutdown。
+    if (impl_) {
+        impl_->shutdown();
+    }
+}
 
 Result<EventLoop> EventLoop::create() {
     Result<void> winsock = ensure_winsock();
@@ -597,7 +676,7 @@ void EventLoop::detach(NativeHandle handle) {
 }
 
 void EventLoop::post(std::function<void()> work) {
-    impl_->post(std::move(work));
+    (void)impl_->post(std::move(work));
 }
 void EventLoop::stop() {
     impl_->stop();
@@ -664,6 +743,7 @@ Task<Result<NativeHandle>> EventLoop::accept(NativeHandle listener, int address_
     }
     Result<void> attached = impl->attach(static_cast<NativeHandle>(*accepted));
     if (!attached) {
+        ::closesocket(static_cast<SOCKET>(*accepted));
         co_return fail(attached.error());
     }
     co_return static_cast<NativeHandle>(*accepted);
@@ -699,8 +779,7 @@ Task<Result<void>> EventLoop::wait_for(NativeHandle, bool) {
 Task<Result<void>> EventLoop::sleep_until(Clock::time_point deadline) {
     Impl* impl = impl_.get();
     auto submit = [impl, deadline](std::coroutine_handle<> coroutine, Result<void>* result) {
-        impl->add_timer(deadline, coroutine, result);
-        return Result<void>{};
+        return impl->add_timer(deadline, coroutine, result);
     };
     co_return co_await detail::OperationAwaiter<Result<void>, decltype(submit)>{submit};
 }
@@ -712,13 +791,12 @@ Task<Result<void>> EventLoop::sleep_for(Duration delay) {
 Task<void> EventLoop::yield() {
     Impl* impl = impl_.get();
     auto submit = [impl](std::coroutine_handle<> coroutine, Result<void>* result) {
-        impl->post([coroutine, result]() mutable {
+        return impl->post([coroutine, result]() mutable {
             if (result) {
                 *result = Result<void>{};
             }
             coroutine.resume();
         });
-        return Result<void>{};
     };
     (void)co_await detail::OperationAwaiter<Result<void>, decltype(submit)>{submit};
     co_return;

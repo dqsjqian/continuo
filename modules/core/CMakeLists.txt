@@ -52,7 +52,7 @@ target_include_directories(continuo_core PUBLIC
 # only — implementation detail, not part of the installed surface.
 target_include_directories(continuo_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-target_compile_features(continuo_core PUBLIC cxx_std_20)
+target_compile_features(continuo_core PUBLIC cxx_std_23)
 target_link_libraries(continuo_core PRIVATE continuo::warnings)
 
 find_package(Threads REQUIRED)

@@ -65,15 +65,15 @@ void Socket::close() noexcept {
     if (handle_ == invalid_handle) {
         return;
     }
-    // Detach before closing: the loop may still hold registrations, and
-    // cancelling them after the descriptor number is reusable risks acting on
-    // whatever reuses it.
-    if (loop_ != nullptr) {
-        loop_->detach(handle_);
+    // Publish the closed state before detach can resume user code. A resumed
+    // cancellation handler may close (or destroy) this wrapper reentrantly.
+    const NativeHandle handle = std::exchange(handle_, invalid_handle);
+    EventLoop* loop = std::exchange(loop_, nullptr);
+    if (loop != nullptr) {
+        loop->detach(handle);
     }
-    detail::close_socket(static_cast<detail::socket_t>(handle_));
-    handle_ = invalid_handle;
-    loop_ = nullptr;
+    // No access to this after resuming user code.
+    detail::close_socket(static_cast<detail::socket_t>(handle));
 }
 
 // ── Listener ─────────────────────────────────────────────────────────────────
@@ -148,18 +148,25 @@ Task<Result<Socket>> Listener::accept() {
         co_return fail(Errc::invalid_argument);
     }
 
-    Result<NativeHandle> accepted = co_await loop_->accept(handle_, local_.native_family());
+    EventLoop* loop = loop_;
+    const NativeHandle listening = handle_;
+    const bool no_delay = options_.no_delay;
+    Result<NativeHandle> accepted = co_await loop->accept(listening, local_.native_family());
     if (!accepted) {
         co_return fail(accepted.error());
     }
 
-    Socket socket{*loop_, *accepted};
+    Socket socket{*loop, *accepted};
+    // Completion may already have been queued when close requested cancellation.
+    if (handle_ != listening || loop_ != loop) {
+        co_return fail(Errc::cancelled);
+    }
 
     // Per-connection options are applied here rather than inherited: Windows
     // does not propagate all listener options to accepted sockets, so relying
     // on inheritance would work on POSIX and quietly differ on Windows.
     Result<void> nodelay =
-        detail::apply_no_delay(static_cast<detail::socket_t>(*accepted), options_.no_delay);
+        detail::apply_no_delay(static_cast<detail::socket_t>(*accepted), no_delay);
     if (!nodelay) {
         co_return fail(nodelay.error());
     }
@@ -171,12 +178,12 @@ void Listener::close() noexcept {
     if (handle_ == invalid_handle) {
         return;
     }
-    if (loop_ != nullptr) {
-        loop_->detach(handle_);
+    const NativeHandle handle = std::exchange(handle_, invalid_handle);
+    EventLoop* loop = std::exchange(loop_, nullptr);
+    if (loop != nullptr) {
+        loop->detach(handle);
     }
-    detail::close_socket(static_cast<detail::socket_t>(handle_));
-    handle_ = invalid_handle;
-    loop_ = nullptr;
+    detail::close_socket(static_cast<detail::socket_t>(handle));
 }
 
 // ── connect ──────────────────────────────────────────────────────────────────

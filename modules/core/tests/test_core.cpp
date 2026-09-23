@@ -38,6 +38,8 @@ std::string to_string(std::span<const std::byte> bytes) {
 
 void test_error_model() {
     test::section("error model");
+    static_assert(std::is_same_v<Result<int>, std::expected<int, Error>>);
+    static_assert(std::is_same_v<Result<void>, std::expected<void, Error>>);
 
     const Error eof = make_error_code(Errc::eof);
     CHECK(eof.category() == continuo_category());

@@ -45,6 +45,11 @@ public:
     EventLoop& operator=(EventLoop&&) noexcept;
     EventLoop(const EventLoop&) = delete;
     EventLoop& operator=(const EventLoop&) = delete;
+    /// Destroy only after the run thread is stopped. Outstanding I/O is
+    /// cancelled and, on IOCP, drained before buffers/operations are released.
+    /// Pending coroutine frames and borrowed buffers must remain alive until
+    /// cancellation resumes them. This is not permission to destroy a pending
+    /// Task independently. Do not move a loop while transports refer to it.
     ~EventLoop();
 
     // ── portable I/O (completion-shaped) ────────────────────────────────────

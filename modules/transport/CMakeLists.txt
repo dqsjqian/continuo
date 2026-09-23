@@ -17,7 +17,7 @@ target_include_directories(continuo_transport PUBLIC
 )
 target_include_directories(continuo_transport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-target_compile_features(continuo_transport PUBLIC cxx_std_20)
+target_compile_features(continuo_transport PUBLIC cxx_std_23)
 target_link_libraries(continuo_transport
     PUBLIC continuo::core
     PRIVATE continuo::warnings

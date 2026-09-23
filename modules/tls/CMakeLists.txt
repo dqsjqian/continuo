@@ -11,7 +11,7 @@ target_include_directories(continuo_tls PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
-target_compile_features(continuo_tls PUBLIC cxx_std_20)
+target_compile_features(continuo_tls PUBLIC cxx_std_23)
 target_link_libraries(continuo_tls
     PUBLIC continuo::core OpenSSL::SSL OpenSSL::Crypto
     PRIVATE continuo::warnings

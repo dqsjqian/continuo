@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -414,6 +415,246 @@ void test_socket_move_and_close() {
     moved.close();
 }
 
+void test_pending_accept_close(bool destroy_owner) {
+    test::section(destroy_owner ? "pending accept close / destroy owner"
+                                : "pending accept close / reentrant close");
+
+    Result<EventLoop> created = EventLoop::create();
+    CHECK(created.has_value());
+    if (!created) {
+        return;
+    }
+    EventLoop& loop = *created;
+    Result<tcp::Listener> bound = tcp::Listener::bind(loop, Endpoint::loopback(0));
+    CHECK(bound.has_value());
+    if (!bound) {
+        return;
+    }
+    auto listener = std::make_unique<tcp::Listener>(std::move(*bound));
+    std::atomic<int> done{0};
+    Error failure{};
+
+    struct Accept {
+        static DetachedTask run(std::unique_ptr<tcp::Listener>& owner,
+                                bool destroy,
+                                Error& error,
+                                std::atomic<int>& counter) {
+            Result<tcp::Socket> accepted = co_await owner->accept();
+            CHECK(!accepted.has_value());
+            if (!accepted) {
+                error = accepted.error();
+            }
+            // detach 可能同步恢复续体；外层 close 必须已先放弃句柄所有权。
+            CHECK(owner->native_handle() == invalid_handle);
+            owner->close();
+            if (destroy) {
+                owner.reset();
+            } else {
+                Result<tcp::Socket> again = co_await owner->accept();
+                CHECK(!again.has_value());
+                CHECK(!again && again.error() == Errc::invalid_argument);
+            }
+            counter.fetch_add(1, std::memory_order_release);
+        }
+    };
+
+    Accept::run(listener, destroy_owner, failure, done);
+    CHECK(done.load() == 0);
+    CHECK(loop.outstanding() == 1);
+    listener->close();
+    const bool completed = pump_until(loop, done, 1);
+    CHECK(completed);
+    if (!completed) {
+        std::terminate();
+    }
+    CHECK(failure == Errc::cancelled);
+    CHECK(loop.outstanding() == 0);
+    CHECK(loop.run_once(0ms).has_value());
+    CHECK(done.load() == 1);
+    CHECK(destroy_owner ? !listener : listener->native_handle() == invalid_handle);
+}
+
+struct LoopbackPair {
+    tcp::Socket server;
+    tcp::Socket client;
+
+    static DetachedTask
+    accept(tcp::Listener& listener, tcp::Socket& socket, std::atomic<int>& done) {
+        Result<tcp::Socket> accepted = co_await listener.accept();
+        CHECK(accepted.has_value());
+        if (accepted) {
+            socket = std::move(*accepted);
+        }
+        done.fetch_add(1, std::memory_order_release);
+    }
+
+    static DetachedTask
+    connect(EventLoop& loop, Endpoint endpoint, tcp::Socket& socket, std::atomic<int>& done) {
+        Result<tcp::Socket> connected = co_await tcp::connect(loop, endpoint);
+        CHECK(connected.has_value());
+        if (connected) {
+            socket = std::move(*connected);
+        }
+        done.fetch_add(1, std::memory_order_release);
+    }
+
+    bool open(EventLoop& loop) {
+        Result<tcp::Listener> listener = tcp::Listener::bind(loop, Endpoint::loopback(0));
+        CHECK(listener.has_value());
+        if (!listener) {
+            return false;
+        }
+        std::atomic<int> done{0};
+        accept(*listener, server, done);
+        connect(loop, listener->local_endpoint(), client, done);
+        const bool completed = pump_until(loop, done, 2);
+        CHECK(completed);
+        if (!completed) {
+            // 超时后不允许挂起任务继续引用已销毁的局部状态。
+            std::terminate();
+        }
+        return server.valid() && client.valid();
+    }
+};
+
+void test_pending_read_close(bool destroy_owner) {
+    test::section(destroy_owner ? "pending read close / destroy owner"
+                                : "pending read close / reentrant close");
+
+    Result<EventLoop> created = EventLoop::create();
+    CHECK(created.has_value());
+    if (!created) {
+        return;
+    }
+    EventLoop& loop = *created;
+    LoopbackPair pair;
+    if (!pair.open(loop)) {
+        return;
+    }
+    auto socket = std::make_unique<tcp::Socket>(std::move(pair.server));
+    std::atomic<int> done{0};
+    Error failure{};
+
+    struct Read {
+        static DetachedTask run(std::unique_ptr<tcp::Socket>& owner,
+                                bool destroy,
+                                Error& error,
+                                std::atomic<int>& counter) {
+            std::array<std::byte, 32> buffer{};
+            Result<std::size_t> read = co_await owner->read_some(buffer);
+            CHECK(!read.has_value());
+            if (!read) {
+                error = read.error();
+            }
+            CHECK(!owner->valid());
+            CHECK(owner->native_handle() == invalid_handle);
+            owner->close();
+            if (destroy) {
+                // 续体可销毁正在执行 close 的对象，外层 close 不可再读 this。
+                owner.reset();
+            } else {
+                Result<std::size_t> again = co_await owner->read_some(buffer);
+                CHECK(!again && again.error() == Errc::invalid_argument);
+                Result<std::size_t> written = co_await owner->write_some(bytes_of("closed"));
+                CHECK(!written && written.error() == Errc::invalid_argument);
+            }
+            counter.fetch_add(1, std::memory_order_release);
+        }
+    };
+
+    Read::run(socket, destroy_owner, failure, done);
+    CHECK(done.load() == 0);
+    CHECK(loop.outstanding() == 1);
+    socket->close();
+    const bool completed = pump_until(loop, done, 1);
+    CHECK(completed);
+    if (!completed) {
+        std::terminate();
+    }
+    CHECK(failure == Errc::cancelled);
+    CHECK(loop.outstanding() == 0);
+    CHECK(loop.run_once(0ms).has_value());
+    CHECK(done.load() == 1);
+    CHECK(destroy_owner ? !socket : !socket->valid());
+}
+
+void test_loop_destruction_pending_accept() {
+    test::section("loop destruction / pending accept");
+
+    std::atomic<int> done{0};
+    Error failure{};
+    struct Accept {
+        static DetachedTask run(tcp::Listener listener, Error& error, std::atomic<int>& counter) {
+            Result<tcp::Socket> accepted = co_await listener.accept();
+            CHECK(!accepted.has_value());
+            if (!accepted) {
+                error = accepted.error();
+            }
+            listener.close();
+            CHECK(listener.native_handle() == invalid_handle);
+            counter.fetch_add(1, std::memory_order_release);
+        }
+    };
+
+    {
+        Result<EventLoop> created = EventLoop::create();
+        CHECK(created.has_value());
+        if (!created) {
+            return;
+        }
+        Result<tcp::Listener> listener = tcp::Listener::bind(*created, Endpoint::loopback(0));
+        CHECK(listener.has_value());
+        if (!listener) {
+            return;
+        }
+        Accept::run(std::move(*listener), failure, done);
+        CHECK(done.load() == 0);
+        CHECK(created->outstanding() == 1);
+    }
+    CHECK(done.load() == 1);
+    CHECK(failure == Errc::cancelled);
+}
+
+void test_loop_destruction_pending_read() {
+    test::section("loop destruction / pending read");
+
+    std::atomic<int> done{0};
+    Error failure{};
+    struct Read {
+        static DetachedTask
+        run(tcp::Socket socket, tcp::Socket peer, Error& error, std::atomic<int>& counter) {
+            std::array<std::byte, 32> buffer{};
+            Result<std::size_t> read = co_await socket.read_some(buffer);
+            CHECK(!read.has_value());
+            if (!read) {
+                error = read.error();
+            }
+            socket.close();
+            peer.close();
+            CHECK(!socket.valid());
+            CHECK(!peer.valid());
+            counter.fetch_add(1, std::memory_order_release);
+        }
+    };
+
+    {
+        Result<EventLoop> created = EventLoop::create();
+        CHECK(created.has_value());
+        if (!created) {
+            return;
+        }
+        LoopbackPair pair;
+        if (!pair.open(*created)) {
+            return;
+        }
+        Read::run(std::move(pair.server), std::move(pair.client), failure, done);
+        CHECK(done.load() == 0);
+        CHECK(created->outstanding() == 1);
+    }
+    CHECK(done.load() == 1);
+    CHECK(failure == Errc::cancelled);
+}
+
 }  // namespace
 
 int main() {
@@ -425,6 +666,12 @@ int main() {
     test_larger_transfer();
     test_connection_refused();
     test_socket_move_and_close();
+    test_pending_accept_close(false);
+    test_pending_accept_close(true);
+    test_pending_read_close(false);
+    test_pending_read_close(true);
+    test_loop_destruction_pending_accept();
+    test_loop_destruction_pending_read();
 
     return test::summary();
 }

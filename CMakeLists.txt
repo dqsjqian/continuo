@@ -2,18 +2,18 @@ cmake_minimum_required(VERSION 3.20)
 
 project(continuo
     VERSION 0.1.0
-    DESCRIPTION "Coroutine-native C++20 networking library — transport, protocols, and nothing else"
+    DESCRIPTION "Coroutine-native C++23 networking library — transport, protocols, and nothing else"
     LANGUAGES CXX
 )
 
 # ── Standard ────────────────────────────────────────────────────────────────
 #
-# C++20 is the floor and it is a real floor, not an aspiration: CI builds both
-# 20 and 23. The only standard-dependent piece is `Result<T>`, which uses
-# `std::expected` when the library provides it and a documented subset
-# otherwise (see modules/core/include/continuo/core/error.hpp).
-
-set(CMAKE_CXX_STANDARD 20 CACHE STRING "C++ standard used to build Continuo")
+# C++23 is the baseline. Use std::expected directly rather than maintaining a
+# second, subtly different error model for an older standard.
+set(CMAKE_CXX_STANDARD 23 CACHE STRING "C++ standard used to build Continuo")
+if(CMAKE_CXX_STANDARD LESS 23)
+    message(FATAL_ERROR "Continuo requires C++23 or newer; use -DCMAKE_CXX_STANDARD=23")
+endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 

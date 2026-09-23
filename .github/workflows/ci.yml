@@ -26,9 +26,7 @@ jobs:
   #   macos   → kqueue
   #   windows → IOCP
   #
-  # Both standards are built because Result<T> has two implementations —
-  # std::expected on C++23, a documented subset on C++20. Building only one
-  # would let the other rot.
+  # C++23 is the baseline; Result<T> uses std::expected on every platform.
   build:
     needs: discipline
     runs-on: ${{ matrix.os }}
@@ -36,11 +34,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,  std: 20, backend: epoll }
           - { os: ubuntu-latest,  std: 23, backend: epoll }
-          - { os: macos-latest,   std: 20, backend: kqueue }
           - { os: macos-latest,   std: 23, backend: kqueue }
-          - { os: windows-latest, std: 20, backend: iocp }
           - { os: windows-latest, std: 23, backend: iocp }
     name: ${{ matrix.backend }} / c++${{ matrix.std }}
     steps:
@@ -60,7 +55,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        std: [20, 23]
+        std: [23]
     steps:
       - uses: actions/checkout@v4
       - name: Install OpenSSL on Linux
