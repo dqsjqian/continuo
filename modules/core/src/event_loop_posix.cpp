@@ -21,6 +21,7 @@
     #include <cerrno>
     #include <fcntl.h>
     #include <mutex>
+    #include <sys/socket.h>
     #include <unistd.h>
     #include <unordered_map>
     #include <utility>
@@ -490,6 +491,82 @@ Task<Result<std::size_t>> EventLoop::write(NativeHandle handle, std::span<const 
         if (!ready) {
             co_return fail(ready.error());
         }
+    }
+}
+
+Task<Result<NativeHandle>> EventLoop::accept(NativeHandle listener, int address_family) {
+    // address_family is only needed by IOCP, which must pre-create the socket.
+    // accept() reports the family itself, so POSIX ignores it.
+    static_cast<void>(address_family);
+
+    for (;;) {
+        const int accepted = ::accept(listener, nullptr, nullptr);
+        if (accepted >= 0) {
+            // Attach before handing it over: a caller that has to remember
+            // this would have code that works here and fails on Windows.
+            Result<void> attached = impl_->attach(accepted);
+            if (!attached) {
+                ::close(accepted);
+                co_return fail(attached.error());
+            }
+            co_return static_cast<NativeHandle>(accepted);
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        // ECONNABORTED: the peer went away between the readiness notification
+        // and the accept. Ordinary on a busy listener — retry rather than
+        // failing the whole accept loop.
+        if (errno == ECONNABORTED) {
+            continue;
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            co_return fail(last_os_error());
+        }
+        Result<void> ready = co_await wait_for(listener, /*writable=*/false);
+        if (!ready) {
+            co_return fail(ready.error());
+        }
+    }
+}
+
+Task<Result<void>> EventLoop::connect(NativeHandle handle, std::span<const std::byte> address) {
+    if (address.empty()) {
+        co_return fail(Errc::invalid_argument);
+    }
+
+    const auto* target = reinterpret_cast<const sockaddr*>(address.data());
+    for (;;) {
+        if (::connect(handle, target, static_cast<socklen_t>(address.size())) == 0) {
+            co_return Result<void>{};
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EISCONN) {
+            co_return Result<void>{};  // already established
+        }
+        if (errno != EINPROGRESS && errno != EALREADY && errno != EWOULDBLOCK) {
+            co_return fail(last_os_error());
+        }
+
+        // A non-blocking connect reports completion by becoming writable, but
+        // writability alone does not mean success: the actual outcome lives in
+        // SO_ERROR and must be read, or a refused connection looks connected.
+        Result<void> ready = co_await wait_for(handle, /*writable=*/true);
+        if (!ready) {
+            co_return fail(ready.error());
+        }
+
+        int pending = 0;
+        socklen_t length = sizeof(pending);
+        if (::getsockopt(handle, SOL_SOCKET, SO_ERROR, &pending, &length) < 0) {
+            co_return fail(last_os_error());
+        }
+        if (pending != 0) {
+            co_return fail(std::error_code{pending, std::system_category()});
+        }
+        co_return Result<void>{};
     }
 }
 

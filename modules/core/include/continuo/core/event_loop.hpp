@@ -74,6 +74,28 @@ public:
     [[nodiscard]] Task<Result<std::size_t>> write(NativeHandle handle,
                                                   std::span<const std::byte> source);
 
+    /// Accept one connection from a listening handle.
+    ///
+    /// The returned handle is already attached to the loop, because on IOCP an
+    /// accepted socket is useless until it is associated with the completion
+    /// port — leaving that to the caller would be a portability trap that only
+    /// fires on one platform.
+    ///
+    /// `address_family` is the platform's own constant (`AF_INET`, `AF_INET6`,
+    /// ...) passed straight through. The loop does not interpret it; IOCP
+    /// simply needs to pre-create a socket of the right family before it can
+    /// submit an accept.
+    [[nodiscard]] Task<Result<NativeHandle>> accept(NativeHandle listener, int address_family);
+
+    /// Connect `handle` to an already-encoded socket address.
+    ///
+    /// `address` is an opaque `sockaddr` blob: the loop memcpy's it into the
+    /// syscall and never looks inside. That is what keeps `core` free of
+    /// address-family knowledge while still being the only layer that talks to
+    /// the OS — building the blob is the transport's job.
+    [[nodiscard]] Task<Result<void>> connect(NativeHandle handle,
+                                             std::span<const std::byte> address);
+
     // ── timers and scheduling (portable) ────────────────────────────────────
 
     /// Suspend for at least `delay`.

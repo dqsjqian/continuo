@@ -63,6 +63,7 @@ if(CONTINUO_BUILD_TESTS)
 endif()
 
 add_subdirectory(modules/core)
+add_subdirectory(modules/transport)
 add_subdirectory(modules/http)
 
 if(CONTINUO_BUILD_TESTS)

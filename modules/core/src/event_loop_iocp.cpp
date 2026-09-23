@@ -32,6 +32,7 @@
     #include <array>
     #include <atomic>
     #include <memory>
+    #include <mswsock.h>
     #include <mutex>
     #include <unordered_map>
     #include <utility>
@@ -56,6 +57,31 @@ constexpr ULONG kEventBatch = 64;
 
 /// Completion key used for `post()` wakeups, distinguishable from real I/O.
 constexpr ULONG_PTR kWakeupKey = 1;
+
+/// Per-endpoint slot size AcceptEx writes addresses into: a sockaddr plus the
+/// 16 bytes of padding the API mandates.
+constexpr DWORD kAddressSlot = sizeof(SOCKADDR_STORAGE) + 16;
+
+/// AcceptEx and ConnectEx are not exported from a link library: they must be
+/// fetched per-socket through WSAIoctl. Resolved once and cached, which is what
+/// Microsoft's own documentation prescribes.
+template<typename Fn>
+[[nodiscard]] Result<Fn> resolve_extension(SOCKET socket, GUID guid) {
+    Fn function = nullptr;
+    DWORD written = 0;
+    if (::WSAIoctl(socket,
+                   SIO_GET_EXTENSION_FUNCTION_POINTER,
+                   &guid,
+                   sizeof(guid),
+                   &function,
+                   sizeof(function),
+                   &written,
+                   nullptr,
+                   nullptr) == SOCKET_ERROR) {
+        return fail(last_socket_error());
+    }
+    return function;
+}
 
 /// Winsock needs process-wide initialisation, exactly once.
 [[nodiscard]] Result<void> ensure_winsock() {
@@ -83,6 +109,17 @@ public:
         std::coroutine_handle<> handle{};
         Result<std::size_t>* result{nullptr};
         WSABUF buffer{};
+
+        /// Accept-only state. AcceptEx requires the socket to exist *before*
+        /// the operation is submitted, and writes both endpoint addresses into
+        /// a caller-supplied buffer that must stay alive until completion —
+        /// hence both living here, owned by the loop.
+        SOCKET accepted{INVALID_SOCKET};
+        SOCKET listener{INVALID_SOCKET};
+        /// Two sockaddr slots plus the 16-byte padding AcceptEx demands.
+        std::array<std::byte, 2 * (sizeof(SOCKADDR_STORAGE) + 16)> address_scratch{};
+        bool is_accept{false};
+        bool is_connect{false};
     };
 
     explicit Impl(HANDLE port) noexcept : port_(port) {}
@@ -209,6 +246,109 @@ public:
         return fail(error);
     }
 
+    [[nodiscard]] Result<void> submit_accept(NativeHandle listener,
+                                             int address_family,
+                                             std::coroutine_handle<> coroutine,
+                                             Result<std::size_t>* result) {
+        if (shutting_down_.load(std::memory_order_acquire)) {
+            return fail(Errc::cancelled);
+        }
+
+        const auto listening = static_cast<SOCKET>(listener);
+        if (accept_ex_ == nullptr) {
+            GUID guid = WSAID_ACCEPTEX;
+            Result<LPFN_ACCEPTEX> resolved = resolve_extension<LPFN_ACCEPTEX>(listening, guid);
+            if (!resolved) {
+                return fail(resolved.error());
+            }
+            accept_ex_ = *resolved;
+        }
+
+        // AcceptEx needs the receiving socket to exist before submission —
+        // unlike accept(), which manufactures one on return.
+        const SOCKET accepted =
+            ::WSASocketW(address_family, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_OVERLAPPED);
+        if (accepted == INVALID_SOCKET) {
+            return fail(last_socket_error());
+        }
+
+        Operation* operation = acquire_operation(coroutine, result);
+        operation->is_accept = true;
+        operation->accepted = accepted;
+        operation->listener = listening;
+
+        DWORD received = 0;
+        const BOOL ok = accept_ex_(listening,
+                                   accepted,
+                                   operation->address_scratch.data(),
+                                   /*dwReceiveDataLength=*/0,
+                                   kAddressSlot,
+                                   kAddressSlot,
+                                   &received,
+                                   &operation->overlapped);
+
+        if (ok == TRUE || ::WSAGetLastError() == ERROR_IO_PENDING) {
+            return Result<void>{};
+        }
+
+        const Error error = last_socket_error();
+        ::closesocket(accepted);
+        release_operation(operation);
+        return fail(error);
+    }
+
+    [[nodiscard]] Result<void> submit_connect(NativeHandle handle,
+                                              std::span<const std::byte> address,
+                                              std::coroutine_handle<> coroutine,
+                                              Result<std::size_t>* result) {
+        if (shutting_down_.load(std::memory_order_acquire)) {
+            return fail(Errc::cancelled);
+        }
+
+        const auto socket = static_cast<SOCKET>(handle);
+        if (connect_ex_ == nullptr) {
+            GUID guid = WSAID_CONNECTEX;
+            Result<LPFN_CONNECTEX> resolved = resolve_extension<LPFN_CONNECTEX>(socket, guid);
+            if (!resolved) {
+                return fail(resolved.error());
+            }
+            connect_ex_ = *resolved;
+        }
+
+        const auto* target = reinterpret_cast<const sockaddr*>(address.data());
+
+        // ConnectEx requires an already-bound socket; POSIX connect() binds
+        // implicitly, so this step has no counterpart in the other backend.
+        SOCKADDR_STORAGE local{};
+        local.ss_family = target->sa_family;
+        const int local_length = target->sa_family == AF_INET6
+                                     ? static_cast<int>(sizeof(sockaddr_in6))
+                                     : static_cast<int>(sizeof(sockaddr_in));
+        if (::bind(socket, reinterpret_cast<const sockaddr*>(&local), local_length) ==
+                SOCKET_ERROR &&
+            ::WSAGetLastError() != WSAEINVAL) {
+            return fail(last_socket_error());
+        }
+
+        Operation* operation = acquire_operation(coroutine, result);
+        operation->is_connect = true;
+
+        const BOOL ok = connect_ex_(socket,
+                                    target,
+                                    static_cast<int>(address.size()),
+                                    nullptr,
+                                    0,
+                                    nullptr,
+                                    &operation->overlapped);
+        if (ok == TRUE || ::WSAGetLastError() == ERROR_IO_PENDING) {
+            return Result<void>{};
+        }
+
+        const Error error = last_socket_error();
+        release_operation(operation);
+        return fail(error);
+    }
+
     void add_timer(detail::Clock::time_point deadline,
                    std::coroutine_handle<> coroutine,
                    Result<void>* result) {
@@ -290,12 +430,36 @@ public:
                 if (status != 0) {
                     return fail(std::error_code{static_cast<int>(status), std::system_category()});
                 }
+                if (operation->is_accept) {
+                    // An accept completes with zero bytes transferred — that is
+                    // success, not eof. The accepted socket also does not
+                    // inherit the listener's state unless told to, and skipping
+                    // this leaves getsockname/shutdown broken in ways that only
+                    // show up much later.
+                    ::setsockopt(operation->accepted,
+                                 SOL_SOCKET,
+                                 SO_UPDATE_ACCEPT_CONTEXT,
+                                 reinterpret_cast<const char*>(&operation->listener),
+                                 sizeof(operation->listener));
+                    return static_cast<std::size_t>(operation->accepted);
+                }
+                if (operation->is_connect) {
+                    // A connect also completes with zero bytes. Only a recv
+                    // may read zero as "peer closed".
+                    return std::size_t{0};
+                }
                 if (transferred == 0) {
                     // Zero bytes on a completed recv means the peer closed.
                     return fail(Errc::eof);
                 }
                 return static_cast<std::size_t>(transferred);
             }();
+
+            // A failed accept must not leak the socket it pre-created.
+            if (operation->is_accept && !outcome.has_value() &&
+                operation->accepted != INVALID_SOCKET) {
+                ::closesocket(operation->accepted);
+            }
 
             finished.emplace_back(operation, outcome);
         }
@@ -372,6 +536,9 @@ private:
     std::unordered_map<Operation*, std::unique_ptr<Operation>> operations_{};
     detail::TimerQueue timers_{};
     detail::PostQueue posted_{};
+
+    LPFN_ACCEPTEX accept_ex_{nullptr};
+    LPFN_CONNECTEX connect_ex_{nullptr};
 
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> wake_pending_{false};
@@ -455,6 +622,46 @@ Task<Result<std::size_t>> EventLoop::write(NativeHandle handle, std::span<const 
         return impl->submit_write(handle, source, coroutine, result);
     };
     co_return co_await detail::OperationAwaiter<Result<std::size_t>, decltype(submit)>{submit};
+}
+
+Task<Result<NativeHandle>> EventLoop::accept(NativeHandle listener, int address_family) {
+    Impl* impl = impl_.get();
+    auto submit = [impl, listener, address_family](std::coroutine_handle<> coroutine,
+                                                   Result<std::size_t>* result) {
+        return impl->submit_accept(listener, address_family, coroutine, result);
+    };
+
+    // The accepted socket travels back through the size_t slot; the loop has
+    // already associated it with the completion port.
+    Result<std::size_t> accepted =
+        co_await detail::OperationAwaiter<Result<std::size_t>, decltype(submit)>{submit};
+    if (!accepted) {
+        co_return fail(accepted.error());
+    }
+    Result<void> attached = impl->attach(static_cast<NativeHandle>(*accepted));
+    if (!attached) {
+        co_return fail(attached.error());
+    }
+    co_return static_cast<NativeHandle>(*accepted);
+}
+
+Task<Result<void>> EventLoop::connect(NativeHandle handle, std::span<const std::byte> address) {
+    if (address.size() < sizeof(sockaddr)) {
+        co_return fail(Errc::invalid_argument);
+    }
+    Impl* impl = impl_.get();
+    auto submit = [impl, handle, address](std::coroutine_handle<> coroutine,
+                                          Result<std::size_t>* result) {
+        return impl->submit_connect(handle, address, coroutine, result);
+    };
+    Result<std::size_t> connected =
+        co_await detail::OperationAwaiter<Result<std::size_t>, decltype(submit)>{submit};
+    if (!connected) {
+        co_return fail(connected.error());
+    }
+    // ConnectEx leaves the socket in a half-initialised state until told.
+    ::setsockopt(static_cast<SOCKET>(handle), SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, nullptr, 0);
+    co_return Result<void>{};
 }
 
 // ── timers and scheduling ────────────────────────────────────────────────────
