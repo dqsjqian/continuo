@@ -122,6 +122,11 @@ inline void close_socket(socket_t socket) noexcept {
 [[nodiscard]] inline Result<void>
 apply_exclusive_bind(socket_t socket, bool exclusive, bool reuse_after_close) {
 #if CONTINUO_PLATFORM_WINDOWS
+    // SO_EXCLUSIVEADDRUSE already permits rebinding a port this process left
+    // in TIME_WAIT, so Windows needs no separate switch for it — the flag is
+    // meaningful only on the POSIX branch below.
+    static_cast<void>(reuse_after_close);
+
     if (exclusive) {
         return set_flag(socket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, true);
     }
