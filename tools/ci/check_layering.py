@@ -21,6 +21,21 @@ Rule 2 — no host framework dependency.
     <aria/...>` anywhere in the library would turn an optional adapter into a
     hard dependency for every consumer.
 
+Rule 3 — platform detection has exactly one home.
+
+    Only `platform.hpp` may test raw compiler macros (`_WIN32`, `__linux__`,
+    `__APPLE__`, ...). Everywhere else asks it via `CONTINUO_*`. Scattered
+    `#ifdef _WIN32` is how a library ends up with a first-class POSIX path and
+    a Windows path nobody can reason about — and why "supports Windows" starts
+    meaning "compiles on Windows".
+
+Rule 4 — protocols are platform-agnostic.
+
+    A protocol module must not include OS headers. Protocols speak to the
+    stream and executor seams only; the moment a parser knows what a socket is,
+    the same parser can no longer be tested over an in-memory pipe or run over
+    TLS.
+
 Usage:
     python3 tools/ci/check_layering.py [repo_root]
 
@@ -56,7 +71,29 @@ BANNED_EVERYWHERE: dict[str, str] = {
     "aria/": "Continuo must not depend on Aria; hosts integrate via the executor/stream seams",
 }
 
+# OS headers a protocol module must never reach for.
+PLATFORM_HEADER_PREFIXES: tuple[str, ...] = (
+    "sys/", "netinet/", "arpa/", "net/",
+    "windows.h", "winsock2.h", "ws2tcpip.h", "mswsock.h", "basetsd.h",
+    "unistd.h", "fcntl.h", "poll.h", "errno.h",
+    "TargetConditionals.h",
+)
+
+# Raw compiler macros that only platform.hpp may test. Everything else uses the
+# CONTINUO_* macros it derives.
+RAW_PLATFORM_MACROS: tuple[str, ...] = (
+    "_WIN32", "_WIN64", "__linux__", "__APPLE__", "__ANDROID__",
+    "__FreeBSD__", "__OpenBSD__", "__NetBSD__", "TARGET_OS_IPHONE",
+)
+
+# The single file allowed to do platform detection, relative to repo root.
+PLATFORM_DETECTION_HOME = "modules/core/include/continuo/core/platform.hpp"
+
 INCLUDE_RE = re.compile(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]')
+
+# Matches a preprocessor conditional that tests a raw platform macro, e.g.
+# `#if defined(_WIN32)`, `#ifdef __linux__`, `#elif __APPLE__`.
+CONDITIONAL_RE = re.compile(r"^\s*#\s*(if|ifdef|ifndef|elif)\b(.*)$")
 
 
 def layer_of(path: Path, modules_root: Path) -> str | None:
@@ -91,25 +128,49 @@ def check(repo_root: Path) -> list[str]:
         layer = layer_of(path, modules_root)
         forbidden = FORBIDDEN_INCLUDES.get(layer or "", ())
         display = path.relative_to(repo_root)
+        is_platform_home = display.as_posix() == PLATFORM_DETECTION_HOME
 
         for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            # Rule 3 — platform detection has exactly one home.
+            if not is_platform_home:
+                conditional = CONDITIONAL_RE.match(line)
+                if conditional:
+                    expression = conditional.group(2)
+                    for macro in RAW_PLATFORM_MACROS:
+                        if re.search(rf"\b{re.escape(macro)}\b", expression):
+                            violations.append(
+                                f"{display}:{lineno}: tests raw platform macro '{macro}' — "
+                                f"use the CONTINUO_* macros from {PLATFORM_DETECTION_HOME}"
+                            )
+
             match = INCLUDE_RE.match(line)
             if not match:
                 continue
             included = match.group(1)
 
+            # Rule 2 — no host framework dependency.
             for prefix, reason in BANNED_EVERYWHERE.items():
                 if included.startswith(prefix):
                     violations.append(
                         f"{display}:{lineno}: includes '{included}' — {reason}"
                     )
 
+            # Rule 1 — dependencies point downwards only.
             for prefix in forbidden:
                 if included.startswith(prefix):
                     violations.append(
                         f"{display}:{lineno}: layer '{layer}' includes '{included}' — "
                         f"dependencies only point downwards"
                     )
+
+            # Rule 4 — protocols are platform-agnostic.
+            if layer == "protocol":
+                for prefix in PLATFORM_HEADER_PREFIXES:
+                    if included.startswith(prefix):
+                        violations.append(
+                            f"{display}:{lineno}: protocol module includes OS header "
+                            f"'{included}' — protocols talk to the stream/executor seams only"
+                        )
 
     return violations
 

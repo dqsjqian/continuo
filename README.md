@@ -6,10 +6,21 @@ ride on it.
 > *Basso continuo*: the continuously played bass line that supplies the
 > harmonic foundation a Baroque work is built over. Aria sings on top of it.
 
-**Status: v0.1 — foundation.** The seams are settled, compile and run clean,
-and are covered by tests. There is no event loop, no socket, and no HTTP parser
-yet. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the roadmap and the
+**Status: v0.2 — the loop runs.** Seams are settled and the event loop works on
+all three I/O backends. No sockets and no HTTP parser yet. See
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the roadmap and the
 reasoning behind each decision.
+
+| Platform | Backend | State |
+|---|---|---|
+| macOS · iOS · BSD | kqueue | built + tested |
+| Linux · Android | epoll | built + tested in CI |
+| Windows | IOCP | built + tested in CI |
+
+One public API across all of them, because it is **completion-shaped** rather
+than readiness-shaped — the only shape that maps onto IOCP as directly as onto
+epoll. That decision is the backbone of the whole design; the reasoning is in
+the architecture doc.
 
 ## Why
 
@@ -28,19 +39,26 @@ ergonomics, and an API that was coroutine-shaped from the first commit.
 ## What it looks like
 
 ```cpp
-#include <continuo/core/stream.hpp>
+#include <continuo/core/event_loop.hpp>
 
-// A protocol never names a socket type — only the stream concept.
-continuo::Task<continuo::Result<void>> greet(continuo::AsyncStream auto& stream) {
-    constexpr std::string_view message = "hello\n";
-    co_return co_await continuo::write_all(
-        stream, std::as_bytes(std::span{message.data(), message.size()}));
+continuo::Task<continuo::Result<void>> echo_once(continuo::EventLoop& loop,
+                                                 continuo::NativeHandle handle) {
+    std::array<std::byte, 4096> scratch{};
+
+    // "tell me when this read finished" — identical on kqueue, epoll, IOCP.
+    continuo::Result<std::size_t> read = co_await loop.read(handle, scratch);
+    if (!read) {
+        co_return continuo::fail(read.error());   // Errc::eof on a clean close
+    }
+
+    co_await loop.write(handle, std::span{scratch}.first(*read));
+    co_return continuo::Result<void>{};
 }
 ```
 
 Failures are values (`Result<T>` over `std::error_code`), the host decides
-which thread resumes a coroutine (`Executor`), and the same parser runs over
-TCP, TLS, or an in-memory pipe.
+which thread resumes a coroutine (`Executor`), and a protocol written against
+the stream concepts runs over TCP, TLS, or an in-memory pipe unchanged.
 
 ## Build
 
@@ -59,13 +77,17 @@ Architectural invariants are checked by a script, not by convention:
 python3 tools/ci/check_layering.py
 ```
 
-It fails the build if `core` reaches up into a transport or protocol layer, or
-if anything in the library includes a host framework header.
+It fails the build when a layer reaches upwards, when anything includes a host
+framework header, when a file tests a raw platform macro instead of asking
+`platform.hpp`, or when a protocol module includes an OS header.
 
 ## Layout
 
 ```
-modules/core/        event loop, Buffer, Task, executor & stream seams, errors
+modules/core/        EventLoop, Buffer, Task, executor & stream seams, errors
+  include/…/platform.hpp   the only file that detects a platform
+  src/event_loop_posix.cpp kqueue / epoll backend
+  src/event_loop_iocp.cpp  Windows backend
 modules/transport/   tcp / udp / unix          (reserved slot)
 modules/http/        HTTP/1.1                  (reserved slot)
 tools/ci/            architectural discipline scripts

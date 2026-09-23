@@ -11,14 +11,14 @@ Feature lists are a poor definition of completeness for a protocol library.
 Continuo uses six layers instead, and the order matters — each one is only
 worth building on top of a solid layer below.
 
-| Layer | Concern | v0.1 status |
+| Layer | Concern | status |
 |---|---|---|
 | 1 Protocol correctness | RFC 9110 semantics, reject smuggling ambiguity, no guessing on malformed input | reserved |
-| 2 Transport & concurrency | transport × protocol decoupling, readiness backends, backpressure | seam defined |
-| 3 Execution model | coroutine-native API, host-owned thread policy | **done (`Task`, `Executor`)** |
+| 2 Transport & concurrency | transport × protocol decoupling, I/O backends, backpressure | **backends done (kqueue / epoll / IOCP); sockets reserved** |
+| 3 Execution model | coroutine-native API, host-owned thread policy | **done (`Task`, `Executor`, `EventLoop`)** |
 | 4 API & abstraction | streaming bodies, value-based errors, composable helpers | **done (`Result`, `Buffer`, stream concepts)** |
 | 5 Safety & robustness | TLS seam, limits closed by default, continuous fuzzing | reserved |
-| 6 Engineering quality | conformance suites, interop benchmarks, ABI policy, docs | **CI + discipline scripts in place** |
+| 6 Engineering quality | conformance suites, interop benchmarks, ABI policy, docs | **CI across 3 backends + 4 discipline checks** |
 
 The first principle behind layer 1 is worth stating plainly, because it drives
 API shape everywhere else: **the value of a protocol library is concentrated in
@@ -26,6 +26,40 @@ its negative space** — the completeness with which it says *no* to malformed
 input. Continuo does not guess on a `Content-Length`/`Transfer-Encoding`
 conflict; it rejects. Limits are closed by default and opened by configuration,
 never the reverse.
+
+## The decision everything else follows from: completion, not readiness
+
+Continuo targets macOS, Linux, Windows, iOS, and Android. Those platforms do
+not agree on what an asynchronous I/O API *is*:
+
+| | Model | Shape |
+|---|---|---|
+| kqueue (macOS, iOS, BSD) | **reactor** | "this handle is *ready*" — you then read |
+| epoll (Linux, Android) | **reactor** | same |
+| IOCP (Windows) | **proactor** | "your read has *completed*" — you submitted it earlier |
+
+This forces a choice, and getting it backwards is how libraries end up with a
+first-class POSIX path and a Windows path nobody can reason about:
+
+- A **readiness-shaped** public API (`wait_readable(fd)`) cannot be implemented
+  on IOCP without badly emulating it — IOCP never answers "is it ready?".
+- A **completion-shaped** public API (`read(handle, buffer)`) maps onto IOCP
+  *directly*, and is trivially emulated on a reactor: try the syscall, and on
+  `EAGAIN` wait for readiness and retry.
+
+So **the public API is completion-shaped on every platform**, and readiness is
+an implementation detail of the POSIX backends. This is the conclusion asio
+reached, and the direction io_uring has since taken Linux — a future io_uring
+backend fits this API without changing a line of it.
+
+```cpp
+std::size_t n = (co_await loop.read(handle, buffer)).value();   // all platforms
+```
+
+Readiness is still exposed, but fenced: `wait_readable` / `wait_writable` exist
+behind `#if CONTINUO_HAS_READINESS_API` for embedding a descriptor owned by
+another library. Code that calls them does not compile on Windows — the honest
+outcome, and better than an emulation whose semantics quietly differ.
 
 ## Layering
 
@@ -36,10 +70,12 @@ protocol   continuo::http   continuo::ws    continuo::h2   …   (each independe
                                   ↓  reads/writes through stream concepts only
 transport  continuo::tcp   continuo::udp   continuo::unix
                                   ↓
-core       event loop · Buffer · Task · Executor seam · TLS seam · limits
+core       EventLoop · Buffer · Task · Executor seam · TLS seam · limits
+                                  ↓
+backend    kqueue (macOS/iOS/BSD) · epoll (Linux/Android) · IOCP (Windows)
 ```
 
-Two invariants, both enforced by `tools/ci/check_layering.py` rather than by
+Four invariants, all enforced by `tools/ci/check_layering.py` rather than by
 convention:
 
 1. **Dependencies point downwards only.** `core` must not include transport or
@@ -49,10 +85,17 @@ convention:
 2. **No host framework dependency.** Continuo never includes `aria/…`. Hosts
    integrate through the executor and stream seams, so the library stays usable
    standalone.
+3. **Platform detection has exactly one home.** Only `platform.hpp` may test
+   `_WIN32`, `__linux__`, `__APPLE__` and friends; everything else asks it via
+   `CONTINUO_*`. Scattered `#ifdef _WIN32` is how "supports Windows" decays
+   into "compiles on Windows".
+4. **Protocols are platform-agnostic.** A protocol module may not include OS
+   headers. The moment a parser knows what a socket is, it can no longer be
+   tested over an in-memory pipe or run over TLS.
 
-The scripts exist because both failure modes are *gradual*. Nobody decides to
-weld the socket loop to the parser — it happens one include at a time, and by
-the time it hurts, the fix is a rewrite.
+The scripts exist because every one of these failure modes is *gradual*. Nobody
+decides to weld the socket loop to the parser — it happens one include at a
+time, and by the time it hurts, the fix is a rewrite.
 
 ### TCP and UDP are transport, not "more protocols"
 
@@ -104,6 +147,9 @@ The core test suite asserts this claim in code: `write_all` drives a
 
 | Decision | Choice | Why |
 |---|---|---|
+| **I/O model** | **completion-shaped public API** | The only shape that maps onto IOCP *and* reactors; see the section above |
+| Platform support | macOS, Linux, Windows, iOS, Android — all first-class | Hosts ship on all of them; a compile-only platform is not supported |
+| Readiness API | POSIX-only, behind an explicit macro | No IOCP equivalent; a fenced gap beats a misleading emulation |
 | Execution model | coroutine-native, lazy `Task<T>` | The market gap: asio predates coroutines, cpp-httplib is thread-per-connection |
 | Library form | compiled library, not header-only | 22k lines in one header costs every consumer compile time; a compiled target can carry an ABI policy |
 | Error model | `std::error_code` + `Result<T>` | Standard, interoperable; failures are values, not exceptions |
@@ -112,11 +158,24 @@ The core test suite asserts this claim in code: `write_all` drives a
 | Framework coupling | zero — Aria depends on Continuo, never the reverse | Keeps the library usable by anyone; adapters live on the host side |
 | Protocol scope | transport + HTTP/1.1 solid; ws/h2/h3 are slots, not promises | Breadth without depth is how protocol libraries get unsafe |
 
-## v0.1 scope
+## Scope so far
 
-Shipped: error model, `Task<T>`, `Buffer`, executor and stream seams, warning
-policy, layering discipline, CI across C++20/C++23 and sanitizers.
+**v0.1 — seams.** Error model, `Task<T>`, `Buffer`, executor and stream
+concepts, warning policy, layering discipline, CI across C++20/C++23 and
+sanitizers.
 
-Deliberately absent: event loop and readiness backends, real sockets, TLS,
-HTTP parsing, cancellation plumbing, detached task launching. Each needs the
-seams above to be settled first — which is what v0.1 is for.
+**v0.2 — the loop.** `EventLoop` with three backends (kqueue, epoll, IOCP),
+completion-shaped `read`/`write`, timers, cross-thread `post`, and a
+`platform.hpp` that is the single home for platform detection. CI now builds
+and *runs* tests on all three backends, and cross-compiles for iOS and Android.
+
+Verified locally on kqueue: 118 checks across C++20, C++23, and ASan/UBSan.
+The epoll and IOCP backends are validated by CI only — no Linux or Windows
+machine was available here, and saying otherwise would be a claim without
+evidence.
+
+**Deliberately absent.** Real sockets (`modules/transport`), TLS, HTTP parsing,
+cancellation tokens, multi-threaded loops, and detached task launching. The
+loop was worth building before sockets because the I/O model dictates what a
+socket API can look like; building sockets first is how a poll loop ends up
+welded to one protocol.

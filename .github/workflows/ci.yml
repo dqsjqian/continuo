@@ -11,16 +11,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Architectural invariants first: they are cheap and they fail loudest.
+  # Architectural invariants first: cheap, and they fail loudest.
   discipline:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Layering and framework-independence check
+      - name: Layering, framework-independence, platform-fencing
         run: python3 tools/ci/check_layering.py
 
-  # Both standards are built because Result<T> has two implementations:
-  # std::expected on C++23, a documented subset on C++20. Only building one
+  # Every backend gets a real build and a real test run, because a platform
+  # that merely compiles is not a supported platform:
+  #
+  #   ubuntu  → epoll
+  #   macos   → kqueue
+  #   windows → IOCP
+  #
+  # Both standards are built because Result<T> has two implementations —
+  # std::expected on C++23, a documented subset on C++20. Building only one
   # would let the other rot.
   build:
     needs: discipline
@@ -28,22 +35,34 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        std: [20, 23]
+        include:
+          - { os: ubuntu-latest,  std: 20, backend: epoll }
+          - { os: ubuntu-latest,  std: 23, backend: epoll }
+          - { os: macos-latest,   std: 20, backend: kqueue }
+          - { os: macos-latest,   std: 23, backend: kqueue }
+          - { os: windows-latest, std: 20, backend: iocp }
+          - { os: windows-latest, std: 23, backend: iocp }
+    name: ${{ matrix.backend }} / c++${{ matrix.std }}
     steps:
       - uses: actions/checkout@v4
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_STANDARD=${{ matrix.std }}
       - name: Build
-        run: cmake --build build --parallel
+        run: cmake --build build --parallel --config Debug
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure --build-config Debug
 
-  # Coroutine frame lifetime is the easiest thing in this library to get
-  # subtly wrong, and the hardest to notice without a sanitizer.
+  # Coroutine frame lifetime is the easiest thing here to get subtly wrong and
+  # the hardest to notice without a sanitizer. The event loop raises the
+  # stakes: frames are resumed from inside the loop, long after the call that
+  # created them returned.
   sanitizers:
     needs: discipline
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - name: Configure with ASan + UBSan
@@ -57,6 +76,32 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: ctest --test-dir build/asan --output-on-failure
 
-# Windows is intentionally absent until modules/transport lands: there is no
-# platform-specific code to exercise yet, and a green job that proves nothing
-# is worse than an honest gap.
+  # Mobile targets cross-compile only; no runner executes them. Keeping them in
+  # CI catches the usual breakage — a POSIX assumption that does not hold on a
+  # sandboxed platform — without pretending the tests ran.
+  ios:
+    needs: discipline
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure for iOS
+        run: >
+          cmake -S . -B build/ios -G Xcode
+          -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64
+          -DCONTINUO_BUILD_TESTS=OFF
+      - name: Build library only
+        run: cmake --build build/ios --target continuo_core
+
+  android:
+    needs: discipline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure with NDK
+        run: >
+          cmake -S . -B build/android
+          -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake
+          -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24
+          -DCONTINUO_BUILD_TESTS=OFF
+      - name: Build library only
+        run: cmake --build build/android --target continuo_core --parallel
