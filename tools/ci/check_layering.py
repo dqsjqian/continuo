@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Enforce Continuo's two architectural invariants at build time.
+"""Enforce Continuo's architectural invariants at build time.
 
-Both rules exist because the failure mode they prevent is *gradual*. Nobody
+These rules exist because the failure mode they prevent is *gradual*. Nobody
 decides to weld the socket layer to the parser; it happens one include at a
 time, and by the time it hurts, the fix is a rewrite. A comment in a design
 document cannot stop that. A failing build can.
@@ -54,16 +54,19 @@ SOURCE_SUFFIXES = {".hpp", ".h", ".cpp", ".cc", ".ipp"}
 LAYERS: dict[str, tuple[str, ...]] = {
     "core": ("core",),
     "transport": ("transport",),
+    "tls": ("tls",),
     "protocol": ("http", "ws", "h2", "h3", "dns"),
 }
 
 # Layer -> include path prefixes it is not allowed to reach for.
 FORBIDDEN_INCLUDES: dict[str, tuple[str, ...]] = {
-    "core": ("continuo/transport/", "continuo/http/", "continuo/ws/",
+    "core": ("continuo/tls/", "openssl/", "continuo/transport/", "continuo/http/", "continuo/ws/",
              "continuo/h2/", "continuo/h3/", "continuo/dns/"),
-    "transport": ("continuo/http/", "continuo/ws/", "continuo/h2/",
+    "transport": ("continuo/tls/", "openssl/", "continuo/http/", "continuo/ws/", "continuo/h2/",
                   "continuo/h3/", "continuo/dns/"),
-    "protocol": (),
+    "tls": ("continuo/transport/", "continuo/http/", "continuo/ws/", "continuo/h2/",
+            "continuo/h3/", "continuo/dns/"),
+    "protocol": ("openssl/", "continuo/tls/", "continuo/transport/"),
 }
 
 # Include prefixes no layer may use, with the reason reported to the user.
@@ -126,7 +129,9 @@ def check(repo_root: Path) -> list[str]:
 
     for path in iter_sources(modules_root):
         layer = layer_of(path, modules_root)
-        forbidden = FORBIDDEN_INCLUDES.get(layer or "", ())
+        # Integration tests may compose modules; production headers/sources may not.
+        is_test = "tests" in path.relative_to(modules_root).parts
+        forbidden = () if is_test else FORBIDDEN_INCLUDES.get(layer or "", ())
         display = path.relative_to(repo_root)
         is_platform_home = display.as_posix() == PLATFORM_DETECTION_HOME
 
@@ -164,7 +169,7 @@ def check(repo_root: Path) -> list[str]:
                     )
 
             # Rule 4 — protocols are platform-agnostic.
-            if layer == "protocol":
+            if layer in ("protocol", "tls") and not is_test:
                 for prefix in PLATFORM_HEADER_PREFIXES:
                     if included.startswith(prefix):
                         violations.append(

@@ -52,6 +52,40 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure --build-config Debug
 
+  # TLS is an opt-in module. Keep the dependency-free matrix above as well.
+  tls:
+    needs: discipline
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        std: [20, 23]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install OpenSSL on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - name: Locate OpenSSL on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+      - name: Install OpenSSL on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT/vcpkg.exe" install openssl:x64-windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "CMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Configure TLS
+        run: cmake -S . -B build/tls -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_STANDARD=${{ matrix.std }} -DCONTINUO_ENABLE_TLS=ON
+      - name: Build TLS
+        run: cmake --build build/tls --parallel --config Debug
+      - name: Test TLS and HTTPS
+        run: ctest --test-dir build/tls --output-on-failure --build-config Debug
+
   # Coroutine frame lifetime is the easiest thing here to get subtly wrong and
   # the hardest to notice without a sanitizer. The event loop raises the
   # stakes: frames are resumed from inside the loop, long after the call that
@@ -65,9 +99,19 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - name: Configure with ASan + UBSan
+      - name: Install OpenSSL on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - name: Locate OpenSSL on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+      - name: Configure with ASan + UBSan and TLS
         run: >
           cmake -S . -B build/asan -DCMAKE_BUILD_TYPE=Debug
+          -DCONTINUO_ENABLE_TLS=ON
           -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
       - name: Build
         run: cmake --build build/asan --parallel
@@ -89,8 +133,8 @@ jobs:
           cmake -S . -B build/ios -G Xcode
           -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64
           -DCONTINUO_BUILD_TESTS=OFF
-      - name: Build library only
-        run: cmake --build build/ios --target continuo_core
+      - name: Build all non-TLS libraries (no target OpenSSL configured)
+        run: cmake --build build/ios --config Debug
 
   android:
     needs: discipline
@@ -103,5 +147,5 @@ jobs:
           -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake
           -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24
           -DCONTINUO_BUILD_TESTS=OFF
-      - name: Build library only
-        run: cmake --build build/android --target continuo_core --parallel
+      - name: Build all non-TLS libraries (no target OpenSSL configured)
+        run: cmake --build build/android --parallel

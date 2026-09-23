@@ -209,6 +209,9 @@ Task<Result<void>> send_error(Stream& stream, unsigned status) {
 /// doubt is how one bad request becomes several.
 template<AsyncStream Stream, typename Handler>
 Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptions options = {}) {
+    if (options.read_chunk == 0) {
+        co_return fail(Errc::invalid_argument);
+    }
     Buffer input;
     RequestParser parser{options.limits};
 
@@ -216,6 +219,7 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
         parser.reset();
 
         bool head_ready = false;
+        bool request_started = !input.empty();
         bool body_drained = false;
         Buffer body;  // accumulated only up to the configured limit
 
@@ -258,12 +262,17 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
                         // A clean close *between* requests is how a keep-alive
                         // connection normally ends — not a failure. A close
                         // mid-request is a truncated message and does fail.
-                        if (read.error() == Errc::eof && !head_ready) {
+                        if (read.error() == Errc::eof && !request_started) {
                             co_return Result<void>{};
                         }
                         co_return fail(read.error());
                     }
                     input.commit(*read);
+                    if (*read == 0) {
+                        // A non-empty read making no progress must not spin.
+                        co_return fail(Errc::eof);
+                    }
+                    request_started = true;
                 }
                 break;
             }

@@ -261,5 +261,36 @@ request, hit eof, and closed. The parser now advances its own state machine
 and `need_more` means exactly one thing. **A state machine must not export an
 ambiguous "try again".**
 
-**Deliberately absent.** UDP, TLS, routing, HTTP/2, cancellation tokens, and
-multi-threaded loops.
+**TLS/HTTPS foundation.** Optional `continuo::tls` (OpenSSL 3) depends on core,
+not on TCP or HTTP. A bounded memory BIO pair separates synchronous TLS state
+transitions from asynchronous ciphertext reads/writes. No SSL socket BIO or
+`SSL_set_fd` is used; IOCP and POSIX therefore share the same TLS pump.
+
+Client verification is mandatory: trusted chain plus DNS/IP identity; DNS
+connections also send SNI. TLS 1.2 is the minimum. OpenSSL errors are classified
+immediately on the calling thread before any suspension. Fatal errors poison
+the session, and ciphertext EOF without close_notify is truncation. Shutdown
+sends and flushes only the local close_notify; it does not certify a two-way
+shutdown. Context lifetime is retained by SSL; the borrowed transport and spans
+must remain alive. One outstanding operation per TLS stream is supported;
+overlapping calls are rejected rather than racing the SSL state machine.
+
+Tests generate fresh private CA/certificate/key fixtures at runtime; no private
+keys are committed. HTTPS exercises the existing HTTP loop unchanged, with
+trusted/untrusted chains, DNS and IP identity mismatches, short encrypted I/O,
+large payloads, orderly close and truncated TCP. The optional TLS CI matrix is
+separate from the dependency-free build. iOS/Android jobs currently compile all
+non-TLS libraries only; target OpenSSL and mobile TLS runtime validation remain
+outstanding. BSD also has no dedicated CI evidence.
+
+This integration also fixes HTTP EOF before the end of a partial request head
+being mistaken for idle disconnect, and rejects a zero read-chunk policy.
+Current request bodies remain buffered, not streamed to handlers.
+
+**Known lifecycle limits.** Pending tasks must not be destroyed while the event
+loop/kernel still holds their handles or buffers. Cancellation, deadlines and
+IOCP teardown with outstanding operations require further work. This milestone
+must not be represented as production-ready or cancellation-safe.
+
+**Deliberately absent.** UDP, routing, HTTP/2, a full HTTP client, native OS trust
+store integration, mTLS policy, cancellation tokens, and multi-threaded loops.

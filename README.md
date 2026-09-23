@@ -6,18 +6,25 @@ ride on it.
 > *Basso continuo*: the continuously played bass line that supplies the
 > harmonic foundation a Baroque work is built over. Aria sings on top of it.
 
-**Status: v0.5 — it serves HTTP.** Event loop on all three I/O backends, TCP
-transport, a strict incremental HTTP/1.1 parser, response serialisation, and a
-connection loop. A real client gets a real response over a real socket. No TLS
-and no routing layer yet. See
+**Status: TLS/HTTPS foundation.** Event loop on three I/O backends, TCP,
+HTTP/1.1 parsing/serialisation and a connection loop, plus an optional OpenSSL 3
+TLS stream. This is an experimental foundation, not a production-ready server:
+cancellation/deadlines, concurrent connection ownership, routing and a full HTTP
+client remain outstanding. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the roadmap and the
 reasoning behind each decision.
 
 | Platform | Backend | State |
 |---|---|---|
-| macOS · iOS · BSD | kqueue | built + tested |
-| Linux · Android | epoll | built + tested in CI |
-| Windows | IOCP | built + tested in CI, real loopback TCP |
+| macOS | kqueue | local runtime tests, including TLS/HTTPS |
+| Linux | epoll | desktop runtime CI, separate TLS matrix |
+| Windows | IOCP | desktop loopback runtime CI, separate TLS matrix |
+| iOS / Android | kqueue / epoll | cross-compile non-TLS modules only; no device runtime evidence |
+| BSD | kqueue | backend intended to be portable; no dedicated CI evidence |
+
+CI configuration describes the validation plan, not proof that an unrun change
+passed. Mobile TLS requires a target-built OpenSSL 3 toolchain and is not yet
+covered by this repository's CI.
 
 One public API across all of them, because it is **completion-shaped** rather
 than readiness-shaped — the only shape that maps onto IOCP as directly as onto
@@ -46,7 +53,7 @@ ergonomics, and an API that was coroutine-shaped from the first commit.
 
 using namespace continuo;
 
-Task<Result<void>> serve(tcp::Listener& listener) {
+Task<Result<void>> serve(transport::tcp::Listener& listener) {
     auto handler = [](const http::Request& request, auto& writer,
                       std::span<const std::byte> body) -> Task<Result<void>> {
         http::Response response;
@@ -56,7 +63,7 @@ Task<Result<void>> serve(tcp::Listener& listener) {
     };
 
     for (;;) {
-        Result<tcp::Socket> peer = co_await listener.accept();
+        Result<transport::tcp::Socket> peer = co_await listener.accept();
         if (!peer) {
             co_return fail(peer.error());
         }
@@ -73,14 +80,44 @@ generic over the stream — the same handler will serve TLS unchanged.
 
 ## Build
 
-Requires CMake 3.20+ and a C++20 compiler. No dependencies — including for the
-test build.
+Requires CMake 3.20+ and a C++20 compiler. The default non-TLS build has no
+third-party dependency. Enable TLS explicitly to require OpenSSL 3.
 
 ```sh
 cmake -S . -B build/debug -DCMAKE_BUILD_TYPE=Debug
 cmake --build build/debug
 ctest --test-dir build/debug --output-on-failure
 ```
+
+For TLS and HTTPS integration tests:
+
+```sh
+cmake -S . -B build/tls -DCONTINUO_ENABLE_TLS=ON -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/tls
+ctest --test-dir build/tls --output-on-failure
+```
+
+Set `OPENSSL_ROOT_DIR` if CMake cannot locate your OpenSSL 3 installation.
+`tls::Context::client(ca_file)` verifies both the certificate chain and the
+DNS name/IP passed to `tls::Stream<T>::create`. Omitting the CA file uses
+OpenSSL's default trust paths, not necessarily the operating system's native
+trust store. There is no insecure verification bypass. Context factories accept
+an optional final `protocol` argument for a single ALPN identifier; default is
+no ALPN. HTTPS callers can opt into `"http/1.1"` and inspect
+`stream.negotiated_protocol()`. The TLS module does not hardcode HTTP or imply
+HTTP/2 support.
+
+Create a stream over a live TCP socket, `co_await stream.handshake()`, then pass
+it to the existing `http::serve_connection`. On normal completion call
+`co_await stream.shutdown()` before closing TCP. Shutdown sends and flushes the
+local `close_notify`; it does not wait for a peer reply. Bare TCP EOF during TLS
+reads is reported as truncation, not a clean TLS close.
+
+TLS currently serializes operations on each stream (overlap is rejected). The
+stream, transport and borrowed buffers must outlive their pending tasks. Do not
+destroy pending event-loop tasks to implement a timeout: cancellation-safe
+lifetime management remains outstanding. HTTP request bodies are currently
+buffered up to the configured limit, not streamed to the handler.
 
 Architectural invariants are checked by a script, not by convention:
 

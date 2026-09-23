@@ -553,6 +553,35 @@ void test_double_send_refused() {
     CHECK(count_occurrences(stream.sent(), "HTTP/1.1 200 OK") == 1);
 }
 
+void test_truncated_head_and_zero_read_policy() {
+    test::section("truncated heads are not clean idle closes");
+    int calls = 0;
+    auto handler =
+        [&calls](const Request&, auto& writer, std::span<const std::byte>) -> Task<Result<void>> {
+        ++calls;
+        co_return co_await writer.send(Response{});
+    };
+    for (const std::string_view partial :
+         {"G", "GET / HTTP/1.1\r\n", "GET / HTTP/1.1\r\nHost: x\r\n"}) {
+        ScriptedStream stream{std::string{partial}};
+        const auto result = serve_connection(stream, handler).sync_get();
+        CHECK(!result);
+        CHECK(result.error() == Errc::eof);
+    }
+    CHECK(calls == 0);
+    ScriptedStream idle{""};
+    CHECK(serve_connection(idle, handler).sync_get().has_value());
+    ScriptedStream pipeline{"GET / HTTP/1.1\r\nHost: x\r\n\r\nGET /incomplete HTTP/1.1\r\n"};
+    CHECK(!serve_connection(pipeline, handler).sync_get());
+    CHECK(calls == 1);
+    ServerOptions options;
+    options.read_chunk = 0;
+    ScriptedStream empty{""};
+    const auto invalid = serve_connection(empty, handler, options).sync_get();
+    CHECK(!invalid);
+    CHECK(invalid.error() == Errc::invalid_argument);
+}
+
 }  // namespace
 
 int main() {
@@ -575,6 +604,7 @@ int main() {
     test_clean_close_between_requests();
     test_request_limit_closes_connection();
     test_double_send_refused();
+    test_truncated_head_and_zero_read_policy();
 
     return test::summary();
 }

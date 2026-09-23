@@ -23,6 +23,7 @@ endif()
 
 option(CONTINUO_BUILD_TESTS "Build Continuo tests" ${PROJECT_IS_TOP_LEVEL})
 option(CONTINUO_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
+option(CONTINUO_ENABLE_TLS "Build the optional OpenSSL 3 TLS stream module" OFF)
 
 # ── Warning policy ──────────────────────────────────────────────────────────
 #
@@ -53,10 +54,10 @@ endif()
 #
 # Dependency direction is one-way and enforced by tools/ci/check_layering.py:
 #
-#   http / ws / ... (protocol)  →  tcp / udp / unix (transport)  →  core
+#   http and tls consume core's AsyncStream seam; transport implements it.
+#   Applications compose the modules, rather than http depending on sockets.
 #
-# core knows nothing about transports; transports know nothing about protocols.
-# `transport/` and `http/` are reserved slots in v0.1 and carry no code yet.
+# TLS is optional: the core/plain TCP/HTTP build has no OpenSSL dependency.
 
 if(CONTINUO_BUILD_TESTS)
     enable_testing()
@@ -65,6 +66,10 @@ endif()
 add_subdirectory(modules/core)
 add_subdirectory(modules/transport)
 add_subdirectory(modules/http)
+
+if(CONTINUO_ENABLE_TLS)
+    add_subdirectory(modules/tls)
+endif()
 
 if(CONTINUO_BUILD_TESTS)
     add_subdirectory(modules/core/tests)
