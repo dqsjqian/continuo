@@ -714,6 +714,10 @@ void test_cancel_in_flight() {
     CHECK(done.load(std::memory_order_acquire) == 1);
 }
 
+#if CONTINUO_HAS_READINESS_API
+/// Only meaningful where readiness is the mechanism: `wait_readable` and
+/// `wait_writable` are not declared on IOCP, so this is compiled out rather
+/// than skipped, which is the honest shape for a platform extension.
 void test_cancel_leaves_other_direction_armed() {
     test::section("cancelling one direction leaves the other waiting");
 
@@ -791,6 +795,7 @@ void test_cancel_leaves_other_direction_armed() {
     CHECK(write_outcome.has_value());
     CHECK(loop.outstanding() == 0);
 }
+#endif  // CONTINUO_HAS_READINESS_API
 
 void test_deadline_on_a_suspended_read() {
     test::section("deadline on a read that never becomes ready");
@@ -1221,7 +1226,9 @@ int main(int argc, char** argv) {
     test_yield_returns_to_loop();
     test_options_rejected_before_submit();
     test_cancel_in_flight();
+#if CONTINUO_HAS_READINESS_API
     test_cancel_leaves_other_direction_armed();
+#endif
     test_deadline_on_a_suspended_read();
     test_deadline_is_absolute_across_retries();
     test_sleep_deadline_beats_wake_up();
