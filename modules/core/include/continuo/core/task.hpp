@@ -12,11 +12,16 @@
 // awaiter), which is what keeps a temporary `Task` from destroying a frame
 // that is still running.
 //
-// Deliberately absent from v0.1: `then()`-style continuations, detached
-// launching, and cancellation plumbing. They belong with the executor and
-// event loop, which land together in a later milestone.
+// Destroying a *started but unfinished* frame is a contract violation and
+// terminates — the same rule as destroying a joinable `std::thread`. See
+// `detail::report_abandoned_frame`.
+//
+// Deliberately absent: `then()`-style continuations and detached launching.
+// Per-operation cancellation lives on the event loop (`OperationOptions`),
+// not on `Task`: a task does not know which operation it is suspended on.
 
 #include <coroutine>
+#include <cstdio>
 #include <exception>
 #include <optional>
 #include <stdexcept>
@@ -30,6 +35,33 @@ class Task;
 
 namespace detail {
 
+/// Report that a started, unfinished coroutine frame was about to be destroyed,
+/// then terminate.
+///
+/// Why terminate rather than throw: once a task has started and suspended,
+/// something else may hold its handle — the event loop stores it, along with a
+/// pointer into the awaiter that lives in that very frame, plus whatever
+/// buffers the operation borrowed. Destroying the frame turns all of those into
+/// dangling references, and there is no way for the destructor to find out
+/// whether that happened. Throwing would be worse than useless: the frame would
+/// still be destroyed (or leaked) while the exception unwinds.
+///
+/// This is the same contract as destroying a joinable `std::thread`.
+///
+/// `std::terminate` rather than `std::abort`, so that the subprocess contract
+/// tests can install a `std::set_terminate` handler and assert an exit code.
+[[noreturn]] inline void report_abandoned_frame(const char* site) noexcept {
+    std::fprintf(stderr,
+                 "continuo::Task: %s must not destroy a started, unfinished coroutine frame.\n"
+                 "  The event loop may still hold its handle, its result slot, or buffers it\n"
+                 "  borrowed. Await the task to completion, or keep it alive until whatever\n"
+                 "  owns the suspension resumes it. To stop an operation early, pass\n"
+                 "  OperationOptions{.stop = token} instead of destroying the task.\n"
+                 "  This is the same contract as destroying a joinable std::thread.\n",
+                 site);
+    std::terminate();
+}
+
 /// Shared promise state: the continuation to resume once the body finishes.
 ///
 /// `FinalAwaiter::await_suspend` is a template so that a
@@ -38,6 +70,12 @@ namespace detail {
 /// not be convertible from the derived handle.
 struct TaskPromiseBase {
     std::coroutine_handle<> continuation{};
+
+    /// Set at the two — and only two — places that resume a task frame:
+    /// `Task::Awaiter::await_suspend` and `Task::sync_get`. Together with
+    /// `handle.done()` this separates "never ran, safe to destroy" from
+    /// "suspended mid-flight, someone else may hold it".
+    bool started{false};
 
     struct FinalAwaiter {
         [[nodiscard]] bool await_ready() const noexcept { return false; }
@@ -54,6 +92,16 @@ struct TaskPromiseBase {
     [[nodiscard]] std::suspend_always initial_suspend() noexcept { return {}; }
     [[nodiscard]] FinalAwaiter final_suspend() noexcept { return {}; }
 };
+
+/// True when destroying `handle`'s frame would be a contract violation.
+///
+/// `done()` is well defined for a frame suspended at any suspend point,
+/// including the initial and final ones; it is undefined only while a frame is
+/// *executing*, and no caller of this reaches it from inside a running body.
+template<typename Promise>
+[[nodiscard]] bool frame_abandoned(std::coroutine_handle<Promise> handle) noexcept {
+    return handle && handle.promise().started && !handle.done();
+}
 
 template<typename T>
 struct TaskPromise final : TaskPromiseBase {
@@ -144,15 +192,24 @@ public:
             Awaiter& operator=(Awaiter&&) = delete;
 
             ~Awaiter() {
-                if (handle_) {
-                    handle_.destroy();
+                if (!handle_) {
+                    return;
                 }
+                // The awaiter lives in the awaiting frame and outlives the
+                // suspension, so destroying that frame mid-await lands here
+                // first. Cascading destruction therefore fails fast at the
+                // outermost abandoned level, never deeper.
+                if (detail::frame_abandoned(handle_)) {
+                    detail::report_abandoned_frame("awaiting frame");
+                }
+                handle_.destroy();
             }
 
             [[nodiscard]] bool await_ready() const noexcept { return !handle_ || handle_.done(); }
 
             std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiting) noexcept {
                 handle_.promise().continuation = awaiting;
+                handle_.promise().started = true;  // before the symmetric transfer
                 return handle_;
             }
 
@@ -174,8 +231,8 @@ public:
     ///
     /// Intended for tests and for synchronous entry points. A task that
     /// suspends on real I/O will *not* complete here — that needs an event
-    /// loop, and this function throws `std::logic_error` rather than silently
-    /// returning a half-built result.
+    /// loop, and a suspension is a contract violation that terminates rather
+    /// than either destroying a frame the loop may reference or leaking it.
     decltype(auto) sync_get() && {
         handle_type handle = std::exchange(handle_, {});
         if (!handle) {
@@ -191,10 +248,12 @@ public:
             }
         } guard{handle};
 
+        handle.promise().started = true;
         handle.resume();
         if (!handle.done()) {
-            throw std::logic_error(
-                "continuo::Task::sync_get: task suspended; drive it on an event loop instead");
+            // The guard must not run: the frame is suspended, so whatever it
+            // suspended on may hold the handle and the awaiter inside it.
+            detail::report_abandoned_frame("sync_get");
         }
 
         if constexpr (std::is_void_v<T>) {
@@ -208,10 +267,17 @@ public:
 
 private:
     void destroy() noexcept {
-        if (handle_) {
-            handle_.destroy();
-            handle_ = {};
+        if (!handle_) {
+            return;
         }
+        // A `Task` normally owns only an unstarted frame — awaiting moves the
+        // handle into the awaiter. Holding a started one and dropping it is the
+        // same violation, so it gets the same answer.
+        if (detail::frame_abandoned(handle_)) {
+            detail::report_abandoned_frame("task destructor");
+        }
+        handle_.destroy();
+        handle_ = {};
     }
 
     handle_type handle_{};

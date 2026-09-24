@@ -13,8 +13,11 @@
 #include "continuo/core/task.hpp"
 
 #include <algorithm>
+#include <coroutine>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <span>
 #include <stdexcept>
@@ -126,8 +129,13 @@ void test_task() {
     CHECK_THROWS(throws_inside().sync_get(), std::runtime_error);
     CHECK_THROWS(propagates_failure().sync_get(), std::runtime_error);
 
-    // sync_get refuses to pretend a suspended task finished.
-    CHECK_THROWS(suspends_forever().sync_get(), std::logic_error);
+    // An empty task is a caller error, not a lifetime violation: there is no
+    // frame to abandon, so it still reports by exception.
+    CHECK_THROWS(Task<int>{}.sync_get(), std::logic_error);
+
+    // sync_get on a task that suspends is a contract violation and terminates.
+    // Asserted out-of-process, in `task_contract_sync-get-suspended`, because a
+    // terminating process cannot also report the rest of this file's checks.
 
     // Move-only ownership: the moved-from task must be empty.
     Task<int> source = answer();
@@ -332,9 +340,36 @@ void test_executor_seam() {
     CHECK(queued.pending() == 0);
 }
 
+// ── contract violations, asserted out-of-process ─────────────────────────────
+
+/// Destroying a started, unfinished frame must terminate. Each mode does
+/// exactly one violation and must not return; `check_terminates.cmake` asserts
+/// the terminate handler's exit code.
+int run_contract_violation(std::string_view mode) {
+    // A portable terminate handler, not platform-specific signals.
+    std::set_terminate([] { std::_Exit(77); });
+
+    if (mode == "sync-get-suspended") {
+        // The frame parks on a suspend point sync_get cannot drive.
+        suspends_forever().sync_get();
+    } else if (mode == "abandoned-awaiter") {
+        Task<void> task = suspends_forever();
+        auto awaiter = std::move(task).operator co_await();
+        // Start the body by hand so that it is genuinely suspended when the
+        // awaiter — which lives in the awaiting frame — goes out of scope.
+        awaiter.await_suspend(std::noop_coroutine()).resume();
+    } else {
+        return 2;
+    }
+    return 0;  // reaching here means the violation was not caught
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2) {
+        return run_contract_violation(argv[1]);
+    }
     test_error_model();
     test_task();
     test_buffer();

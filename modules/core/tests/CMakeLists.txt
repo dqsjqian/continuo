@@ -17,12 +17,24 @@ add_test(NAME core COMMAND continuo_core_tests)
 add_test(NAME event_loop COMMAND continuo_event_loop_tests)
 add_test(NAME task_scope COMMAND continuo_task_scope_tests)
 set_tests_properties(task_scope PROPERTIES TIMEOUT 60)
-foreach(mode pending-destruction unobserved-failure abandoned-join unstarted-join)
-    add_test(NAME task_scope_${mode} COMMAND ${CMAKE_COMMAND}
-        -DPROGRAM=$<TARGET_FILE:continuo_task_scope_tests> -DMODE=${mode}
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/check_scope_termination.cmake)
-    set_tests_properties(task_scope_${mode} PROPERTIES TIMEOUT 15)
-endforeach()
+
+# Contract violations must terminate, and only a separate process can assert
+# that. `check_terminates.cmake` demands the exact exit code the binary's
+# terminate handler installs, so an ordinary crash does not pass as fail-fast.
+function(continuo_add_terminate_tests prefix target)
+    foreach(mode ${ARGN})
+        add_test(NAME ${prefix}_${mode} COMMAND ${CMAKE_COMMAND}
+            -DPROGRAM=$<TARGET_FILE:${target}> -DMODE=${mode}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/check_terminates.cmake)
+        set_tests_properties(${prefix}_${mode} PROPERTIES TIMEOUT 15)
+    endforeach()
+endfunction()
+
+continuo_add_terminate_tests(task_scope continuo_task_scope_tests
+    pending-destruction unobserved-failure abandoned-join unstarted-join)
+
+continuo_add_terminate_tests(task_contract continuo_core_tests
+    sync-get-suspended abandoned-awaiter)
 
 # An event-loop bug tends to hang rather than fail. A timeout turns that into
 # a red test instead of a stuck CI job.
