@@ -1,7 +1,10 @@
 #include "continuo/http/serializer.hpp"
 
+#include "grammar.hpp"
+
 #include <array>
-#include <cstdio>
+#include <cstddef>
+#include <cstdint>
 #include <string>
 
 namespace continuo::http {
@@ -12,45 +15,12 @@ void append(Buffer& out, std::string_view text) {
         std::span<const std::byte>{reinterpret_cast<const std::byte*>(text.data()), text.size()});
 }
 
-/// `tchar` — the only bytes allowed in a field name (RFC 9110 §5.6.2).
-[[nodiscard]] constexpr bool is_tchar(unsigned char c) noexcept {
-    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
-        return true;
-    }
-    switch (c) {
-    case '!':
-    case '#':
-    case '$':
-    case '%':
-    case '&':
-    case '\'':
-    case '*':
-    case '+':
-    case '-':
-    case '.':
-    case '^':
-    case '_':
-    case '`':
-    case '|':
-    case '~':
-        return true;
-    default:
-        return false;
-    }
-}
-
-/// Visible ASCII, SP, HTAB, and obs-text. Control bytes excluded: a CR or LF
-/// inside a value is response splitting.
-[[nodiscard]] constexpr bool is_field_vchar(unsigned char c) noexcept {
-    return c == '\t' || (c >= 0x20 && c != 0x7F);
-}
-
 [[nodiscard]] bool valid_header_name(std::string_view name) noexcept {
     if (name.empty()) {
         return false;
     }
     for (const char c : name) {
-        if (!is_tchar(static_cast<unsigned char>(c))) {
+        if (!grammar::is_tchar(static_cast<unsigned char>(c))) {
             return false;
         }
     }
@@ -59,7 +29,7 @@ void append(Buffer& out, std::string_view text) {
 
 [[nodiscard]] bool valid_header_value(std::string_view value) noexcept {
     for (const char c : value) {
-        if (!is_field_vchar(static_cast<unsigned char>(c))) {
+        if (!grammar::is_field_vchar(static_cast<unsigned char>(c))) {
             return false;
         }
     }
@@ -124,23 +94,10 @@ bool should_keep_alive(const Request& request) noexcept {
         if (!connection) {
             return false;
         }
-        std::string_view remaining = *connection;
-        while (!remaining.empty()) {
-            const std::size_t comma = remaining.find(',');
-            std::string_view item = remaining.substr(0, comma);
-            while (!item.empty() && (item.front() == ' ' || item.front() == '\t')) {
-                item.remove_prefix(1);
-            }
-            while (!item.empty() && (item.back() == ' ' || item.back() == '\t')) {
-                item.remove_suffix(1);
-            }
+        for (const std::string_view item : grammar::split_list(*connection)) {
             if (HeaderMap::names_equal(item, token)) {
                 return true;
             }
-            if (comma == std::string_view::npos) {
-                break;
-            }
-            remaining.remove_prefix(comma + 1);
         }
         return false;
     };

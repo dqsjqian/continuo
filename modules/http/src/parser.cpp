@@ -1,67 +1,16 @@
 #include "continuo/http/parser.hpp"
 
+#include "grammar.hpp"
+
 #include <algorithm>
-#include <cstring>
+#include <cstdint>
 #include <limits>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace continuo::http {
 namespace {
-
-// ── character classification (RFC 9110 §5.6.2) ───────────────────────────────
-
-/// `tchar` — the characters allowed in a field name or method token.
-///
-/// Notably excludes SP, HTAB, and the separators. A field name containing
-/// anything outside this set is rejected, which is what closes the "header
-/// name with a space" smuggling vector.
-[[nodiscard]] constexpr bool is_tchar(unsigned char c) noexcept {
-    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
-        return true;
-    }
-    switch (c) {
-    case '!':
-    case '#':
-    case '$':
-    case '%':
-    case '&':
-    case '\'':
-    case '*':
-    case '+':
-    case '-':
-    case '.':
-    case '^':
-    case '_':
-    case '`':
-    case '|':
-    case '~':
-        return true;
-    default:
-        return false;
-    }
-}
-
-/// Characters permitted in a field value: visible ASCII, SP, HTAB, plus the
-/// obs-text range. Control characters are not — a bare CR or LF inside a value
-/// is header injection.
-[[nodiscard]] constexpr bool is_field_vchar(unsigned char c) noexcept {
-    return c == '\t' || (c >= 0x20 && c != 0x7F);
-}
-
-[[nodiscard]] constexpr bool is_ows(char c) noexcept {
-    return c == ' ' || c == '\t';
-}
-
-[[nodiscard]] std::string_view trim_ows(std::string_view text) noexcept {
-    while (!text.empty() && is_ows(text.front())) {
-        text.remove_prefix(1);
-    }
-    while (!text.empty() && is_ows(text.back())) {
-        text.remove_suffix(1);
-    }
-    return text;
-}
 
 [[nodiscard]] std::string_view as_text(std::span<const std::byte> bytes) noexcept {
     return std::string_view{reinterpret_cast<const char*>(bytes.data()), bytes.size()};
@@ -156,27 +105,6 @@ struct Line {
         value = value * 16 + digit;
     }
     return value;
-}
-
-/// Split a comma-separated list, trimming optional whitespace around items.
-[[nodiscard]] std::vector<std::string_view> split_list(std::string_view text) {
-    std::vector<std::string_view> items;
-    while (!text.empty()) {
-        const std::size_t comma = text.find(',');
-        const std::string_view item = trim_ows(text.substr(0, comma));
-        if (!item.empty()) {
-            items.push_back(item);
-        }
-        if (comma == std::string_view::npos) {
-            break;
-        }
-        text.remove_prefix(comma + 1);
-    }
-    return items;
-}
-
-[[nodiscard]] bool equals_ignore_case(std::string_view a, std::string_view b) noexcept {
-    return HeaderMap::names_equal(a, b);
 }
 
 class ParseCategory final : public std::error_category {
@@ -398,7 +326,7 @@ Result<bool> RequestParser::parse_start_line(Buffer& input) {
         return fail(ParseError::malformed_start_line);
     }
     for (const char c : method) {
-        if (!is_tchar(static_cast<unsigned char>(c))) {
+        if (!grammar::is_tchar(static_cast<unsigned char>(c))) {
             return fail(ParseError::malformed_start_line);
         }
     }
@@ -458,7 +386,7 @@ Result<bool> RequestParser::parse_headers(Buffer& input) {
         // A continuation line (obs-fold). Rejected by default: RFC 9112 §5.2
         // tells recipients to reject it, and accepting it while a peer does
         // not is a smuggling differential.
-        if (is_ows(line.text.front())) {
+        if (grammar::is_ows(line.text.front())) {
             if (!limits_.allow_obsolete_line_folding) {
                 return fail(ParseError::obsolete_line_folding);
             }
@@ -480,22 +408,22 @@ Result<bool> RequestParser::parse_headers(Buffer& input) {
         // a server MUST reject this; it is one of the best-known smuggling
         // vectors, because intermediaries disagree about whether the field
         // name includes the space.
-        if (is_ows(name.back())) {
+        if (grammar::is_ows(name.back())) {
             return fail(ParseError::whitespace_before_colon);
         }
         for (const char c : name) {
-            if (!is_tchar(static_cast<unsigned char>(c))) {
+            if (!grammar::is_tchar(static_cast<unsigned char>(c))) {
                 return fail(ParseError::malformed_header);
             }
         }
 
         const std::string_view raw_value = line.text.substr(colon + 1);
         for (const char c : raw_value) {
-            if (!is_field_vchar(static_cast<unsigned char>(c))) {
+            if (!grammar::is_field_vchar(static_cast<unsigned char>(c))) {
                 return fail(ParseError::malformed_header);
             }
         }
-        const std::string_view value = trim_ows(raw_value);
+        const std::string_view value = grammar::trim_ows(raw_value);
 
         if (request_.headers.size() + 1 > limits_.max_header_count) {
             return fail(ParseError::limit_exceeded);
@@ -527,7 +455,7 @@ Result<void> RequestParser::decide_framing() {
         const std::vector<std::string_view> raw = request_.headers.get_all("Transfer-Encoding");
         std::vector<std::string_view> codings;
         for (const std::string_view field : raw) {
-            for (const std::string_view coding : split_list(field)) {
+            for (const std::string_view coding : grammar::split_list(field)) {
                 codings.push_back(coding);
             }
         }
@@ -539,11 +467,11 @@ Result<void> RequestParser::decide_framing() {
         // otherwise the message length is undeterminable (RFC 9112 §6.3).
         std::size_t chunked_count = 0;
         for (const std::string_view coding : codings) {
-            if (equals_ignore_case(coding, "chunked")) {
+            if (HeaderMap::names_equal(coding, "chunked")) {
                 ++chunked_count;
             }
         }
-        if (chunked_count != 1 || !equals_ignore_case(codings.back(), "chunked")) {
+        if (chunked_count != 1 || !HeaderMap::names_equal(codings.back(), "chunked")) {
             return fail(ParseError::invalid_transfer_encoding);
         }
         // Any other coding (gzip, deflate) is a content transform this parser
@@ -562,7 +490,7 @@ Result<void> RequestParser::decide_framing() {
         std::optional<std::uint64_t> agreed;
         for (const std::string_view field : values) {
             // A single field may itself be a list: "Content-Length: 5, 5".
-            for (const std::string_view item : split_list(field)) {
+            for (const std::string_view item : grammar::split_list(field)) {
                 const std::optional<std::uint64_t> parsed = parse_decimal(item);
                 if (!parsed) {
                     return fail(ParseError::malformed_content_length);
@@ -719,11 +647,11 @@ Result<RequestParser::Progress> RequestParser::read_chunk_trailer(Buffer& input)
             return fail(ParseError::malformed_header);
         }
         const std::string_view name = line.text.substr(0, colon);
-        if (is_ows(name.back())) {
+        if (grammar::is_ows(name.back())) {
             return fail(ParseError::whitespace_before_colon);
         }
         for (const char c : name) {
-            if (!is_tchar(static_cast<unsigned char>(c))) {
+            if (!grammar::is_tchar(static_cast<unsigned char>(c))) {
                 return fail(ParseError::malformed_header);
             }
         }
@@ -732,7 +660,7 @@ Result<RequestParser::Progress> RequestParser::read_chunk_trailer(Buffer& input)
             return fail(ParseError::limit_exceeded);
         }
 
-        trailers_.append(std::string{name}, std::string{trim_ows(line.text.substr(colon + 1))});
+        trailers_.append(std::string{name}, std::string{grammar::trim_ows(line.text.substr(colon + 1))});
         input.consume(line.consumed);
         return Progress::advanced;
     }
