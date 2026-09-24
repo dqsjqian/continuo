@@ -74,7 +74,7 @@ flowchart TB
 | macOS | kqueue | 桌面运行测试，包含 TLS / HTTPS |
 | Linux | epoll | 桌面运行 CI，独立 TLS 矩阵 |
 | Windows | IOCP | 桌面 loopback 运行 CI，独立 TLS 矩阵 |
-| iOS / Android | kqueue / epoll | 仅非 TLS 模块交叉编译；没有真机运行证据 |
+| iOS / Android | kqueue / epoll | 仅非 TLS 模块交叉编译；没有真机运行证据。Android 需 **NDK 29+**，见下文构建要求 |
 | BSD | kqueue | 后端可移植方向；没有专门 CI 证据 |
 
 最近已确认的三桌面 CI 通过基线是 `a123370`。IOCP 的取消语义在开发机上**没有任何运行证据**：本地只通过 mingw-w64 交叉编译做类型与生命周期检查，而 mingw 不是 MSVC，能编译也不等于能运行。CI 配置存在，不等于当前代码已通过。
@@ -257,7 +257,9 @@ stop 可以从**任意线程**请求，但一律在循环线程交付：回调�
 
 ## 构建与接入
 
-需要 **CMake 3.20+、C++23 编译器，以及同时提供 `std::expected` 和 `std::stop_token` 的标准库**。默认非 TLS 构建没有第三方依赖；TLS 显式启用后需要 OpenSSL 3。Android 需 **API 30+**：NDK 的 libc++ 在更低 API 级别上不提供 `std::stop_token`。
+需要 **CMake 3.20+、C++23 编译器，以及同时提供 `std::expected` 和 `std::stop_token` 的标准库**。默认非 TLS 构建没有第三方依赖；TLS 显式启用后需要 OpenSSL 3。
+
+Android 需 **NDK 29 或更新**（与 API 级别无关）：NDK 27 / 28 附带的 libc++ 是 LLVM 18 / 19，那里 `std::stop_token` 被 `_LIBCPP_HAS_NO_EXPERIMENTAL_STOP_TOKEN` 门控，发行版默认关闭；LLVM 20 移除了该门控。NDK 29（clang 21）在 API 24 上实测可构建。
 
 ```sh
 cmake -S . -B build/debug -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_STANDARD=23

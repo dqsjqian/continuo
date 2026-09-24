@@ -373,6 +373,22 @@ argument for running tests on every platform rather than building on them.
    lifetime errors cheaply, but mingw is not MSVC and a compile is not a run.
    Those semantics have no local evidence of any kind.
 
+4. **A toolchain the CI image defaults to is not the toolchain a library
+   requires.** `std::stop_token` is gated behind
+   `_LIBCPP_HAS_NO_EXPERIMENTAL_STOP_TOKEN` in the libc++ that NDK 27 and 28
+   ship (LLVM 18 and 19), and LLVM 20 removed the gate — so the Android job
+   could not build this library at any API level while it used
+   `$ANDROID_NDK_ROOT`. The NDK version is now pinned.
+
+   The instructive part is the diagnosis. `TaskScope` has used
+   `std::stop_source` since it was written, so the requirement predates this
+   work by some margin; it stayed invisible only because no translation unit
+   the Android job compiled happened to include that header. And the first
+   attempt at a fix — raising the API level — was a guess that CI disproved,
+   because libc++'s availability gating is Apple-only and had nothing to do
+   with it. Reading the libc++ sources for the exact gate, and then building
+   against a newer NDK locally, produced the answer in minutes.
+
 The pattern is worth naming, because it will recur: **the dangerous
 portability bug is the one where every platform builds and runs, and one of
 them silently fails to match the condition callers switch on.**

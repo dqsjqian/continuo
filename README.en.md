@@ -74,7 +74,7 @@ Solid arrows show dependencies; dashed arrows show application composition. HTTP
 | macOS | kqueue | Desktop runtime tests, including TLS / HTTPS |
 | Linux | epoll | Desktop runtime CI, separate TLS matrix |
 | Windows | IOCP | Desktop loopback runtime CI, separate TLS matrix |
-| iOS / Android | kqueue / epoll | Non-TLS cross-compilation only; no device runtime evidence. Android needs **API level 30 or newer**, because the NDK's libc++ does not provide `std::stop_token` below it |
+| iOS / Android | kqueue / epoll | Non-TLS cross-compilation only; no device runtime evidence. Android needs **NDK 29 or newer** — see the build requirements below |
 | BSD | kqueue | Backend portability direction; no dedicated CI evidence |
 
 The latest confirmed passing three-desktop CI baseline is `a123370`. The IOCP cancellation semantics have **no runtime evidence at all** on the development machine: locally they are only cross-compiled through mingw-w64 as a type and lifetime check, and mingw is not MSVC — compiling is not running. A CI configuration is not proof that the current code passed.
@@ -257,7 +257,9 @@ A stop may be requested from **any thread**, but is always delivered on the loop
 
 ## Build and integrate
 
-Requires **CMake 3.20+, a C++23 compiler and a standard library providing both `std::expected` and `std::stop_token`**. The default non-TLS build has no third-party dependency. Enabling TLS explicitly requires OpenSSL 3. Android needs **API level 30 or newer**: the NDK's libc++ does not provide `std::stop_token` below it.
+Requires **CMake 3.20+, a C++23 compiler and a standard library providing both `std::expected` and `std::stop_token`**. The default non-TLS build has no third-party dependency. Enabling TLS explicitly requires OpenSSL 3.
+
+Android needs **NDK 29 or newer**, independently of API level: NDK 27 and 28 ship libc++ from LLVM 18 and 19, where `std::stop_token` sits behind `_LIBCPP_HAS_NO_EXPERIMENTAL_STOP_TOKEN` and is off in released builds; LLVM 20 removed the gate. NDK 29 (clang 21) is verified to build at API level 24.
 
 ```sh
 cmake -S . -B build/debug -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_STANDARD=23
