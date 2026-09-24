@@ -17,7 +17,15 @@ namespace continuo::tls {
 /// 同一实例同时只允许一个操作（包括读写），重叠操作返回 operation_in_progress。
 /// 已开始的操作被取消/抛异常或发生致命错误后不可复用；析构不会发送 close_notify。
 /// 不能绕过本包装器直接操作底层流。跨线程驱动还须遵守底层流的线程约束。
-template<AsyncStream Underlying>
+///
+/// 底层流必须是 `BoundedStream`。一次 TLS 操作会对底层做任意多次读写，而只有
+/// 真正在等待的那一层能停止等待；底层若无法承载 `OperationOptions`，本包装器
+/// 就兑现不了取消与截止时间，handshake 会变成一个随时可能挂死的等待。
+///
+/// `options` 原样转发给**每一次**底层读写。这正是绝对截止时间的含义：没有任何
+/// 一层需要扣减已耗时间，一个 `{.deadline = T}` 自然表示「整个 handshake / 读 /
+/// 写必须在 T 之前结束」。换成时长的话每层都得自己做减法，而且都会算错。
+template<BoundedStream Underlying>
 class Stream {
 public:
     [[nodiscard]] static Result<Stream>
@@ -33,22 +41,24 @@ public:
     Stream& operator=(const Stream&) = delete;
     ~Stream() = default;
 
-    [[nodiscard]] Task<Result<void>> handshake() {
-        return run_void(state_.get(), Operation::handshake);
+    [[nodiscard]] Task<Result<void>> handshake(OperationOptions options = {}) {
+        return run_void(state_.get(), Operation::handshake, std::move(options));
     }
 
-    [[nodiscard]] Task<Result<std::size_t>> read_some(std::span<std::byte> destination) {
-        return run(state_.get(), Operation::read, destination, {});
+    [[nodiscard]] Task<Result<std::size_t>> read_some(std::span<std::byte> destination,
+                                                      OperationOptions options = {}) {
+        return run(state_.get(), Operation::read, destination, {}, std::move(options));
     }
 
-    [[nodiscard]] Task<Result<std::size_t>> write_some(std::span<const std::byte> source) {
-        return run(state_.get(), Operation::write, {}, source);
+    [[nodiscard]] Task<Result<std::size_t>> write_some(std::span<const std::byte> source,
+                                                       OperationOptions options = {}) {
+        return run(state_.get(), Operation::write, {}, source, std::move(options));
     }
 
     /// 发送并 flush 本方 close_notify；不等待对方通知，不代表双向关闭完成。
     /// 成功后只能再次 shutdown，不能继续应用读写；底层流由调用方关闭。
-    [[nodiscard]] Task<Result<void>> shutdown() {
-        return run_void(state_.get(), Operation::shutdown);
+    [[nodiscard]] Task<Result<void>> shutdown(OperationOptions options = {}) {
+        return run_void(state_.get(), Operation::shutdown, std::move(options));
     }
 
     /// 仅在没有未完成操作时调用；返回视图在本 Stream 析构后失效。
@@ -83,7 +93,7 @@ private:
 
     explicit Stream(std::unique_ptr<State> state) : state_(std::move(state)) {}
 
-    static Task<Result<void>> flush(State& state) {
+    static Task<Result<void>> flush(State& state, const OperationOptions& options) {
         for (;;) {
             auto drained = state.engine.drain(state.buffer);
             if (!drained) co_return fail(drained.error());
@@ -91,7 +101,8 @@ private:
             std::size_t offset = 0;
             while (offset < *drained) {
                 auto written = co_await state.underlying->write_some(
-                    std::span<const std::byte>(state.buffer).subspan(offset, *drained - offset));
+                    std::span<const std::byte>(state.buffer).subspan(offset, *drained - offset),
+                    options);
                 if (!written || *written == 0 || *written > *drained - offset) {
                     state.engine.invalidate();
                     if (!written) co_return fail(written.error());
@@ -102,14 +113,14 @@ private:
         }
     }
 
-    static Task<Result<void>> receive(State& state) {
+    static Task<Result<void>> receive(State& state, const OperationOptions& options) {
         const auto capacity = std::min(state.buffer.size(), state.engine.input_capacity());
         if (capacity == 0) {
             state.engine.invalidate();
             co_return fail(make_error_code(Errc::protocol_error));
         }
         auto received = co_await state.underlying->read_some(
-            std::span<std::byte>(state.buffer).first(capacity));
+            std::span<std::byte>(state.buffer).first(capacity), options);
         if (!received || *received == 0 || *received > capacity) {
             state.engine.invalidate();
             if ((!received && received.error() == continuo::Errc::eof) ||
@@ -130,7 +141,8 @@ private:
     static Task<Result<std::size_t>> drive(State& state,
                                            Operation operation,
                                            std::span<std::byte> destination,
-                                           std::span<const std::byte> source) {
+                                           std::span<const std::byte> source,
+                                           const OperationOptions& options) {
         for (;;) {
             Result<Engine::Step> step = fail(make_error_code(Errc::invalid_state));
             switch (operation) {
@@ -151,15 +163,16 @@ private:
                 const auto error = step.error();
                 if (error != make_error_code(Errc::invalid_state)) {
                     // 致命错误后仅发送已生成的 alert，不能再调用 SSL I/O。
+                    // 告警是收尾动作，仍受同一截止时间约束，不另给预算。
                     try {
-                        (void)co_await flush(state);
+                        (void)co_await flush(state, options);
                     } catch (...) {
                         // 告警发送失败不能覆盖最初的 TLS 错误。
                     }
                 }
                 co_return fail(error);
             }
-            auto flushed = co_await flush(state);
+            auto flushed = co_await flush(state, options);
             if (!flushed) co_return fail(flushed.error());
             switch (step->status) {
             case Engine::Status::complete:
@@ -169,7 +182,7 @@ private:
             case Engine::Status::want_output:
                 break;
             case Engine::Status::want_input:
-                auto received = co_await receive(state);
+                auto received = co_await receive(state, options);
                 if (!received) co_return fail(received.error());
                 break;
             }
@@ -179,17 +192,19 @@ private:
     static Task<Result<std::size_t>> run(State* state,
                                          Operation operation,
                                          std::span<std::byte> destination,
-                                         std::span<const std::byte> source) {
+                                         std::span<const std::byte> source,
+                                         OperationOptions options) {
         if (!state) co_return fail(make_error_code(Errc::invalid_state));
         OperationGuard guard(*state);
         if (!guard.acquired) co_return fail(make_error_code(Errc::operation_in_progress));
-        auto result = co_await drive(*state, operation, destination, source);
+        auto result = co_await drive(*state, operation, destination, source, options);
         guard.completed = true;
         co_return result;
     }
 
-    static Task<Result<void>> run_void(State* state, Operation operation) {
-        auto result = co_await run(state, operation, {}, {});
+    static Task<Result<void>>
+    run_void(State* state, Operation operation, OperationOptions options) {
+        auto result = co_await run(state, operation, {}, {}, std::move(options));
         if (!result) co_return fail(result.error());
         co_return Result<void>{};
     }

@@ -39,8 +39,10 @@
 #include "continuo/http/parser.hpp"
 #include "continuo/http/serializer.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <utility>
@@ -63,17 +65,55 @@ struct ServerOptions {
 
     /// Send `Connection: close` and hang up after the current response.
     bool force_close = false;
+
+    /// How long an established connection may sit between requests.
+    ///
+    /// Durations rather than a deadline, because a deadline cannot express what
+    /// a server actually wants: one absolute time would cover the whole
+    /// connection, so the hundredth keep-alive request would inherit whatever
+    /// budget the first one left. `serve_connection` turns these into a fresh
+    /// absolute deadline for each request, which is the form every layer below
+    /// composes without arithmetic.
+    ///
+    /// Expiry here is **not** an error. A keep-alive connection going quiet and
+    /// being closed is how it normally ends, so this returns success — the same
+    /// as the peer having closed it politely.
+    ///
+    /// Zero disables it. A server exposed to the internet should not leave it
+    /// that way: an idle connection costs a descriptor and a buffer, and a
+    /// client can open many.
+    Clock::duration idle_timeout = Clock::duration::zero();
+
+    /// How long one request may take, from its first byte to its last
+    /// response byte.
+    ///
+    /// Covers the handler as well as the I/O, because the point is to bound the
+    /// exchange rather than to bound one syscall. Expiry **is** an error
+    /// (`Errc::timed_out`) and ends the connection.
+    ///
+    /// No 408 is sent. Writing a response needs the stream, and the deadline
+    /// that just expired is the same one the write would carry, so the attempt
+    /// would fail immediately — announcing the timeout would take a second,
+    /// separate budget that the caller never granted.
+    ///
+    /// Zero disables it, which leaves a slow peer bounded only by `limits` —
+    /// a bound on one message's size, not on the time it may take to arrive.
+    Clock::duration request_timeout = Clock::duration::zero();
 };
 
 /// Writes one response, and refuses to write two.
 ///
 /// Templated on the stream rather than type-erased so that a handler's writes
 /// go straight to the socket with no virtual dispatch and no allocation.
-template<AsyncStream Stream>
+template<BoundedStream Stream>
 class ResponseWriter {
 public:
-    ResponseWriter(Stream& stream, bool head_request, bool keep_alive) noexcept
-        : stream_(&stream), head_request_(head_request), keep_alive_(keep_alive) {}
+    ResponseWriter(Stream& stream,
+                   bool head_request,
+                   bool keep_alive,
+                   OperationOptions io = {}) noexcept
+        : stream_(&stream), io_(std::move(io)), head_request_(head_request),
+          keep_alive_(keep_alive) {}
 
     ResponseWriter(const ResponseWriter&) = delete;
     ResponseWriter& operator=(const ResponseWriter&) = delete;
@@ -103,7 +143,7 @@ public:
         }
 
         finished_ = true;
-        co_return co_await write_all(*stream_, out.readable());
+        co_return co_await write_all(*stream_, out.readable(), io_);
     }
 
     /// Begin a streaming response whose size is not yet known.
@@ -122,7 +162,7 @@ public:
         sent_head_ = true;
         chunked_ = !status_forbids_body(response.status);
 
-        co_return co_await write_all(*stream_, out.readable());
+        co_return co_await write_all(*stream_, out.readable(), io_);
     }
 
     /// Send one piece of a streaming body.
@@ -144,7 +184,7 @@ public:
         if (!framed) {
             co_return fail(framed.error());
         }
-        co_return co_await write_all(*stream_, out.readable());
+        co_return co_await write_all(*stream_, out.readable(), io_);
     }
 
     /// Terminate a streaming body.
@@ -159,7 +199,7 @@ public:
 
         Buffer out;
         write_last_chunk(out);
-        co_return co_await write_all(*stream_, out.readable());
+        co_return co_await write_all(*stream_, out.readable(), io_);
     }
 
     /// True once a head has gone out — the connection loop uses this to avoid
@@ -171,6 +211,8 @@ public:
 
 private:
     Stream* stream_;
+    /// This request's budget, applied to every write the handler causes.
+    OperationOptions io_{};
     bool head_request_{false};
     bool keep_alive_{true};
     bool sent_head_{false};
@@ -184,8 +226,8 @@ namespace detail {
 ///
 /// Deliberately bare: a parse failure means the request is untrustworthy, so
 /// the reply says as little as possible and the connection closes.
-template<AsyncStream Stream>
-Task<Result<void>> send_error(Stream& stream, unsigned status) {
+template<BoundedStream Stream>
+Task<Result<void>> send_error(Stream& stream, unsigned status, OperationOptions io) {
     Response response;
     response.version = Version::http_1_1;
     response.status = status;
@@ -196,7 +238,9 @@ Task<Result<void>> send_error(Stream& stream, unsigned status) {
     if (!head) {
         co_return fail(head.error());
     }
-    co_return co_await write_all(stream, out.readable());
+    // Carries the request's own deadline: announcing a rejection must not
+    // outlive the exchange it is rejecting.
+    co_return co_await write_all(stream, out.readable(), std::move(io));
 }
 
 }  // namespace detail
@@ -207,7 +251,7 @@ Task<Result<void>> send_error(Stream& stream, unsigned status) {
 /// close. A protocol error is answered with a 4xx where possible and then ends
 /// the connection — continuing to parse a stream whose framing is already in
 /// doubt is how one bad request becomes several.
-template<AsyncStream Stream, typename Handler>
+template<BoundedStream Stream, typename Handler>
 Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptions options = {}) {
     if (options.read_chunk == 0) {
         co_return fail(Errc::invalid_argument);
@@ -215,13 +259,32 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
     Buffer input;
     RequestParser parser{options.limits};
 
+    // Turn a configured window into an absolute deadline, or nothing when the
+    // window is disabled. Every layer below composes absolute deadlines
+    // without arithmetic, which is why the conversion happens exactly here and
+    // exactly once per window.
+    const auto deadline_in = [](Clock::duration window) -> std::optional<Clock::time_point> {
+        if (window == Clock::duration::zero()) {
+            return std::nullopt;
+        }
+        return Clock::now() + window;
+    };
+
     for (std::uint32_t served = 0; served < options.max_requests_per_connection; ++served) {
         parser.reset();
 
         bool head_ready = false;
+        // Bytes left over from a pipelined request mean this one has already
+        // begun, so it is on the request budget rather than the idle one.
         bool request_started = !input.empty();
         bool body_drained = false;
         Buffer body;  // accumulated only up to the configured limit
+
+        // Whichever window applies right now. Recomputed when the first byte
+        // arrives, so that a connection's hundredth request gets the same
+        // budget as its first.
+        OperationOptions io{.deadline = deadline_in(request_started ? options.request_timeout
+                                                                    : options.idle_timeout)};
 
         // ── read and parse one request ──────────────────────────────────────
         while (!head_ready || !body_drained) {
@@ -229,7 +292,7 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
             if (!step) {
                 // The request is malformed. Answer once, then stop: the stream
                 // position is no longer trustworthy.
-                static_cast<void>(co_await detail::send_error(stream, 400));
+                static_cast<void>(co_await detail::send_error(stream, 400, io));
                 co_return fail(step.error());
             }
 
@@ -256,13 +319,16 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
                 }
                 {
                     const std::span<std::byte> space = input.prepare(options.read_chunk);
-                    Result<std::size_t> read = co_await stream.read_some(space);
+                    Result<std::size_t> read = co_await stream.read_some(space, io);
                     if (!read) {
                         input.commit(0);
-                        // A clean close *between* requests is how a keep-alive
-                        // connection normally ends — not a failure. A close
-                        // mid-request is a truncated message and does fail.
-                        if (read.error() == Errc::eof && !request_started) {
+                        // Between requests, both a clean close and an idle
+                        // timeout are how a keep-alive connection normally
+                        // ends — neither is a failure to report. Mid-request,
+                        // the same events are a truncated message and a peer
+                        // that ran out of time, and both do fail.
+                        if (!request_started &&
+                            (read.error() == Errc::eof || read.error() == Errc::timed_out)) {
                             co_return Result<void>{};
                         }
                         co_return fail(read.error());
@@ -272,7 +338,12 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
                         // A non-empty read making no progress must not spin.
                         co_return fail(Errc::eof);
                     }
-                    request_started = true;
+                    if (!request_started) {
+                        request_started = true;
+                        // The request's own budget starts at its first byte,
+                        // not at whenever the connection happened to open.
+                        io.deadline = deadline_in(options.request_timeout);
+                    }
                 }
                 break;
             }
@@ -284,7 +355,9 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
         const bool keep_alive = should_keep_alive(request) && !options.force_close &&
                                 served + 1 < options.max_requests_per_connection;
 
-        ResponseWriter<Stream> writer{stream, head_request, keep_alive};
+        // The handler shares the request budget: a deadline that covered the
+        // reading but not the responding would bound half an exchange.
+        ResponseWriter<Stream> writer{stream, head_request, keep_alive, io};
 
         Result<void> handled = co_await handler(request, writer, body.readable());
         if (!handled) {
@@ -292,7 +365,7 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
             // possible. If it already sent a head, the only honest option is
             // to close, because the response is half-written.
             if (!writer.sent_head()) {
-                static_cast<void>(co_await detail::send_error(stream, 500));
+                static_cast<void>(co_await detail::send_error(stream, 500, io));
             }
             co_return fail(handled.error());
         }

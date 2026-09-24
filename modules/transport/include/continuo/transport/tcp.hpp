@@ -8,6 +8,7 @@
 
 #include "continuo/core/error.hpp"
 #include "continuo/core/event_loop.hpp"
+#include "continuo/core/operation.hpp"
 #include "continuo/core/platform.hpp"
 #include "continuo/core/task.hpp"
 #include "continuo/transport/endpoint.hpp"
@@ -88,10 +89,17 @@ public:
     [[nodiscard]] NativeHandle native_handle() const noexcept { return handle_; }
 
     /// Read once; short reads are normal. `Errc::eof` on a clean close.
-    [[nodiscard]] Task<Result<std::size_t>> read_some(std::span<std::byte> destination);
+    ///
+    /// `options` is forwarded to the event loop unchanged, so the rules in
+    /// `operation.hpp` apply here as written — including that a cancelled read
+    /// on Windows may discard bytes the kernel had already moved, which makes
+    /// the connection unfit for reuse.
+    [[nodiscard]] Task<Result<std::size_t>> read_some(std::span<std::byte> destination,
+                                                      OperationOptions options = {});
 
     /// Write once; short writes are normal.
-    [[nodiscard]] Task<Result<std::size_t>> write_some(std::span<const std::byte> source);
+    [[nodiscard]] Task<Result<std::size_t>> write_some(std::span<const std::byte> source,
+                                                       OperationOptions options = {});
 
     /// Address of the peer, as reported by the OS.
     [[nodiscard]] Result<Endpoint> peer_endpoint() const;
@@ -147,7 +155,10 @@ public:
     ~Listener() { close(); }
 
     /// Accept one connection.
-    [[nodiscard]] Task<Result<Socket>> accept();
+    ///
+    /// A cancelled or timed-out accept produces no socket: any connection the
+    /// kernel had already prepared is closed rather than leaked.
+    [[nodiscard]] Task<Result<Socket>> accept(OperationOptions options = {});
 
     /// The address actually bound — resolves port 0 to the assigned port,
     /// which is how a test binds without guessing a free port.
@@ -173,7 +184,19 @@ struct ConnectOptions {
 };
 
 /// Connect to `endpoint`.
-[[nodiscard]] Task<Result<Socket>>
-connect(EventLoop& loop, const Endpoint& endpoint, ConnectOptions options = {});
+///
+/// `options` configures the socket and may be reused across calls; `io` is
+/// per-call and must not be, since it carries a stop token and an absolute
+/// deadline. Keeping them apart is deliberate: an `OperationOptions` stored
+/// inside a reusable configuration struct is a deadline that silently belongs
+/// to whichever call ran first.
+///
+/// A cancelled connect abandons the *wait*. The kernel's attempt carries on,
+/// so the returned failure leaves nothing for the caller to reuse — the socket
+/// this function created is closed on the way out.
+[[nodiscard]] Task<Result<Socket>> connect(EventLoop& loop,
+                                           const Endpoint& endpoint,
+                                           ConnectOptions options = {},
+                                           OperationOptions io = {});
 
 }  // namespace continuo::transport::tcp

@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/rand.h>
@@ -184,13 +185,21 @@ struct FragmentedSocket {
     std::size_t reads = 0;
     std::size_t writes = 0;
 
-    Task<Result<std::size_t>> read_some(std::span<std::byte> destination) {
+    /// `options` is forwarded rather than dropped: this wraps a real socket,
+    /// so it is a layer that genuinely waits, and swallowing a deadline here
+    /// would make one silently do nothing. The same absolute deadline reaching
+    /// every fragment is what a deadline on the whole transfer means.
+    Task<Result<std::size_t>> read_some(std::span<std::byte> destination,
+                                       OperationOptions options = {}) {
         ++reads;
-        co_return co_await socket.read_some(destination.first(std::min(limit, destination.size())));
+        co_return co_await socket.read_some(destination.first(std::min(limit, destination.size())),
+                                           std::move(options));
     }
-    Task<Result<std::size_t>> write_some(std::span<const std::byte> source) {
+    Task<Result<std::size_t>> write_some(std::span<const std::byte> source,
+                                        OperationOptions options = {}) {
         ++writes;
-        co_return co_await socket.write_some(source.first(std::min(limit, source.size())));
+        co_return co_await socket.write_some(source.first(std::min(limit, source.size())),
+                                            std::move(options));
     }
 };
 
@@ -469,11 +478,17 @@ void run_exchange(const Certificates& certificates,
     }
 }
 
+/// A transport whose reads park until the test resumes them by hand.
+///
+/// `options` is accepted and ignored deliberately: this stream's whole purpose
+/// is to be stuck, so it must not resolve for any reason the test did not
+/// cause. Recording what it was handed is a separate concern — see
+/// `RecordingTransport`.
 struct ControlledTransport {
     std::coroutine_handle<> waiting;
     bool zero_write = false;
 
-    Task<Result<std::size_t>> read_some(std::span<std::byte>) {
+    Task<Result<std::size_t>> read_some(std::span<std::byte>, OperationOptions = {}) {
         struct Pause {
             std::coroutine_handle<>& waiting;
             bool await_ready() const noexcept { return false; }
@@ -485,10 +500,88 @@ struct ControlledTransport {
         co_await Pause{waiting};
         co_return fail(Errc::eof);
     }
-    Task<Result<std::size_t>> write_some(std::span<const std::byte> source) {
+    Task<Result<std::size_t>> write_some(std::span<const std::byte> source,
+                                        OperationOptions = {}) {
         co_return zero_write ? std::size_t{0} : source.size();
     }
 };
+
+/// Records what every underlying operation was handed, and refuses the handshake
+/// once the test has seen enough.
+///
+/// `tls::Stream` drives its underlying stream an unbounded number of times per
+/// TLS operation, so "the deadline reached the underlying stream" is not one
+/// assertion but a claim about every one of those turns.
+struct RecordingTransport {
+    std::vector<std::optional<Clock::time_point>> seen;
+    std::size_t allowed_writes = 0;
+
+    Task<Result<std::size_t>> read_some(std::span<std::byte>, OperationOptions options = {}) {
+        seen.push_back(options.deadline);
+        co_return fail(Errc::eof);
+    }
+
+    Task<Result<std::size_t>> write_some(std::span<const std::byte> source,
+                                         OperationOptions options = {}) {
+        seen.push_back(options.deadline);
+        if (allowed_writes == 0) {
+            co_return fail(Errc::cancelled);
+        }
+        --allowed_writes;
+        co_return source.size();
+    }
+};
+
+void test_options_reach_the_underlying_stream(const Certificates& certificates) {
+    test::section("TLS 把同一个绝对 deadline 交给每一次底层读写");
+
+    Result<tls::Context> context = tls::Context::client(certificates.ca);
+    CHECK(context.has_value());
+    if (!context) {
+        return;
+    }
+
+    RecordingTransport transport;
+    transport.allowed_writes = 2;  // let the ClientHello out, then stop
+    Result<tls::Stream<RecordingTransport>> stream =
+        tls::Stream<RecordingTransport>::create(transport, *context, "localhost");
+    CHECK(stream.has_value());
+    if (!stream) {
+        return;
+    }
+
+    // One absolute deadline for the whole handshake. No layer subtracts
+    // elapsed time — that is the property that made absolute the right choice,
+    // and it is only observable from down here.
+    const auto deadline = Clock::now() + std::chrono::seconds{30};
+    const Result<void> handshake = stream->handshake({.deadline = deadline}).sync_get();
+    CHECK(!handshake);  // the transport refused before the handshake could finish
+
+    CHECK(!transport.seen.empty());
+    bool every_turn_carried_it = !transport.seen.empty();
+    for (const std::optional<Clock::time_point>& observed : transport.seen) {
+        every_turn_carried_it =
+            every_turn_carried_it && observed.has_value() && *observed == deadline;
+    }
+    CHECK(every_turn_carried_it);
+
+    // And with no options, nothing is invented on the way down.
+    RecordingTransport plain;
+    plain.allowed_writes = 2;
+    Result<tls::Stream<RecordingTransport>> bare =
+        tls::Stream<RecordingTransport>::create(plain, *context, "localhost");
+    CHECK(bare.has_value());
+    if (!bare) {
+        return;
+    }
+    CHECK(!bare->handshake().sync_get());
+    CHECK(!plain.seen.empty());
+    bool none_carried_one = !plain.seen.empty();
+    for (const std::optional<Clock::time_point>& observed : plain.seen) {
+        none_carried_one = none_carried_one && !observed.has_value();
+    }
+    CHECK(none_carried_one);
+}
 
 DetachedTask start_handshake(tls::Stream<ControlledTransport>& stream, Error& error, int& done) {
     Completion completion{done};
@@ -573,6 +666,7 @@ int main() {
         certificates.create();
         test_configuration(certificates);
         test_concurrent_operations(certificates);
+        test_options_reach_the_underlying_stream(certificates);
         run_exchange(certificates, "HTTPS DNS 身份验证与 close_notify", "localhost");
         run_exchange(certificates, "HTTPS IP SAN 身份验证", "127.0.0.1");
         run_exchange(certificates,

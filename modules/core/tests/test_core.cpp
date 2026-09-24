@@ -200,7 +200,13 @@ class MemoryStream {
 public:
     explicit MemoryStream(std::size_t chunk_limit) : chunk_limit_(chunk_limit) {}
 
-    Task<Result<std::size_t>> read_some(std::span<std::byte> destination) {
+    /// `options` is accepted and ignored, which is honest for this stream
+    /// rather than a shortcut: it moves bytes already in memory, so it never
+    /// waits, and a stop token or deadline has nothing to interrupt. Accepting
+    /// them is what makes it a `BoundedStream`, so that code under test can be
+    /// the same code that runs over a socket.
+    Task<Result<std::size_t>> read_some(std::span<std::byte> destination,
+                                       OperationOptions = {}) {
         if (read_pos_ >= written_.size()) {
             co_return fail(Errc::eof);
         }
@@ -211,7 +217,8 @@ public:
         co_return n;
     }
 
-    Task<Result<std::size_t>> write_some(std::span<const std::byte> source) {
+    Task<Result<std::size_t>> write_some(std::span<const std::byte> source,
+                                        OperationOptions = {}) {
         const std::size_t n = std::min(source.size(), chunk_limit_);
         written_.insert(
             written_.end(), source.begin(), source.begin() + static_cast<std::ptrdiff_t>(n));

@@ -14,18 +14,20 @@ using AddressScratch = std::array<std::byte, 128>;
 
 // ── Socket ───────────────────────────────────────────────────────────────────
 
-Task<Result<std::size_t>> Socket::read_some(std::span<std::byte> destination) {
+Task<Result<std::size_t>> Socket::read_some(std::span<std::byte> destination,
+                                            OperationOptions options) {
     if (loop_ == nullptr || handle_ == invalid_handle) {
         co_return fail(Errc::invalid_argument);
     }
-    co_return co_await loop_->read(handle_, destination);
+    co_return co_await loop_->read(handle_, destination, std::move(options));
 }
 
-Task<Result<std::size_t>> Socket::write_some(std::span<const std::byte> source) {
+Task<Result<std::size_t>> Socket::write_some(std::span<const std::byte> source,
+                                             OperationOptions options) {
     if (loop_ == nullptr || handle_ == invalid_handle) {
         co_return fail(Errc::invalid_argument);
     }
-    co_return co_await loop_->write(handle_, source);
+    co_return co_await loop_->write(handle_, source, std::move(options));
 }
 
 Result<Endpoint> Socket::peer_endpoint() const {
@@ -143,7 +145,7 @@ Result<Listener> Listener::bind(EventLoop& loop, const Endpoint& endpoint, Liste
     return listener;
 }
 
-Task<Result<Socket>> Listener::accept() {
+Task<Result<Socket>> Listener::accept(OperationOptions options) {
     if (loop_ == nullptr || handle_ == invalid_handle) {
         co_return fail(Errc::invalid_argument);
     }
@@ -151,7 +153,8 @@ Task<Result<Socket>> Listener::accept() {
     EventLoop* loop = loop_;
     const NativeHandle listening = handle_;
     const bool no_delay = options_.no_delay;
-    Result<NativeHandle> accepted = co_await loop->accept(listening, local_.native_family());
+    Result<NativeHandle> accepted =
+        co_await loop->accept(listening, local_.native_family(), std::move(options));
     if (!accepted) {
         co_return fail(accepted.error());
     }
@@ -188,7 +191,10 @@ void Listener::close() noexcept {
 
 // ── connect ──────────────────────────────────────────────────────────────────
 
-Task<Result<Socket>> connect(EventLoop& loop, const Endpoint& endpoint, ConnectOptions options) {
+Task<Result<Socket>> connect(EventLoop& loop,
+                             const Endpoint& endpoint,
+                             ConnectOptions options,
+                             OperationOptions io) {
     Result<detail::socket_t> created = detail::create_tcp_socket(endpoint.native_family());
     if (!created) {
         co_return fail(created.error());
@@ -205,8 +211,8 @@ Task<Result<Socket>> connect(EventLoop& loop, const Endpoint& endpoint, ConnectO
     // the Socket destructor closes the descriptor rather than leaking it.
     Socket wrapper{loop, static_cast<NativeHandle>(socket)};
 
-    Result<void> connected =
-        co_await loop.connect(static_cast<NativeHandle>(socket), endpoint.address_bytes());
+    Result<void> connected = co_await loop.connect(
+        static_cast<NativeHandle>(socket), endpoint.address_bytes(), std::move(io));
     if (!connected) {
         co_return fail(connected.error());
     }

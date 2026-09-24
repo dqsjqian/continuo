@@ -23,8 +23,10 @@
 #include <exception>
 #include <memory>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
+#include <utility>
 
 using namespace continuo;
 using namespace continuo::transport;
@@ -655,6 +657,151 @@ void test_loop_destruction_pending_read() {
     CHECK(failure == Errc::cancelled);
 }
 
+// ── options travel from the socket down to the loop ──────────────────────────
+
+void test_socket_forwards_options() {
+    test::section("a socket's read honours a deadline and a stop token");
+
+    Result<EventLoop> created = EventLoop::create();
+    CHECK(created.has_value());
+    if (!created) {
+        return;
+    }
+    EventLoop& loop = *created;
+
+    LoopbackPair pair;
+    if (!pair.open(loop)) {
+        return;
+    }
+
+    struct Read {
+        static DetachedTask run(tcp::Socket& socket,
+                                OperationOptions options,
+                                Result<std::size_t>& slot,
+                                std::atomic<int>& done) {
+            std::array<std::byte, 64> scratch{};
+            slot = co_await socket.read_some(scratch, std::move(options));
+            done.fetch_add(1, std::memory_order_release);
+        }
+    };
+
+    // A deadline that has already passed is refused before any syscall, so the
+    // loop never takes the operation on. That this arrives as `timed_out`
+    // rather than as a blocked read is the whole point of the pass-through:
+    // `tcp::Socket` adds nothing to the rules in `operation.hpp`, it forwards.
+    std::atomic<int> done{0};
+    Result<std::size_t> expired = std::size_t{999};
+    Read::run(pair.server, {.deadline = Clock::now() - std::chrono::milliseconds{1}}, expired,
+              done);
+    CHECK(done.load(std::memory_order_acquire) == 1);
+    CHECK(!expired.has_value());
+    CHECK(expired.error() == Errc::timed_out);
+    CHECK(loop.outstanding() == 0);
+
+    // A live deadline suspends, and the peer sending nothing lets it expire —
+    // which requires the timer to have reached the loop through two layers.
+    std::atomic<int> timed{0};
+    Result<std::size_t> late = std::size_t{999};
+    const auto started = Clock::now();
+    Read::run(pair.server, {.deadline = started + std::chrono::milliseconds{20}}, late, timed);
+    CHECK(loop.run_once(std::chrono::milliseconds{0}).has_value());
+    CHECK(timed.load(std::memory_order_acquire) == 0);
+    // One outstanding operation, not two: the deadline indexes the read.
+    CHECK(loop.outstanding() == 1);
+    for (int i = 0; i < 200 && timed.load(std::memory_order_acquire) == 0; ++i) {
+        CHECK(loop.run_once(std::chrono::milliseconds{50}).has_value());
+    }
+    CHECK(timed.load(std::memory_order_acquire) == 1);
+    CHECK(!late.has_value());
+    CHECK(late.error() == Errc::timed_out);
+    CHECK(Clock::now() - started >= std::chrono::milliseconds{20});
+
+    // And a stop token cuts a suspended read short.
+    std::stop_source source;
+    std::atomic<int> stopped{0};
+    Result<std::size_t> cancelled = std::size_t{999};
+    Read::run(pair.server, {.stop = source.get_token()}, cancelled, stopped);
+    CHECK(loop.run_once(std::chrono::milliseconds{0}).has_value());
+    CHECK(stopped.load(std::memory_order_acquire) == 0);
+    source.request_stop();
+    CHECK(loop.run_once(EventLoop::Duration::min()).has_value());
+    CHECK(stopped.load(std::memory_order_acquire) == 1);
+    CHECK(!cancelled.has_value());
+    CHECK(cancelled.error() == Errc::cancelled);
+    CHECK(loop.outstanding() == 0);
+}
+
+void test_accept_and_connect_forward_options() {
+    test::section("accept and connect honour a deadline");
+
+    Result<EventLoop> created = EventLoop::create();
+    CHECK(created.has_value());
+    if (!created) {
+        return;
+    }
+    EventLoop& loop = *created;
+
+    Result<tcp::Listener> listener = tcp::Listener::bind(loop, Endpoint::loopback(0));
+    CHECK(listener.has_value());
+    if (!listener) {
+        return;
+    }
+
+    struct Accept {
+        static DetachedTask
+        run(tcp::Listener& listening, OperationOptions options, Error& failure,
+            std::atomic<int>& done) {
+            Result<tcp::Socket> accepted = co_await listening.accept(std::move(options));
+            CHECK(!accepted);
+            if (!accepted) {
+                failure = accepted.error();
+            }
+            // A timed-out accept must produce no socket: anything the kernel
+            // had already prepared is closed rather than handed over or leaked.
+            done.fetch_add(1, std::memory_order_release);
+        }
+    };
+
+    std::atomic<int> done{0};
+    Error failure{};
+    const auto started = Clock::now();
+    Accept::run(*listener, {.deadline = started + std::chrono::milliseconds{20}}, failure, done);
+    for (int i = 0; i < 200 && done.load(std::memory_order_acquire) == 0; ++i) {
+        CHECK(loop.run_once(std::chrono::milliseconds{50}).has_value());
+    }
+    CHECK(done.load(std::memory_order_acquire) == 1);
+    CHECK(failure == Errc::timed_out);
+    CHECK(Clock::now() - started >= std::chrono::milliseconds{20});
+    CHECK(loop.outstanding() == 0);
+
+    // A connect whose deadline has already passed never reaches the kernel, so
+    // there is nothing left half-open for the caller to wonder about.
+    struct Connect {
+        static DetachedTask
+        run(EventLoop& target, Endpoint endpoint, OperationOptions io, Error& failure,
+            std::atomic<int>& done) {
+            Result<tcp::Socket> connected =
+                co_await tcp::connect(target, endpoint, {}, std::move(io));
+            CHECK(!connected);
+            if (!connected) {
+                failure = connected.error();
+            }
+            done.fetch_add(1, std::memory_order_release);
+        }
+    };
+
+    std::atomic<int> connect_done{0};
+    Error connect_failure{};
+    Connect::run(loop,
+                 listener->local_endpoint(),
+                 {.deadline = Clock::now() - std::chrono::milliseconds{1}},
+                 connect_failure,
+                 connect_done);
+    CHECK(connect_done.load(std::memory_order_acquire) == 1);
+    CHECK(connect_failure == Errc::timed_out);
+    CHECK(loop.outstanding() == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -672,6 +819,8 @@ int main() {
     test_pending_read_close(true);
     test_loop_destruction_pending_accept();
     test_loop_destruction_pending_read();
+    test_socket_forwards_options();
+    test_accept_and_connect_forward_options();
 
     return test::summary();
 }

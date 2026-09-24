@@ -17,6 +17,13 @@
 
 namespace continuo {
 
+/// The clock every deadline in Continuo is expressed against.
+///
+/// Steady rather than system: a deadline must not move because something
+/// adjusted the wall clock, and a timeout that can be lengthened by an NTP
+/// correction is not a bound.
+using Clock = std::chrono::steady_clock;
+
 /// What may cut an operation short, besides the operation finishing.
 ///
 /// A plain aggregate so that callers can name only what they need. **The
@@ -39,11 +46,19 @@ struct OperationOptions {
     /// Absolute point in time after which the operation reports
     /// `Errc::timed_out`.
     ///
-    /// Absolute, not a duration, on purpose: an operation that retries
-    /// internally (`EAGAIN`, `EINTR`, a partial readiness wakeup) must not
-    /// refresh its budget on every retry, or a slow peer could hold it open
-    /// indefinitely while every individual wait stayed under the limit.
-    std::optional<std::chrono::steady_clock::time_point> deadline{};
+    /// Absolute, not a duration, on purpose. Two reasons, and the second is
+    /// the one that matters more:
+    ///
+    ///   * An operation that retries internally (`EAGAIN`, `EINTR`, a partial
+    ///     readiness wakeup) must not refresh its budget on every retry, or a
+    ///     slow peer could hold it open indefinitely while every individual
+    ///     wait stayed under the limit.
+    ///   * It **composes**. One absolute deadline handed down through TLS to a
+    ///     socket means "this whole handshake must finish by then" without any
+    ///     layer subtracting elapsed time. A duration would require every
+    ///     layer to do that arithmetic, and each one would get it slightly
+    ///     wrong.
+    std::optional<Clock::time_point> deadline{};
 };
 
 }  // namespace continuo

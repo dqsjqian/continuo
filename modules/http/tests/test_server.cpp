@@ -22,11 +22,14 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 using namespace continuo;
@@ -221,7 +224,13 @@ public:
     explicit ScriptedStream(std::string incoming, std::size_t chunk_limit = 64)
         : incoming_(std::move(incoming)), chunk_limit_(chunk_limit) {}
 
-    Task<Result<std::size_t>> read_some(std::span<std::byte> destination) {
+    /// `options` is accepted and ignored, which is honest for this stream
+    /// rather than a shortcut: it moves bytes already in memory, so it never
+    /// waits, and a stop token or deadline has nothing to interrupt. Accepting
+    /// them is what makes it a `BoundedStream`, so that code under test can be
+    /// the same code that runs over a socket.
+    Task<Result<std::size_t>> read_some(std::span<std::byte> destination,
+                                       OperationOptions = {}) {
         if (read_pos_ >= incoming_.size()) {
             co_return fail(Errc::eof);
         }
@@ -232,7 +241,8 @@ public:
         co_return n;
     }
 
-    Task<Result<std::size_t>> write_some(std::span<const std::byte> source) {
+    Task<Result<std::size_t>> write_some(std::span<const std::byte> source,
+                                        OperationOptions = {}) {
         const std::size_t n = std::min(source.size(), chunk_limit_);
         outgoing_.append(reinterpret_cast<const char*>(source.data()), n);
         co_return n;
@@ -582,6 +592,195 @@ void test_truncated_head_and_zero_read_policy() {
     CHECK(invalid.error() == Errc::invalid_argument);
 }
 
+// ── timeouts ─────────────────────────────────────────────────────────────────
+
+/// A stream that reports a timeout instead of producing bytes.
+///
+/// `serve_connection` turns its configured windows into deadlines and hands
+/// them to the stream; whether the deadline is actually enforced is the event
+/// loop's job and is tested there. What has to be tested *here* is the part
+/// only this layer decides: which expiry is an ordinary end of connection and
+/// which is a failure.
+class TimingOutStream {
+public:
+    explicit TimingOutStream(std::string incoming) : incoming_(std::move(incoming)) {}
+
+    Task<Result<std::size_t>> read_some(std::span<std::byte> destination,
+                                        OperationOptions options = {}) {
+        // Every read the connection loop issues must carry a deadline when one
+        // is configured; a window that never reaches the stream is a window
+        // that does nothing.
+        saw_deadline_ = saw_deadline_ || options.deadline.has_value();
+        if (read_pos_ >= incoming_.size()) {
+            co_return fail(Errc::timed_out);
+        }
+        const std::size_t available = incoming_.size() - read_pos_;
+        const std::size_t n = std::min(available, destination.size());
+        std::memcpy(destination.data(), incoming_.data() + read_pos_, n);
+        read_pos_ += n;
+        co_return n;
+    }
+
+    Task<Result<std::size_t>> write_some(std::span<const std::byte> source,
+                                         OperationOptions = {}) {
+        outgoing_.append(reinterpret_cast<const char*>(source.data()), source.size());
+        co_return source.size();
+    }
+
+    [[nodiscard]] bool saw_deadline() const noexcept { return saw_deadline_; }
+    [[nodiscard]] const std::string& sent() const noexcept { return outgoing_; }
+
+private:
+    std::string incoming_;
+    std::string outgoing_;
+    std::size_t read_pos_ = 0;
+    bool saw_deadline_ = false;
+};
+
+void test_timeout_windows() {
+    test::section("idle expiry ends a connection; request expiry fails it");
+
+    auto handler =
+        [](const Request&, auto& writer, std::span<const std::byte>) -> Task<Result<void>> {
+        co_return co_await writer.send(Response{});
+    };
+
+    ServerOptions options;
+    options.idle_timeout = std::chrono::seconds{30};
+    options.request_timeout = std::chrono::seconds{30};
+
+    // Nothing ever arrives. An idle keep-alive connection that goes quiet and
+    // is closed is how one normally ends, so this succeeds — the same answer a
+    // polite close gets.
+    TimingOutStream idle{""};
+    const Result<void> idle_result = serve_connection(idle, handler, options).sync_get();
+    CHECK(idle_result.has_value());
+    CHECK(idle.saw_deadline());
+
+    // A request that begins and then stalls is a different thing: the peer ran
+    // out of time mid-message, and the message is now truncated.
+    TimingOutStream stalled{"GET / HTTP/1.1\r\nHost: x\r\n"};
+    const Result<void> stalled_result = serve_connection(stalled, handler, options).sync_get();
+    CHECK(!stalled_result);
+    CHECK(stalled_result.error() == Errc::timed_out);
+    // No 408: writing one needs the stream under the deadline that just
+    // expired, so the attempt could only fail.
+    CHECK(stalled.sent().empty());
+
+    // The same stall, with the windows disabled, is indistinguishable from any
+    // other stream error — the timeout is the stream's, not the server's.
+    ServerOptions unbounded;
+    TimingOutStream no_windows{"GET / HTTP/1.1\r\nHost: x\r\n"};
+    const Result<void> unbounded_result =
+        serve_connection(no_windows, handler, unbounded).sync_get();
+    CHECK(!unbounded_result);
+    CHECK(unbounded_result.error() == Errc::timed_out);
+    CHECK(!no_windows.saw_deadline());
+}
+
+/// Logs the deadline handed to every single read and write.
+///
+/// One byte per read on purpose: a request that arrives in one read never
+/// exercises the transition from the idle window to the request window,
+/// because the transition happens *after* the first byte.
+class RecordingStream {
+public:
+    RecordingStream(std::string incoming,
+                    std::vector<std::optional<Clock::time_point>>& reads,
+                    std::vector<std::optional<Clock::time_point>>& writes)
+        : incoming_(std::move(incoming)), reads_(&reads), writes_(&writes) {}
+
+    Task<Result<std::size_t>> read_some(std::span<std::byte> destination,
+                                        OperationOptions options = {}) {
+        reads_->push_back(options.deadline);
+        if (read_pos_ >= incoming_.size() || destination.empty()) {
+            co_return fail(Errc::eof);
+        }
+        destination[0] = static_cast<std::byte>(incoming_[read_pos_]);
+        ++read_pos_;
+        co_return std::size_t{1};
+    }
+
+    Task<Result<std::size_t>> write_some(std::span<const std::byte> source,
+                                         OperationOptions options = {}) {
+        writes_->push_back(options.deadline);
+        co_return source.size();
+    }
+
+private:
+    std::string incoming_;
+    std::vector<std::optional<Clock::time_point>>* reads_;
+    std::vector<std::optional<Clock::time_point>>* writes_;
+    std::size_t read_pos_ = 0;
+};
+
+void test_request_budget_is_per_request() {
+    test::section("the idle window covers waiting; the request window covers the exchange");
+
+    // Deliberately far apart, so that which window produced a given deadline
+    // can be read off its magnitude. Equal windows would make the two
+    // indistinguishable and the test would pass whatever the code did.
+    const auto idle = std::chrono::hours{1};
+    const auto request = std::chrono::hours{5};
+    const auto boundary = Clock::now() + std::chrono::hours{3};
+
+    std::vector<std::optional<Clock::time_point>> reads;
+    std::vector<std::optional<Clock::time_point>> writes;
+
+    auto handler =
+        [](const Request&, auto& writer, std::span<const std::byte>) -> Task<Result<void>> {
+        co_return co_await writer.send(Response{});
+    };
+
+    ServerOptions options;
+    options.idle_timeout = idle;
+    options.request_timeout = request;
+
+    RecordingStream stream{"GET /one HTTP/1.1\r\nHost: x\r\n\r\n", reads, writes};
+    const Result<void> served = serve_connection(stream, handler, options).sync_get();
+    CHECK(served.has_value());
+
+    CHECK(reads.size() > 1);
+    CHECK(!writes.empty());
+
+    // Every operation carries a deadline: a configured window that fails to
+    // reach the stream is a window that does nothing.
+    bool all_reads_bounded = !reads.empty();
+    for (const auto& deadline : reads) {
+        all_reads_bounded = all_reads_bounded && deadline.has_value();
+    }
+    CHECK(all_reads_bounded);
+
+    bool all_writes_bounded = !writes.empty();
+    for (const auto& deadline : writes) {
+        all_writes_bounded = all_writes_bounded && deadline.has_value();
+    }
+    CHECK(all_writes_bounded);
+
+    // The first read is the connection waiting, so it is on the idle window.
+    CHECK(reads.front().has_value());
+    if (reads.front()) {
+        CHECK(*reads.front() < boundary);
+    }
+
+    // Once a byte has arrived the request's own window takes over — which is
+    // the whole reason these are durations rather than one deadline for the
+    // connection.
+    bool some_read_on_request_window = false;
+    for (const auto& deadline : reads) {
+        some_read_on_request_window = some_read_on_request_window || (deadline && *deadline > boundary);
+    }
+    CHECK(some_read_on_request_window);
+
+    // And the response is part of that same exchange: a budget that bounded
+    // the reading but not the writing would bound half of it.
+    bool writes_on_request_window = !writes.empty();
+    for (const auto& deadline : writes) {
+        writes_on_request_window = writes_on_request_window && deadline && *deadline > boundary;
+    }
+    CHECK(writes_on_request_window);
+}
+
 }  // namespace
 
 int main() {
@@ -605,6 +804,8 @@ int main() {
     test_request_limit_closes_connection();
     test_double_send_refused();
     test_truncated_head_and_zero_read_policy();
+    test_timeout_windows();
+    test_request_budget_is_per_request();
 
     return test::summary();
 }
