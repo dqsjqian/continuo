@@ -1,0 +1,7 @@
+if(NOT DEFINED PROGRAM OR NOT DEFINED MODE)
+    message(FATAL_ERROR "PROGRAM and MODE are required")
+endif()
+execute_process(COMMAND "${PROGRAM}" "${MODE}" RESULT_VARIABLE result TIMEOUT 10)
+if(NOT "${result}" STREQUAL "77")
+    message(FATAL_ERROR "Scope contract ${MODE} expected terminate handler exit 77, got ${result}")
+endif()

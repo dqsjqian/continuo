@@ -621,13 +621,10 @@ Task<void> EventLoop::yield() {
     if (!impl_ || impl_->shutting_down()) co_return;
     Impl* impl = impl_.get();
     auto submit = [impl](std::coroutine_handle<> coroutine, Result<void>* result) {
-        impl->post([coroutine, result]() mutable {
-            if (result) {
-                *result = Result<void>{};
-            }
-            coroutine.resume();
-        });
-        return Result<void>{};
+        // A yield is a tracked suspension, not disposable posted work.
+        // An already-due timer runs on the next pump and is cancelled/resumed
+        // by shutdown, keeping child scopes joinable.
+        return impl->add_timer(Clock::now(), coroutine, result);
     };
     (void)co_await detail::OperationAwaiter<Result<void>, decltype(submit)>{submit};
     co_return;

@@ -791,12 +791,9 @@ Task<Result<void>> EventLoop::sleep_for(Duration delay) {
 Task<void> EventLoop::yield() {
     Impl* impl = impl_.get();
     auto submit = [impl](std::coroutine_handle<> coroutine, Result<void>* result) {
-        return impl->post([coroutine, result]() mutable {
-            if (result) {
-                *result = Result<void>{};
-            }
-            coroutine.resume();
-        });
+        // Keep yield in the tracked timer queue so shutdown resumes it after
+        // draining kernel I/O, instead of discarding a continuation in post().
+        return impl->add_timer(Clock::now(), coroutine, result);
     };
     (void)co_await detail::OperationAwaiter<Result<void>, decltype(submit)>{submit};
     co_return;

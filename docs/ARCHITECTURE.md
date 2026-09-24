@@ -32,12 +32,12 @@ and remaining acceptance work must be described separately.
 
 | Concern | Current foundation | Remaining acceptance work |
 |---|---|---|
-| Execution and ownership | Lazy, move-only `Task`, executor seam, single-threaded `EventLoop` | Structured child-task lifetimes, explicit operation/buffer ownership, safe cancellation and join/drain semantics |
-| Cancellation and deadlines | Timers and loop stop are available | Propagated cancellation and operation deadlines; deterministic outcomes for completion/close/timeout races; `stop()` is not cancellation |
+| Execution and ownership | Lazy, move-only `Task`, single-threaded `TaskScope` with immediate spawn and one-shot join, executor seam, single-threaded `EventLoop` | Explicit operation/buffer ownership across layers, safe I/O cancellation and continued join/drain validation |
+| Cancellation and deadlines | Scope cooperative stop token, timers and loop stop are available; yield is tracked through shutdown | Propagated I/O cancellation and operation deadlines; deterministic outcomes for completion/close/timeout races; neither a stop token nor `stop()` automatically cancels I/O |
 | Transport and composition | TCP and completion-shaped kqueue/epoll/IOCP implementations; stream concepts | Equivalent observable semantics across backends, verified teardown, bounded queues; datagram contracts before UDP expansion |
 | Protocols and data flow | HTTP/1.1 parser, serializer and connection loop; buffered request bodies | Protocol conformance evidence, streamed bodies, slow-consumer backpressure and bounded aggregate memory |
 | Security and robustness | Optional OpenSSL TLS stream, parser limits and negative-input tests | Lifecycle-safe TLS cancellation, broader fuzzing, failure injection and resource-exhaustion tests |
-| Engineering evidence | Desktop runtime CI and mobile cross-compilation jobs exist | C++23 baseline migration, mobile runtime evidence, reproducible interop/performance/resource measurements; no current stable ABI promise |
+| Engineering evidence | C++23-only build, desktop runtime CI and mobile cross-compilation jobs exist; last confirmed passing desktop baseline is `eddfddb` | Fresh validation of current scope/task/yield changes, mobile runtime evidence, reproducible interop/performance/resource measurements; no current stable ABI promise |
 
 Rejecting ambiguous or malformed input is part of protocol correctness, not a
 substitute for the other contracts. The HTTP parser rejects conflicting
@@ -107,7 +107,7 @@ adapter       optional TLS          direct transport
                   │                       │
 transport        TCP             future datagram/local transports
                   └───────────┬───────────┘
-core       EventLoop · Buffer · Task · Executor · errors
+core       EventLoop · Buffer · Task · TaskScope · Executor · errors
                               │
 backend                kqueue · epoll · IOCP
 ```
@@ -192,13 +192,65 @@ bodies are currently buffered before handler delivery. End-to-end streaming
 must additionally define buffer ownership, incremental consumption, early
 termination and the way slow consumers suspend producers.
 
+### `TaskScope` — implemented single-threaded child ownership
+
+`TaskScope` in `continuo/core/task_scope.hpp` owns child tasks, not their borrowed
+resources. It is neither copyable nor movable. Scope operations, child completion
+and stop callbacks must all execute on the same thread; the type is not a
+cross-thread scheduler or a complete server-launch facility.
+
+- `spawn(Task<void>)` accepts an unstarted, nonempty task, takes ownership and
+  starts it immediately. Empty input throws `std::invalid_argument`; spawn after
+  join has been requested throws `std::logic_error`. Completed child frames are
+  reclaimed promptly instead of accumulating until scope destruction.
+- `join()` can be called only once. The call immediately closes spawn intake,
+  even though the returned `Task<void>` is lazy and has not yet been awaited.
+  Drive that task to completion: join waits for every child and its frame cleanup.
+  A second join throws `std::logic_error`.
+- The first observed child exception is retained and requests cooperative stop.
+  Join rethrows it only after every child has finished and released its frame;
+  siblings are not abandoned when the first child fails. `Result` failures are
+  values, not exceptions: a `Task<void>` adapter must handle them explicitly,
+  for example by throwing `std::system_error`, as in the README example.
+- `get_stop_token()` / `request_stop()` expose a `std::stop_token` signal.
+  Children may inspect it or register callbacks, but pending I/O is not
+  automatically cancelled and there is no deadline propagation. Requesting stop
+  does not close spawn intake or replace join. Callback reentrancy can complete
+  the last child and resume the join continuation synchronously.
+- An untouched empty scope (neither spawn nor join used) may be destroyed.
+  Every other scope must finish joining before destruction, even if all children
+  completed synchronously and `pending() == 0`. Join that rethrows after cleanup
+  still satisfies this requirement. Early scope destruction terminates; so does
+  destroying a join task while it is waiting. Discarding an unstarted join still
+  leaves the scope unjoined and causes termination at scope destruction.
+  This fail-fast policy prevents silent release of child frames still referenced
+  by I/O; it is not automatic asynchronous cleanup in a destructor.
+
+Keep borrowed streams, buffers, coroutine-lambda closures and other child state
+alive through join; normally keep the associated loop alive longer as well.
+Do not destroy the parent task while it awaits join. Prefer free-function
+coroutines for examples so a temporary lambda cannot leave a dangling closure.
+Do not use `sync_get()` for real asynchronous I/O or a join that may suspend.
+Awaiting an empty or consumed `Task<T>` now throws `std::logic_error` rather than
+accessing a missing frame.
+
+`EventLoop::yield()` uses an already-due timer rather than disposable posted
+work. It counts as outstanding work, resumes on the next loop pump and is also
+resumed by loop shutdown, allowing a waiting scope join to finish. Its public
+return type is still `Task<void>`: shutdown's internal cancellation result is
+not returned to the caller. Resumption does not authorize more work on a
+shut-down loop, and `stop()` itself remains a stop-pumping request, not I/O
+cancellation.
+
 ### Required lifetime and resource contracts
 
-These are design/acceptance requirements, not claims about the current API:
+These are broader design/acceptance requirements, beyond the scope foundation:
 
 - **Structured concurrency:** child operations belong to an explicit scope.
-  Leaving that scope must stop and join/drain its children before releasing
-  their coroutine frames or buffers; silently detached work is not a default.
+  Callers must explicitly stop when needed and join/drain before leaving that
+  scope or releasing borrowed resources. `TaskScope` provides owned spawn/join
+  and fail-fast misuse detection, not implicit destructor-driven I/O cancellation;
+  silently detached work is not a default.
 - **Ownership:** distinguish owned sockets, operation state and coroutine
   frames from borrowed streams and spans. Specify the destruction order of
   task, stream and loop, and which objects must survive kernel completion.
@@ -244,10 +296,10 @@ them silently fails to match the condition callers switch on.**
 | **I/O model** | **completion-shaped public API** | A common operation contract for IOCP and reactor implementations |
 | Platform scope | macOS, Linux and Windows runtime targets; iOS/Android targets currently cross-compiled | Runtime correctness must be demonstrated per platform; BSD has no dedicated CI evidence |
 | Readiness API | POSIX-only, behind an explicit macro | A platform extension, not part of the portable operation contract |
-| Execution model | Coroutine-native with lazy `Task<T>` as the current foundation | Structured lifetimes and cancellation still need implementation and verification |
+| Execution model | Lazy `Task<T>` with explicit single-threaded `TaskScope` spawn / join | Owned child frames and cooperative stop are implemented; full I/O cancellation and deadlines remain acceptance work |
 | Library form | Compiled library with modular public headers | Keep implementation boundaries explicit; an ABI policy must be decided before stabilization |
 | Error model | `std::error_code` + `Result<T>` for operational failures | `Task` can still propagate body exceptions; this is not a no-exceptions guarantee |
-| Standard floor | Target C++23; current build still supports C++20 | Migrate build/toolchain and standard-library usage deliberately; no legacy-baseline compatibility mandate |
+| Standard floor | C++23-only build; `Result<T>` directly aliases `std::expected<T, Error>` | Validate each toolchain and standard library; no C++20 compatibility mandate |
 | Buffer shape | Current `Buffer` is contiguous | Future segmented or borrowed-buffer designs need measured benefit and an explicit ownership contract |
 | Framework coupling | No host-framework dependency or old Aria API compatibility promise | Consumers adapt to the independent library after its contracts are established |
 | Protocol scope | HTTP/1.1 and optional TLS exercise the core; later protocols remain proposals | Stabilize lifecycle and resource semantics before broadening scope |
@@ -262,8 +314,9 @@ configuration; the historical milestones below do not certify these gates.
    standard-library facilities to C++23. Document ownership, thread affinity,
    error and short-transfer semantics. Compile independent minimal consumers
    without Aria or compatibility adapters.
-2. **Lifecycle and structured execution.** Implement scope-owned tasks,
-   cancellation/deadline propagation and safe join/drain. Test destruction and
+2. **Lifecycle and structured execution.** Validate the implemented scope-owned
+   tasks and explicit join; add I/O cancellation/deadline propagation and safe
+   cross-layer drain. Test destruction and
    close with pending read/write/accept/connect/timer work, nested task failure,
    repeated cancellation and simultaneous completion. Require exactly-once
    completion and no dangling kernel buffers, resumptions or resource leaks
@@ -370,10 +423,27 @@ This integration also fixes HTTP EOF before the end of a partial request head
 being mistaken for idle disconnect, and rejects a zero read-chunk policy.
 Current request bodies remain buffered, not streamed to handlers.
 
+**Structured task foundation.** `TaskScope` adds immediate owned spawn, one-shot
+join, prompt child-frame reclamation, cooperative stop and first-exception
+propagation after all children finish. Empty-task await is checked; tracked
+`yield` resumes during loop shutdown. These changes are newer than the last
+confirmed passing desktop CI baseline `eddfddb` and await fresh validation.
+
+The current test registration has eight regular suites with TLS (`core`,
+`event_loop`, `task_scope`, `transport`, `http_parser`, `http_server`,
+`http_end_to_end`, `tls_https`), or seven without TLS. Four additional CTests
+exercise fail-fast violations: `task_scope_pending-destruction`,
+`task_scope_unobserved-failure`, `task_scope_abandoned-join` and
+`task_scope_unstarted-join`. Totals are **12 CTests with TLS and 11 without**;
+registration counts do not assert that this revision has passed them.
+
 **Known lifecycle limits.** Pending tasks must not be destroyed while the event
-loop/kernel still holds their handles or buffers. Cancellation, deadlines and
-IOCP teardown with outstanding operations require further work. This milestone
-must not be represented as production-ready or cancellation-safe.
+loop/kernel still holds their handles or buffers. Scope misuse is fail-fast, not
+implicit I/O cancellation or universal protection for arbitrary standalone
+`Task` destruction. Full cancellation, deadlines and continued cross-backend
+teardown validation remain work; this foundation is not production-readiness
+or a complete cancellation-safety claim.
 
 **Deliberately absent.** UDP, routing, HTTP/2, a full HTTP client, native OS trust
-store integration, mTLS policy, cancellation tokens, and multi-threaded loops.
+store integration, mTLS policy, I/O-integrated cancellation/deadline propagation,
+and multi-threaded loops.

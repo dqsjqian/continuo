@@ -17,7 +17,7 @@ C++23 · TCP · 可选 OpenSSL 3 · HTTP/1.1
 > *Basso continuo*，通奏低音：持续演奏的低音声部，为音乐提供基础。
 > Continuo 希望成为网络软件的这层基础，而不是另一个包办一切的 HTTP 框架。
 
-**当前阶段：实验性基础库，不是生产就绪的网络栈。** TCP、可选 TLS 与 HTTP/1.1 已有实现和测试；结构化任务生命周期、取消、截止时间及端到端背压仍未完成。API 可以随契约完善而调整，暂不承诺稳定 ABI。
+**当前阶段：实验性基础库，不是生产就绪的网络栈。** TCP、可选 TLS 与 HTTP/1.1 已有实现和测试；单线程 `TaskScope` 已提供显式子任务所有权与 join，但完整 I/O 取消、截止时间及端到端背压仍未完成。API 可以随契约完善而调整，暂不承诺稳定 ABI。
 
 ## 为什么是 Continuo
 
@@ -36,7 +36,7 @@ flowchart TB
     App -.-> HTTP[http · HTTP/1.1]
     App -.-> TLS[tls · 可选 OpenSSL 3]
     App -.-> TCP[transport · TCP]
-    HTTP --> Core[core · Task / Result / AsyncStream / Executor / Buffer / EventLoop]
+    HTTP --> Core[core · Task / TaskScope / Result / AsyncStream / Executor / Buffer / EventLoop]
     TLS --> Core
     TCP --> Core
     Core --> Backends[kqueue · epoll · IOCP]
@@ -46,7 +46,7 @@ flowchart TB
 
 | 目录 / 构建目标 | 职责 |
 |---|---|
-| `modules/core` · `continuo::core` | 协程、错误、流与执行器接口、缓冲、事件循环和定时器 |
+| `modules/core` · `continuo::core` | 协程与任务作用域、错误、流与执行器接口、缓冲、事件循环和定时器 |
 | `modules/transport` · `continuo::transport` | 数值 IP 地址、TCP 监听 / 连接 / 读写 |
 | `modules/tls` · `continuo::tls` | 可选 TLS 流、证书与主机名验证、ALPN |
 | `modules/http` · `continuo::http` | HTTP/1.1 解析、序列化、单连接请求处理 |
@@ -57,7 +57,7 @@ flowchart TB
 
 | 领域 | 已实现的基础 | 尚未完成 / 待验证 |
 |---|---|---|
-| 执行与生命周期 | 惰性、仅可移动的 `Task`；单线程 `EventLoop`；定时器与投递 | 结构化子任务、取消传播、截止时间、统一的 join / drain 契约 |
+| 执行与生命周期 | 惰性、仅可移动的 `Task`；单线程 `TaskScope` 的 spawn / join 与协作 stop token；单线程 `EventLoop`、定时器与投递 | 完整 I/O 取消传播、截止时间、跨层 join / drain 契约与持续生命周期验证 |
 | TCP | IPv4 / IPv6、监听、连接、短读写、默认独占绑定 | 关闭与完成竞争的持续验证；全链路操作与队列上限 |
 | TLS（可选） | OpenSSL 3、证书链和 DNS 名 / IP 验证、单 ALPN 标识、关闭通知 | 取消安全；移动端 TLS；更广泛互操作验证 |
 | HTTP/1.1 | 增量解析、序列化、keep-alive、流水线请求处理、HEAD、分块响应 | 请求体目前有界缓冲；流式请求体、路由、完整客户端仍待实现 |
@@ -76,7 +76,7 @@ flowchart TB
 | iOS / Android | kqueue / epoll | 仅非 TLS 模块交叉编译；没有真机运行证据 |
 | BSD | kqueue | 后端可移植方向；没有专门 CI 证据 |
 
-最近已确认的三桌面 CI 通过基线是 `3831c20`。当前 C++23 基线迁移与关闭安全修订不应被视为已获该次 CI 覆盖；新增提交需重新验证。CI 配置存在，不等于当前代码已通过。
+最近已确认的三桌面 CI 通过基线是 `eddfddb`。当前 `TaskScope`、空任务 await 与 yield 生命周期修订不在该次基线覆盖范围内，本批仍待重新验证。CI 配置存在，不等于当前代码已通过。
 
 ## 看看 API
 
@@ -144,6 +144,47 @@ Task<Result<void>> serve_http(transport::tcp::Socket& socket) {
 
 `serve_connection` 负责单连接上的请求解析、请求体读取和请求循环，不负责接入调度或并发连接管理。处理函数是自由函数，没有临时协程 lambda 的闭包生命周期问题。将流类型换成已握手的 `tls::Stream<T>`，即可复用处理逻辑。
 
+### TaskScope：显式启动子任务并等待清理
+
+```cpp
+#include <continuo/core/event_loop.hpp>
+#include <continuo/core/task_scope.hpp>
+
+#include <chrono>
+#include <stop_token>
+#include <system_error>
+
+continuo::Task<void> delayed_increment(
+    continuo::EventLoop& loop, std::stop_token stop, int& count) {
+    auto slept = co_await loop.sleep_for(std::chrono::milliseconds{1});
+    if (!slept) {
+        throw std::system_error(slept.error());
+    }
+    if (!stop.stop_requested()) {
+        ++count;
+    }
+}
+
+continuo::Task<int> count_after_delay(continuo::EventLoop& loop) {
+    int count = 0;
+    continuo::TaskScope scope;
+    scope.spawn(delayed_increment(loop, scope.get_stop_token(), count));
+    co_await scope.join();
+    co_return count;
+}
+```
+
+宿主须驱动 `loop` 并等待 `count_after_delay` 完成，不能对它调用 `sync_get()`。`count` 位于父协程帧内，直到 join 完成才离开作用域；宿主须保持 `loop` 和父任务存活。自由函数避免临时协程 lambda 的闭包悬空；`sleep_for` 的 `Result` 错误被显式转为异常，而非吞掉。
+
+- `TaskScope` 不可复制或移动。`spawn(Task<void>)` 接管未启动、非空的任务并立即启动；已完成的子任务帧及时释放，不等到 scope 析构。
+- `join()` **只能调用一次，调用即关闭 spawn 接纳**，返回的惰性 `Task<void>` 必须驱动至完成。即使 `pending() == 0`，使用过的 scope 仍须 join。
+- 第一个观察到的子任务异常触发 `request_stop()`；join 等待所有子任务与帧清理后才重抛该异常，不提前丢弃兄弟任务。
+- `get_stop_token()` / `request_stop()` 只是协作信号，不会自动取消正在等待的 I/O，也不提供截止时间。scope 操作、子任务完成和 stop 回调须在同一线程执行。
+- 仅从未 spawn / join 的空 scope 可直接析构。其余 scope 必须等 join 完成（包括清理完成后重抛异常）；提前析构或销毁正在等待的 join 会 `std::terminate()`。丢弃未启动的 join 也不能免除析构前完成 join 的义务。这是 fail-fast，不是隐式取消或后台清理，更不会悄悄释放仍被 I/O 引用的子帧。
+- await 空的或已被消费的 `Task` 会抛出 `std::logic_error`；向 scope 传入空任务会抛出 `std::invalid_argument`。
+
+`EventLoop::yield()` 通过已到期定时器登记等待，计入 outstanding，下一次循环驱动时恢复；loop shutdown 也会恢复它，使 scope 有机会完成 join。但其返回类型仍是 `Task<void>`，**不会向调用者返回取消状态**；这不表示关闭后的 loop 可以继续使用，也不改变 `stop()` 不是取消的边界。
+
 **调用方必须遵守的生命周期约束**
 
 - 套接字、TLS 流、处理函数借用的对象与缓冲必须存活到相应操作结束；关联的事件循环必须更长寿。
@@ -189,7 +230,7 @@ target_link_libraries(my_app PRIVATE continuo::transport continuo::http)
 
 ## 测试与路线
 
-启用 TLS 时有 **7 个 CTest 套件**，非 TLS 构建为 6 个：`core`、`event_loop`、`transport`、`http_parser`、`http_server`、`http_end_to_end`、`tls_https`。它们覆盖基础类型、事件循环、TCP loopback、HTTP 解析与连接处理、TLS / HTTPS 组合及相关负测；套件数量不是完整性证明。
+启用 TLS 时有 **8 个常规测试套件**：`core`、`event_loop`、`task_scope`、`transport`、`http_parser`、`http_server`、`http_end_to_end`、`tls_https`，非 TLS 构建为 7 个。另有 4 个独立 fail-fast CTest：`task_scope_pending-destruction`、`task_scope_unobserved-failure`、`task_scope_abandoned-join`、`task_scope_unstarted-join`，验证生命周期违约确实触发终止。**CTest 总计为 TLS 12 项、非 TLS 11 项**。常规套件覆盖基础类型、事件循环、scope 的帧释放 / join / 异常与协作 stop、TCP loopback、HTTP 解析与连接处理、TLS / HTTPS 组合及相关负测；数量不是完整性证明。
 
 ```sh
 python3 tools/ci/check_layering.py

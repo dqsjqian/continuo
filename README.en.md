@@ -17,7 +17,7 @@ C++23 · TCP · Optional OpenSSL 3 · HTTP/1.1
 > *Basso continuo*: the continuously played bass line that provides a musical foundation.
 > Continuo aims to be that foundation for networking software, not another all-in-one HTTP framework.
 
-**Current stage: an experimental foundation, not a production-ready networking stack.** TCP, optional TLS and HTTP/1.1 have implementations and tests. Structured task lifetimes, cancellation, deadlines and end-to-end backpressure remain unfinished. APIs may change as their contracts mature; there is no stable ABI promise yet.
+**Current stage: an experimental foundation, not a production-ready networking stack.** TCP, optional TLS and HTTP/1.1 have implementations and tests. Single-threaded `TaskScope` now provides explicit child-task ownership and joining, but complete I/O cancellation, deadlines and end-to-end backpressure remain unfinished. APIs may change as their contracts mature; there is no stable ABI promise yet.
 
 ## Why Continuo
 
@@ -36,7 +36,7 @@ flowchart TB
     App -.-> HTTP[http · HTTP/1.1]
     App -.-> TLS[tls · Optional OpenSSL 3]
     App -.-> TCP[transport · TCP]
-    HTTP --> Core[core · Task / Result / AsyncStream / Executor / Buffer / EventLoop]
+    HTTP --> Core[core · Task / TaskScope / Result / AsyncStream / Executor / Buffer / EventLoop]
     TLS --> Core
     TCP --> Core
     Core --> Backends[kqueue · epoll · IOCP]
@@ -46,7 +46,7 @@ Solid arrows show dependencies; dashed arrows show application composition. HTTP
 
 | Directory / build target | Responsibility |
 |---|---|
-| `modules/core` · `continuo::core` | Coroutines, errors, stream and executor interfaces, buffers, event loop and timers |
+| `modules/core` · `continuo::core` | Coroutines and task scopes, errors, stream and executor interfaces, buffers, event loop and timers |
 | `modules/transport` · `continuo::transport` | Numeric IP addresses, TCP listen / connect / read / write |
 | `modules/tls` · `continuo::tls` | Optional TLS stream, certificate and hostname verification, ALPN |
 | `modules/http` · `continuo::http` | HTTP/1.1 parsing, serialization and single-connection request handling |
@@ -57,7 +57,7 @@ Solid arrows show dependencies; dashed arrows show application composition. HTTP
 
 | Area | Implemented foundation | Incomplete / still needs validation |
 |---|---|---|
-| Execution and lifetimes | Lazy, move-only `Task`; single-threaded `EventLoop`; timers and posted work | Structured child tasks, propagated cancellation, deadlines and a unified join / drain contract |
+| Execution and lifetimes | Lazy, move-only `Task`; single-threaded `TaskScope` spawn / join and cooperative stop token; single-threaded `EventLoop`, timers and posted work | Complete I/O cancellation propagation, deadlines, cross-layer join / drain contracts and continued lifetime validation |
 | TCP | IPv4 / IPv6, listen, connect, short transfers, exclusive binding by default | Continued close / completion race validation; end-to-end operation and queue bounds |
 | TLS (optional) | OpenSSL 3, certificate-chain and DNS-name / IP verification, one ALPN identifier, close notifications | Cancellation safety; mobile TLS; broader interoperability evidence |
 | HTTP/1.1 | Incremental parsing, serialization, keep-alive, pipelined request handling, HEAD, chunked responses | Request bodies currently use bounded buffering; streaming requests, routing and a complete client remain unimplemented |
@@ -76,7 +76,7 @@ Solid arrows show dependencies; dashed arrows show application composition. HTTP
 | iOS / Android | kqueue / epoll | Non-TLS cross-compilation only; no device runtime evidence |
 | BSD | kqueue | Backend portability direction; no dedicated CI evidence |
 
-The latest confirmed passing three-desktop CI baseline is `3831c20`. The current C++23 baseline migration and close-safety revisions are not covered by that run; new commits require fresh validation. A CI configuration is not proof that the current code passed.
+The latest confirmed passing three-desktop CI baseline is `eddfddb`. The current `TaskScope`, empty-task await and yield-lifetime revisions are not covered by that baseline and still await fresh validation. A CI configuration is not proof that the current code passed.
 
 ## A look at the API
 
@@ -144,6 +144,47 @@ Task<Result<void>> serve_http(transport::tcp::Socket& socket) {
 
 `serve_connection` handles parsing, request-body consumption and the request loop on one connection. It does not schedule accepts or manage concurrent connections. The handler is a free function, avoiding temporary coroutine-lambda closure lifetime hazards. Substituting an already-handshaken `tls::Stream<T>` lets the same handler logic serve TLS.
 
+### TaskScope: start children explicitly and await cleanup
+
+```cpp
+#include <continuo/core/event_loop.hpp>
+#include <continuo/core/task_scope.hpp>
+
+#include <chrono>
+#include <stop_token>
+#include <system_error>
+
+continuo::Task<void> delayed_increment(
+    continuo::EventLoop& loop, std::stop_token stop, int& count) {
+    auto slept = co_await loop.sleep_for(std::chrono::milliseconds{1});
+    if (!slept) {
+        throw std::system_error(slept.error());
+    }
+    if (!stop.stop_requested()) {
+        ++count;
+    }
+}
+
+continuo::Task<int> count_after_delay(continuo::EventLoop& loop) {
+    int count = 0;
+    continuo::TaskScope scope;
+    scope.spawn(delayed_increment(loop, scope.get_stop_token(), count));
+    co_await scope.join();
+    co_return count;
+}
+```
+
+The host must drive `loop` and await `count_after_delay`; do not call `sync_get()` on it. `count` lives in the parent coroutine frame until join completes; the host must keep `loop` and the parent task alive. Free functions avoid dangling temporary coroutine-lambda closures. The `sleep_for` `Result` error is explicitly converted to an exception rather than discarded.
+
+- `TaskScope` is neither copyable nor movable. `spawn(Task<void>)` takes ownership of an unstarted, nonempty task and starts it immediately. Completed child frames are reclaimed promptly, not retained until scope destruction.
+- `join()` **may be called only once and closes spawn intake immediately**, at the call. Its lazy `Task<void>` must be driven to completion. A used scope still requires join even when `pending() == 0`.
+- The first observed child exception triggers `request_stop()`. Join rethrows that exception only after all children and their frames have been cleaned up; it does not abandon siblings early.
+- `get_stop_token()` / `request_stop()` provide only a cooperative signal, not automatic cancellation of pending I/O or deadlines. Scope operations, child completion and stop callbacks must run on the same thread.
+- Only an empty scope on which neither spawn nor join has been used may be destroyed directly. Every other scope requires completed join (including rethrow after cleanup). Premature scope destruction or destruction of a waiting join calls `std::terminate()`. Discarding an unstarted join does not remove the obligation to finish joining before destruction. This is fail-fast, not implicit cancellation or background cleanup, and does not silently free child frames still referenced by I/O.
+- Awaiting an empty or already-consumed `Task` throws `std::logic_error`; passing an empty task to the scope throws `std::invalid_argument`.
+
+`EventLoop::yield()` registers an already-due timer, counts as outstanding work and resumes on the next loop pump. Loop shutdown also resumes it so a scope can finish joining. Its return type remains `Task<void>` and **does not expose cancellation status**. This neither permits further use of a shut-down loop nor changes the boundary that `stop()` is not cancellation.
+
 **Lifetime obligations for callers**
 
 - Sockets, TLS streams, borrowed handler state and buffers must outlive their corresponding operations; the associated event loop must live longer still.
@@ -189,7 +230,7 @@ For TCP only, link just `continuo::transport`. For TLS, enable `CONTINUO_ENABLE_
 
 ## Tests and roadmap
 
-There are **7 CTest suites with TLS enabled**, or 6 without it: `core`, `event_loop`, `transport`, `http_parser`, `http_server`, `http_end_to_end` and `tls_https`. They exercise foundational types, the event loop, TCP loopback, HTTP parsing and connection handling, TLS / HTTPS composition and related negative cases. Suite counts are not proof of completeness.
+There are **8 regular test suites with TLS enabled**: `core`, `event_loop`, `task_scope`, `transport`, `http_parser`, `http_server`, `http_end_to_end` and `tls_https`, or 7 without TLS. Four separate fail-fast CTests — `task_scope_pending-destruction`, `task_scope_unobserved-failure`, `task_scope_abandoned-join` and `task_scope_unstarted-join` — verify that lifetime violations actually terminate. **The CTest total is 12 with TLS or 11 without it.** Regular suites exercise foundational types, the event loop, scope frame reclamation / join / exceptions and cooperative stop, TCP loopback, HTTP parsing and connection handling, TLS / HTTPS composition and related negative cases. Counts are not proof of completeness.
 
 ```sh
 python3 tools/ci/check_layering.py

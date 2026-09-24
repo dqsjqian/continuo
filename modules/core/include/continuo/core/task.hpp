@@ -156,7 +156,12 @@ public:
                 return handle_;
             }
 
-            decltype(auto) await_resume() { return std::move(handle_.promise()).result(); }
+            decltype(auto) await_resume() {
+                if (!handle_) {
+                    throw std::logic_error("continuo::Task: cannot await an empty task");
+                }
+                return std::move(handle_.promise()).result();
+            }
 
         private:
             handle_type handle_;
