@@ -57,14 +57,15 @@ Solid arrows show dependencies; dashed arrows show application composition. HTTP
 
 | Area | Implemented foundation | Incomplete / still needs validation |
 |---|---|---|
-| Execution and lifetimes | Lazy, move-only `Task`; single-threaded `TaskScope` spawn / join and cooperative stop token; single-threaded `EventLoop`, timers and posted work | Complete I/O cancellation propagation, deadlines, cross-layer join / drain contracts and continued lifetime validation |
+| Execution and lifetimes | Lazy, move-only `Task` that terminates rather than destroy a started, unfinished frame; single-threaded `TaskScope` spawn / join and cooperative stop token; single-threaded `EventLoop`, timers and posted work | Cross-layer join / drain contracts and continued lifetime validation; destroying the loop mid-dispatch is refused rather than supported |
+| Cancellation and deadlines | Every `core` operation accepts a stop token and an absolute deadline (`read`/`write`/`accept`/`connect`/`sleep`/`wait_*`) on both backends, resolving exactly once through one point | **Transport, TLS and HTTP do not forward them yet**, so the stack above `core` cannot be said to support cancellation; the Windows semantics rest on CI alone |
 | TCP | IPv4 / IPv6, listen, connect, short transfers, exclusive binding by default | Continued close / completion race validation; end-to-end operation and queue bounds |
 | TLS (optional) | OpenSSL 3, certificate-chain and DNS-name / IP verification, one ALPN identifier, close notifications | Cancellation safety; mobile TLS; broader interoperability evidence |
 | HTTP/1.1 | Incremental parsing, serialization, keep-alive, pipelined request handling, HEAD, chunked responses | Request bodies currently use bounded buffering; streaming requests, routing and a complete client remain unimplemented |
 | Security and resources | Parser limits, malformed-input tests, bounded TLS BIO | End-to-end backpressure, aggregate memory bounds, broader fuzzing and failure injection |
 | Future transports and protocols | TCP stream contracts as a starting point | UDP / datagrams, DNS, further protocols and backends; HTTP/2 and HTTP/3 are not implemented |
 
-“Implemented” does not mean that an area has passed complete acceptance testing. In particular, `stop()` **is not cancellation**, and a timer is not an operation deadline mechanism.
+“Implemented” does not mean that an area has passed complete acceptance testing. `stop()` is still **not cancellation**: it asks `run()` to return. Per-operation cancellation is what `OperationOptions` is for, and it currently reaches `core` only.
 
 ### Platforms and evidence
 
@@ -73,10 +74,10 @@ Solid arrows show dependencies; dashed arrows show application composition. HTTP
 | macOS | kqueue | Desktop runtime tests, including TLS / HTTPS |
 | Linux | epoll | Desktop runtime CI, separate TLS matrix |
 | Windows | IOCP | Desktop loopback runtime CI, separate TLS matrix |
-| iOS / Android | kqueue / epoll | Non-TLS cross-compilation only; no device runtime evidence |
+| iOS / Android | kqueue / epoll | Non-TLS cross-compilation only; no device runtime evidence. Android needs **API level 30 or newer**, because the NDK's libc++ does not provide `std::stop_token` below it |
 | BSD | kqueue | Backend portability direction; no dedicated CI evidence |
 
-The latest confirmed passing three-desktop CI baseline is `eddfddb`. The current `TaskScope`, empty-task await and yield-lifetime revisions are not covered by that baseline and still await fresh validation. A CI configuration is not proof that the current code passed.
+The latest confirmed passing three-desktop CI baseline is `a123370`. The IOCP cancellation semantics have **no runtime evidence at all** on the development machine: locally they are only cross-compiled through mingw-w64 as a type and lifetime check, and mingw is not MSVC — compiling is not running. A CI configuration is not proof that the current code passed.
 
 ## A look at the API
 
@@ -189,12 +190,74 @@ The host must drive `loop` and await `count_after_delay`; do not call `sync_get(
 
 - Sockets, TLS streams, borrowed handler state and buffers must outlive their corresponding operations; the associated event loop must live longer still.
 - Except for `post()` / `stop()`, event-loop operations belong on the owner thread. An executor interface does not make sockets thread-safe.
-- Do not implement timeouts by destroying tasks still awaiting I/O. Do not drive real asynchronous I/O with `Task::sync_get()`.
+- Do not implement timeouts by destroying tasks: pass `OperationOptions{.deadline = ...}`. Destroying a started, unfinished frame terminates, and so does calling `Task::sync_get()` on real asynchronous I/O — the event loop may still hold that frame's handle, its result slot and buffers it borrowed.
+- Do not destroy, replace or re-enter the event loop while it is dispatching a batch, which includes doing so from a coroutine it just resumed. That terminates too: operations already taken out of its queues are waiting to be delivered, and on Windows an undrained completion batch still refers to loop state.
 - The connection owner handles shutdown and closing. These functions neither transfer socket ownership nor provide cancellation or concurrent connection management.
+
+### Cancellation and deadlines: a budget for one operation
+
+```cpp
+#include <continuo/core/event_loop.hpp>
+#include <continuo/core/task_scope.hpp>
+
+#include <array>
+#include <chrono>
+#include <cstddef>
+#include <span>
+#include <stop_token>
+
+using namespace std::chrono_literals;
+
+continuo::Task<continuo::Result<std::size_t>> read_with_budget(
+    continuo::EventLoop& loop,
+    continuo::NativeHandle handle,
+    std::span<std::byte> into,
+    std::stop_token stop) {
+    co_return co_await loop.read(handle,
+                                 into,
+                                 {.stop = std::move(stop),
+                                  .deadline = continuo::EventLoop::Clock::now() + 5s});
+}
+
+continuo::Task<void> read_until_stopped(continuo::EventLoop& loop,
+                                        continuo::NativeHandle handle) {
+    continuo::TaskScope scope;
+    std::array<std::byte, 4096> buffer{};
+
+    const continuo::Result<std::size_t> first =
+        co_await read_with_budget(loop, handle, buffer, scope.get_stop_token());
+    if (!first) {
+        scope.request_stop();
+    }
+    co_await scope.join();
+}
+```
+
+`OperationOptions` is a plain aggregate, filled in with designated initialisers. Two things about it are **contracts** rather than style:
+
+- **The member order cannot be reordered** — designated initialisers must be written in declaration order, so reordering would break every `{.stop = ..., .deadline = ...}` call site at compile time.
+- **It is passed by value** — a reference bound to a `{...}` temporary dies at the end of the expression that creates the coroutine, which is before the coroutine first resumes. Copying also lets the stop state outlive the `TaskScope` that owns the `stop_source`, which is exactly what an operation still winding down after its scope exits needs.
+
+The deadline is an **absolute** time point rather than a duration: an internal retry (`EAGAIN`, `EINTR`, a partial readiness wake-up) must not refresh the budget, or a slow peer could hold the operation open indefinitely while every individual wait stayed under the limit.
+
+Resolution rules:
+
+| Situation | Outcome |
+|---|---|
+| Token already stopped at submission | `Errc::cancelled`, nothing submitted |
+| Deadline already past at submission | `Errc::timed_out`, nothing submitted |
+| Both | `cancelled` — an explicit request outranks an elapsed budget |
+| Zero-length operation with either | The reason, not a 0-byte success it never performed |
+| Completion and deadline / cancellation in the same `run_once` | The completion. It genuinely happened |
+| Repeated cancellation | Resolved once; the extra requests find nothing |
+
+**What cancellation does not do:** it does not roll back I/O that already happened; it does not undo a `connect` the kernel already started (the socket is left indeterminate and the caller must close it — the loop never closes a handle it was lent); and on IOCP a cancelled operation waits for its completion packet before the pinned reason is delivered, **even if that packet reports success** — so a cancelled read whose buffer the kernel had already filled leaves a hole in the stream, and that connection should be closed rather than reused. `timed_out` may also be delivered later than the deadline there.
+
+A stop may be requested from **any thread**, but is always delivered on the loop thread: the callback records an operation id and nudges the loop. That avoids the re-entrancy trap of a `std::stop_callback` firing synchronously inside `await_suspend`, and is also what makes an off-thread request safe.
 
 ## Build and integrate
 
-Requires **CMake 3.20+, a C++23 compiler and a standard library with `std::expected`**. The default non-TLS build has no third-party dependency. Enabling TLS explicitly requires OpenSSL 3.
+Requires **CMake 3.20+, a C++23 compiler and a standard library providing both `std::expected` and `std::stop_token`**. The default non-TLS build has no third-party dependency. Enabling TLS explicitly requires OpenSSL 3. Android needs **API level 30 or newer**: the NDK's libc++ does not provide `std::stop_token` below it.
 
 ```sh
 cmake -S . -B build/debug -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_STANDARD=23
@@ -230,7 +293,7 @@ For TCP only, link just `continuo::transport`. For TLS, enable `CONTINUO_ENABLE_
 
 ## Tests and roadmap
 
-There are **8 regular test suites with TLS enabled**: `core`, `event_loop`, `task_scope`, `transport`, `http_parser`, `http_server`, `http_end_to_end` and `tls_https`, or 7 without TLS. Four separate fail-fast CTests — `task_scope_pending-destruction`, `task_scope_unobserved-failure`, `task_scope_abandoned-join` and `task_scope_unstarted-join` — verify that lifetime violations actually terminate. **The CTest total is 12 with TLS or 11 without it.** Regular suites exercise foundational types, the event loop, scope frame reclamation / join / exceptions and cooperative stop, TCP loopback, HTTP parsing and connection handling, TLS / HTTPS composition and related negative cases. Counts are not proof of completeness.
+There are **8 regular test suites with TLS enabled**: `core`, `event_loop`, `task_scope`, `transport`, `http_parser`, `http_server`, `http_end_to_end` and `tls_https`, or 7 without TLS. **Eight** separate fail-fast CTests each commit one contract violation in its own process and demand the *exact* exit code the terminate handler installs, so that an ordinary crash cannot pass as a deliberate refusal. **The CTest total is 16 with TLS or 15 without it.** Regular suites exercise foundational types, the event loop — including the order in which per-operation cancellation and deadlines are decided, same-batch precedence, and per-direction readiness registration — scope frame reclamation / join / exceptions and cooperative stop, TCP loopback, HTTP parsing and connection handling, TLS / HTTPS composition and related negative cases. Counts are not proof of completeness.
 
 ```sh
 python3 tools/ci/check_layering.py
@@ -238,8 +301,8 @@ python3 tools/ci/check_layering.py
 
 Next priorities:
 
-1. **Stabilize lifetime contracts first:** task ownership, reentrant closing, completion races, structured waiting and cancellation safety.
-2. **Establish end-to-end resource contracts:** deadlines, streaming request bodies, slow-consumer backpressure, queue and memory limits.
+1. **Forward cancellation and deadlines through transport, TLS and HTTP:** only `core` supports them today, so the stack as a whole does not.
+2. **Establish end-to-end resource contracts:** streaming request bodies, slow-consumer backpressure, queue and memory limits.
 3. **Expand with evidence:** cross-platform negative tests, sanitizers, fuzzing, interoperability and reproducible benchmarks; then additional transports and protocols as needed.
 
 See the [architecture document](docs/ARCHITECTURE.md) for design rationale and detailed acceptance criteria. The roadmap describes direction, not shipped functionality or release dates.

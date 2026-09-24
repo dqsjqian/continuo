@@ -57,14 +57,15 @@ flowchart TB
 
 | 领域 | 已实现的基础 | 尚未完成 / 待验证 |
 |---|---|---|
-| 执行与生命周期 | 惰性、仅可移动的 `Task`；单线程 `TaskScope` 的 spawn / join 与协作 stop token；单线程 `EventLoop`、定时器与投递 | 完整 I/O 取消传播、截止时间、跨层 join / drain 契约与持续生命周期验证 |
+| 执行与生命周期 | 惰性、仅可移动的 `Task`（销毁已启动未完成的帧会终止）；单线程 `TaskScope` 的 spawn / join 与协作 stop token；单线程 `EventLoop`、定时器与投递 | 跨层 join / drain 契约与持续生命周期验证；派发中销毁事件循环是明确拒绝，而非支持 |
+| 取消与截止时间 | `core` 层每个操作都接受 stop token 与绝对截止时间（`read`/`write`/`accept`/`connect`/`sleep`/`wait_*`），双后端实现，单一解析点、恰好一次 | **transport / TLS / HTTP 尚未透传**，因此整栈还不能说支持取消；Windows 语义只有 CI 证据 |
 | TCP | IPv4 / IPv6、监听、连接、短读写、默认独占绑定 | 关闭与完成竞争的持续验证；全链路操作与队列上限 |
 | TLS（可选） | OpenSSL 3、证书链和 DNS 名 / IP 验证、单 ALPN 标识、关闭通知 | 取消安全；移动端 TLS；更广泛互操作验证 |
 | HTTP/1.1 | 增量解析、序列化、keep-alive、流水线请求处理、HEAD、分块响应 | 请求体目前有界缓冲；流式请求体、路由、完整客户端仍待实现 |
 | 安全与资源 | 解析限制、畸形输入负测、有界 TLS BIO | 端到端背压、总内存上限、广泛模糊测试与故障注入 |
 | 后续传输与协议 | TCP 流契约作为起点 | UDP / 数据报、DNS、更多协议与后端；HTTP/2、HTTP/3 尚未实现 |
 
-表中的“已实现”不代表相应领域已经完整验收。尤其是 `stop()` **不是取消**，定时器也不等于操作超时机制。
+表中的“已实现”不代表相应领域已经完整验收。`stop()` 仍然 **不是取消**：它只请求 `run()` 返回。逐操作取消是 `OperationOptions` 的职责，且目前只到 `core` 一层。
 
 ### 平台与证据边界
 
@@ -76,7 +77,7 @@ flowchart TB
 | iOS / Android | kqueue / epoll | 仅非 TLS 模块交叉编译；没有真机运行证据 |
 | BSD | kqueue | 后端可移植方向；没有专门 CI 证据 |
 
-最近已确认的三桌面 CI 通过基线是 `eddfddb`。当前 `TaskScope`、空任务 await 与 yield 生命周期修订不在该次基线覆盖范围内，本批仍待重新验证。CI 配置存在，不等于当前代码已通过。
+最近已确认的三桌面 CI 通过基线是 `a123370`。IOCP 的取消语义在开发机上**没有任何运行证据**：本地只通过 mingw-w64 交叉编译做类型与生命周期检查，而 mingw 不是 MSVC，能编译也不等于能运行。CI 配置存在，不等于当前代码已通过。
 
 ## 看看 API
 
@@ -179,7 +180,7 @@ continuo::Task<int> count_after_delay(continuo::EventLoop& loop) {
 - `TaskScope` 不可复制或移动。`spawn(Task<void>)` 接管未启动、非空的任务并立即启动；已完成的子任务帧及时释放，不等到 scope 析构。
 - `join()` **只能调用一次，调用即关闭 spawn 接纳**，返回的惰性 `Task<void>` 必须驱动至完成。即使 `pending() == 0`，使用过的 scope 仍须 join。
 - 第一个观察到的子任务异常触发 `request_stop()`；join 等待所有子任务与帧清理后才重抛该异常，不提前丢弃兄弟任务。
-- `get_stop_token()` / `request_stop()` 只是协作信号，不会自动取消正在等待的 I/O，也不提供截止时间。scope 操作、子任务完成和 stop 回调须在同一线程执行。
+- `get_stop_token()` / `request_stop()` 本身只是协作信号。把该 token 交给 `OperationOptions{.stop = ...}` 才会真正取消 `core` 的 I/O；scope 不会自动这么做。scope 操作、子任务完成和 stop 回调须在同一线程执行。
 - 仅从未 spawn / join 的空 scope 可直接析构。其余 scope 必须等 join 完成（包括清理完成后重抛异常）；提前析构或销毁正在等待的 join 会 `std::terminate()`。丢弃未启动的 join 也不能免除析构前完成 join 的义务。这是 fail-fast，不是隐式取消或后台清理，更不会悄悄释放仍被 I/O 引用的子帧。
 - await 空的或已被消费的 `Task` 会抛出 `std::logic_error`；向 scope 传入空任务会抛出 `std::invalid_argument`。
 
@@ -189,12 +190,74 @@ continuo::Task<int> count_after_delay(continuo::EventLoop& loop) {
 
 - 套接字、TLS 流、处理函数借用的对象与缓冲必须存活到相应操作结束；关联的事件循环必须更长寿。
 - 除 `post()` / `stop()` 外，事件循环操作应在所属线程执行；执行器接口不会让套接字自动变成线程安全对象。
-- 不要通过销毁仍在等待 I/O 的任务实现超时，也不要用 `Task::sync_get()` 驱动真实异步 I/O。
+- 不要通过销毁任务实现超时：传 `OperationOptions{.deadline = ...}`。销毁已启动未完成的帧会 `std::terminate()`，对真实异步 I/O 调用 `Task::sync_get()` 同样如此——事件循环可能仍持有该帧的句柄、结果槽位与借出的缓冲。
+- 不要在事件循环派发批次的过程中销毁、替换或重入它（即被恢复的协程里）。这同样会 `std::terminate()`：已从队列取出待交付的操作，以及 Windows 上尚未排空的完成批次，都还引用着循环的内部状态。
 - 连接所有者负责收尾与关闭；示例函数不转移套接字所有权，也不提供取消或并发连接管理。
+
+### 取消与截止时间：给单个操作加预算
+
+```cpp
+#include <continuo/core/event_loop.hpp>
+#include <continuo/core/task_scope.hpp>
+
+#include <array>
+#include <chrono>
+#include <cstddef>
+#include <span>
+#include <stop_token>
+
+using namespace std::chrono_literals;
+
+continuo::Task<continuo::Result<std::size_t>> read_with_budget(
+    continuo::EventLoop& loop,
+    continuo::NativeHandle handle,
+    std::span<std::byte> into,
+    std::stop_token stop) {
+    co_return co_await loop.read(handle,
+                                 into,
+                                 {.stop = std::move(stop),
+                                  .deadline = continuo::EventLoop::Clock::now() + 5s});
+}
+
+continuo::Task<void> read_until_stopped(continuo::EventLoop& loop,
+                                        continuo::NativeHandle handle) {
+    continuo::TaskScope scope;
+    std::array<std::byte, 4096> buffer{};
+
+    const continuo::Result<std::size_t> first =
+        co_await read_with_budget(loop, handle, buffer, scope.get_stop_token());
+    if (!first) {
+        scope.request_stop();
+    }
+    co_await scope.join();
+}
+```
+
+`OperationOptions` 是个纯聚合体，用指派初始化器按需填写。两点是**契约**而非风格：
+
+- **成员顺序不可重排**——指派初始化器要求按声明顺序书写，重排会让所有 `{.stop = ..., .deadline = ...}` 调用点编译失败。
+- **按值传入**——绑定到 `{...}` 临时量的引用，在创建协程的完整表达式结束时就失效了，而协程首次恢复发生在那之后。按值拷贝还让 stop 状态比持有 `stop_source` 的 `TaskScope` 活得更久，这正是「scope 已退出、操作仍在收尾」所需要的。
+
+截止时间是**绝对时间点**而非时长：内部重试（`EAGAIN`、`EINTR`、部分就绪唤醒）不能刷新预算，否则慢速对端可以让每一次单独等待都不超限，却把操作无限期地挂住。
+
+判定规则：
+
+| 情形 | 结果 |
+|---|---|
+| 提交时 token 已 stop | `Errc::cancelled`，不提交 |
+| 提交时已过截止时间 | `Errc::timed_out`，不提交 |
+| 两者同时命中 | `cancelled`——显式请求压过被动耗尽的预算 |
+| 零长度操作且命中上述任一 | 返回原因，而非它从未执行过的「0 字节成功」 |
+| 同一批 `run_once` 内既有真实完成又有 deadline / 取消 | 真实完成——它确实发生了 |
+| 重复取消 | 只解析一次，多余的请求找不到目标 |
+
+**取消不做的事**：不回滚已经发生的 I/O；不撤销内核已开始的 `connect`（socket 状态不确定，须由调用方 close，循环绝不关闭借来的句柄）；在 IOCP 上，被取消的操作要等完成包到达才交付已固定的原因，**即使那个包是成功的**——所以一个内核已填满缓冲的 read 被取消后字节流会出现空洞，该连接应当关闭而不是复用。`timed_out` 的交付时刻也可能晚于截止时间。
+
+stop 可以从**任意线程**请求，但一律在循环线程交付：回调只记录操作 id 并唤醒循环。这既避开了「`stop_callback` 在 `await_suspend` 内部同步触发」的重入陷阱，也是跨线程请求安全的原因。
 
 ## 构建与接入
 
-需要 **CMake 3.20+、C++23 编译器及支持 `std::expected` 的标准库**。默认非 TLS 构建没有第三方依赖；TLS 显式启用后需要 OpenSSL 3。
+需要 **CMake 3.20+、C++23 编译器，以及同时提供 `std::expected` 和 `std::stop_token` 的标准库**。默认非 TLS 构建没有第三方依赖；TLS 显式启用后需要 OpenSSL 3。Android 需 **API 30+**：NDK 的 libc++ 在更低 API 级别上不提供 `std::stop_token`。
 
 ```sh
 cmake -S . -B build/debug -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_STANDARD=23
@@ -230,7 +293,7 @@ target_link_libraries(my_app PRIVATE continuo::transport continuo::http)
 
 ## 测试与路线
 
-启用 TLS 时有 **8 个常规测试套件**：`core`、`event_loop`、`task_scope`、`transport`、`http_parser`、`http_server`、`http_end_to_end`、`tls_https`，非 TLS 构建为 7 个。另有 4 个独立 fail-fast CTest：`task_scope_pending-destruction`、`task_scope_unobserved-failure`、`task_scope_abandoned-join`、`task_scope_unstarted-join`，验证生命周期违约确实触发终止。**CTest 总计为 TLS 12 项、非 TLS 11 项**。常规套件覆盖基础类型、事件循环、scope 的帧释放 / join / 异常与协作 stop、TCP loopback、HTTP 解析与连接处理、TLS / HTTPS 组合及相关负测；数量不是完整性证明。
+启用 TLS 时有 **8 个常规测试套件**：`core`、`event_loop`、`task_scope`、`transport`、`http_parser`、`http_server`、`http_end_to_end`、`tls_https`，非 TLS 构建为 7 个。另有 **8 个 fail-fast CTest**，每个在独立子进程里只做一次契约违约，并要求终止处理器安装的**精确**退出码——否则任意崩溃都会被当成“刻意快速失败”通过。**CTest 总计为 TLS 16 项、非 TLS 15 项**。常规套件覆盖基础类型、事件循环（含逐操作取消与截止时间的判定顺序、同批优先级、双方向注册）、scope 的帧释放 / join / 异常与协作 stop、TCP loopback、HTTP 解析与连接处理、TLS / HTTPS 组合及相关负测；数量不是完整性证明。
 
 ```sh
 python3 tools/ci/check_layering.py
@@ -238,8 +301,8 @@ python3 tools/ci/check_layering.py
 
 接下来的优先级：
 
-1. **先稳定生命周期契约**：任务所有权、关闭重入、完成竞争、结构化等待与取消安全。
-2. **再建立端到端资源契约**：截止时间、流式请求体、慢消费者背压、队列与内存上限。
+1. **把取消与截止时间透传到 transport / TLS / HTTP**：目前只有 `core` 支持，整栈尚不支持。
+2. **再建立端到端资源契约**：流式请求体、慢消费者背压、队列与内存上限。
 3. **以证据支持扩展**：跨平台负测、sanitizer、模糊测试、互操作与可复现基准；随后按需求扩展传输和协议。
 
 设计依据与详细验收要求见 [架构文档](docs/ARCHITECTURE.md)。路线是方向，不是已交付功能或发布时间承诺。

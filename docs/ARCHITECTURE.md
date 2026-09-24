@@ -32,8 +32,8 @@ and remaining acceptance work must be described separately.
 
 | Concern | Current foundation | Remaining acceptance work |
 |---|---|---|
-| Execution and ownership | Lazy, move-only `Task`, single-threaded `TaskScope` with immediate spawn and one-shot join, executor seam, single-threaded `EventLoop` | Explicit operation/buffer ownership across layers, safe I/O cancellation and continued join/drain validation |
-| Cancellation and deadlines | Scope cooperative stop token, timers and loop stop are available; yield is tracked through shutdown | Propagated I/O cancellation and operation deadlines; deterministic outcomes for completion/close/timeout races; neither a stop token nor `stop()` automatically cancels I/O |
+| Execution and ownership | Lazy, move-only `Task` that terminates rather than destroy a started, unfinished frame; single-threaded `TaskScope` with immediate spawn and one-shot join; executor seam; single-threaded `EventLoop` whose operations carry never-reused identities | Explicit operation/buffer ownership across layers and continued join/drain validation; loop destruction during dispatch is refused rather than supported |
+| Cancellation and deadlines | `OperationOptions` gives every core operation a stop token and an absolute deadline on both backends, with one resolution point per operation; scope cooperative stop, timers and loop stop; yield is tracked through shutdown | Propagation through transport, TLS and HTTP — **the stack above `core` does not forward options yet**; Windows semantics rest on CI alone; `stop()` is still a stop-pumping request, not I/O cancellation |
 | Transport and composition | TCP and completion-shaped kqueue/epoll/IOCP implementations; stream concepts | Equivalent observable semantics across backends, verified teardown, bounded queues; datagram contracts before UDP expansion |
 | Protocols and data flow | HTTP/1.1 parser, serializer and connection loop; buffered request bodies | Protocol conformance evidence, streamed bodies, slow-consumer backpressure and bounded aggregate memory |
 | Security and robustness | Optional OpenSSL TLS stream, parser limits and negative-input tests | Lifecycle-safe TLS cancellation, broader fuzzing, failure injection and resource-exhaustion tests |
@@ -230,9 +230,10 @@ Keep borrowed streams, buffers, coroutine-lambda closures and other child state
 alive through join; normally keep the associated loop alive longer as well.
 Do not destroy the parent task while it awaits join. Prefer free-function
 coroutines for examples so a temporary lambda cannot leave a dangling closure.
-Do not use `sync_get()` for real asynchronous I/O or a join that may suspend.
-Awaiting an empty or consumed `Task<T>` now throws `std::logic_error` rather than
-accessing a missing frame.
+Do not use `sync_get()` for real asynchronous I/O or a join that may suspend:
+it terminates rather than tear down a frame the loop may still reference.
+Awaiting an empty or consumed `Task<T>` throws `std::logic_error` — there is no
+frame to abandon, so that case stays recoverable.
 
 `EventLoop::yield()` uses an already-due timer rather than disposable posted
 work. It counts as outstanding work, resumes on the next loop pump and is also
@@ -254,10 +255,12 @@ These are broader design/acceptance requirements, beyond the scope foundation:
 - **Ownership:** distinguish owned sockets, operation state and coroutine
   frames from borrowed streams and spans. Specify the destruction order of
   task, stream and loop, and which objects must survive kernel completion.
-- **Cancellation and deadlines:** propagate a caller's cancellation request and
-  monotonic deadline through composed I/O, including TLS. Define the outcome
-  of close/completion/cancellation/timeout races, exactly-once completion, and
-  resource reclamation. A timer API or `stop()` alone does not provide this.
+- **Cancellation and deadlines:** `core` now carries a caller's stop token and
+  absolute deadline per operation, resolves each exactly once, and fixes the
+  precedence of the close/completion/cancellation/timeout races (see below).
+  Propagating them through transport, TLS and composed HTTP is still
+  outstanding, and until that lands the stack above `core` cannot be said to
+  support cancellation.
 - **Backpressure:** bound outstanding operations, buffered bytes and work
   queues; define whether reaching each limit suspends or rejects a producer.
   Test slow peers and stalled consumers. A parser size limit or bounded TLS
@@ -265,6 +268,83 @@ These are broader design/acceptance requirements, beyond the scope foundation:
 - **Thread affinity:** identify each operation's owner executor and permitted
   handoff points. Scheduling elsewhere must not leave callbacks able to resume
   a destroyed task or access a loop-bound object from the wrong thread.
+
+## Per-operation cancellation and deadlines
+
+`OperationOptions` carries a `std::stop_token` and an **absolute**
+`steady_clock` deadline, by value, into every `core` operation:
+
+```cpp
+co_await loop.read(handle, buffer, {.deadline = Clock::now() + 5s});
+co_await loop.read(handle, buffer, {.stop = scope.get_stop_token()});
+```
+
+The member order is part of the source contract, because designated
+initialisers must be written in declaration order. Pass-by-value is too: a
+reference bound to a `{...}` temporary dies at the end of the expression that
+creates the coroutine, which is before the coroutine first resumes. Copying
+also lets the stop state outlive the `TaskScope` that owned the `stop_source`,
+which an operation still winding down after a scope exits depends on.
+
+The deadline is absolute rather than a duration so that an operation retrying
+internally — `EAGAIN`, `EINTR`, a partial readiness wake-up — cannot refresh
+its budget, which would let a slow peer hold it open indefinitely while every
+individual wait stayed under the limit.
+
+### Resolution rules
+
+| Situation | Outcome |
+|---|---|
+| Token already stopped at submission | `Errc::cancelled`, nothing submitted |
+| Deadline already past at submission | `Errc::timed_out`, nothing submitted |
+| Both | `cancelled` — an explicit request outranks an elapsed budget |
+| Zero-length operation with either | The reason, not a 0-byte success it never performed |
+| Completion and deadline/cancel in the same `run_once` | The completion. It genuinely happened |
+| Repeated cancellation | Resolved once; the extra requests find nothing |
+| Loop shutdown with work suspended | Each operation's pinned reason, or `cancelled` |
+
+Options are evaluated before an operation's first syscall and again before each
+time it parks, but **not** between a readiness wake-up and the retry it
+enables. An earlier revision did check there, and it made a read that became
+ready in the same batch as its deadline report a timeout on POSIX while IOCP
+reported success for the same program — because a completion packet is dequeued
+before the timer queue is examined. Two backends disagreeing about one program
+is the failure this library exists to avoid.
+
+### What cancellation does not do
+
+- **It does not roll back I/O that already happened.** Bytes already moved
+  stay moved.
+- **It does not undo a kernel `connect`.** Cancelling abandons the *wait*; the
+  socket is left in an indeterminate state and the caller must close it. The
+  loop never closes a handle it was lent.
+- **On IOCP it can lose bytes.** A cancelled or timed-out operation stays in
+  the table until its completion packet arrives, because until then the kernel
+  may still be writing into the OVERLAPPED, the AcceptEx address buffer and the
+  caller's buffer. The pinned reason is then delivered *even if the packet
+  reports success* — so a cancelled read whose buffer the kernel had already
+  filled discards those bytes, leaving a hole in the stream. **A cancelled read
+  or write ends that connection's usefulness on Windows; close it rather than
+  reuse it.** POSIX has no equivalent, because there the cancellation happens
+  before the syscall.
+- **`timed_out` may arrive later than the deadline on IOCP**, for the same
+  reason. Nothing asserts an upper bound on when.
+- **It is not `stop()`.** Stopping the loop asks it to return from `run()`; it
+  does not cancel anything.
+
+### Threading
+
+A stop may be *requested* from any thread; it is *delivered* on the loop
+thread. The callback records an operation id and nudges the loop, and does
+nothing else — a `std::stop_callback` built on an already-stopped token runs
+synchronously inside the `await_suspend` that registered it, where resuming the
+coroutine would re-enter its own suspension. The same indirection is what makes
+an off-thread request safe, and is why the callback holds an id rather than a
+pointer to an awaiter living in a coroutine frame.
+
+Local tests cover the loop thread and an off-thread request that is joined
+before the loop is pumped. Neither is a concurrency stress test, and no claim
+is made about racing a request against a resolution.
 
 ## What CI found that local testing could not
 
@@ -285,9 +365,22 @@ argument for running tests on every platform rather than building on them.
    fixing (1) alone changed nothing: the value never reached the translation.
    `WSAGetOverlappedResult` is the documented way back to a Winsock number.
 
+3. **Nothing on this machine runs IOCP.** The per-operation cancellation work
+   added a third case of the same shape, pre-emptively rather than after the
+   fact. The Windows paths — a pinned reason surviving a success packet,
+   `ERROR_NOT_FOUND`, accept-socket reclamation, buffer release strictly after
+   the drain — are compiled locally through mingw-w64, which catches type and
+   lifetime errors cheaply, but mingw is not MSVC and a compile is not a run.
+   Those semantics have no local evidence of any kind.
+
 The pattern is worth naming, because it will recur: **the dangerous
 portability bug is the one where every platform builds and runs, and one of
 them silently fails to match the condition callers switch on.**
+
+A corollary for the development machine: cross-compiling the backend it cannot
+run is worth doing anyway. It turns a class of mistake that would otherwise
+cost a twenty-minute CI round trip into a local error message, without
+pretending to be verification.
 
 ## Decisions on record
 
@@ -426,24 +519,40 @@ Current request bodies remain buffered, not streamed to handlers.
 **Structured task foundation.** `TaskScope` adds immediate owned spawn, one-shot
 join, prompt child-frame reclamation, cooperative stop and first-exception
 propagation after all children finish. Empty-task await is checked; tracked
-`yield` resumes during loop shutdown. These changes are newer than the last
-confirmed passing desktop CI baseline `eddfddb` and await fresh validation.
+`yield` resumes during loop shutdown.
+
+**Per-operation cancellation and deadlines.** Operations gained never-reused
+identities, timers became cancellable and stopped holding awaiter addresses,
+and every `core` operation accepts a stop token and an absolute deadline with a
+single resolution point. Destroying a started, unfinished `Task`, and
+destroying or re-entering a dispatching loop, both became terminating refusals
+rather than undefined behaviour. Two bugs that were live before this work also
+went: `run_once` stranded already-extracted operations when re-arming its
+wake-up pipe failed, and the HTTP grammar existed as two independent copies.
+Options are not yet forwarded by transport, TLS or HTTP.
 
 The current test registration has eight regular suites with TLS (`core`,
 `event_loop`, `task_scope`, `transport`, `http_parser`, `http_server`,
-`http_end_to_end`, `tls_https`), or seven without TLS. Four additional CTests
-exercise fail-fast violations: `task_scope_pending-destruction`,
-`task_scope_unobserved-failure`, `task_scope_abandoned-join` and
-`task_scope_unstarted-join`. Totals are **12 CTests with TLS and 11 without**;
-registration counts do not assert that this revision has passed them.
+`http_end_to_end`, `tls_https`), or seven without TLS. Eight additional CTests
+run a single contract violation each in its own process and require the exact
+exit code the terminate handler installs, so that an ordinary crash cannot pass
+as a deliberate fail-fast: `task_scope_pending-destruction`,
+`task_scope_unobserved-failure`, `task_scope_abandoned-join`,
+`task_scope_unstarted-join`, `task_contract_sync-get-suspended`,
+`task_contract_abandoned-awaiter`, `event_loop_destroy-during-dispatch` and
+`event_loop_reentrant-run-once`. Totals are **16 CTests with TLS and 15
+without**; registration counts do not assert that this revision has passed
+them.
 
-**Known lifecycle limits.** Pending tasks must not be destroyed while the event
-loop/kernel still holds their handles or buffers. Scope misuse is fail-fast, not
-implicit I/O cancellation or universal protection for arbitrary standalone
-`Task` destruction. Full cancellation, deadlines and continued cross-backend
-teardown validation remain work; this foundation is not production-readiness
-or a complete cancellation-safety claim.
+**Known lifecycle limits.** Destroying a started, unfinished `Task` now
+terminates instead of being undefined, and so does destroying, replacing or
+re-entering the loop while it is dispatching a batch. Both are refusals, not
+recoveries: the loop cannot make either safe by itself, so it says so loudly
+instead of continuing into a use-after-free. Cancellation is a `core` facility
+only — transport, TLS and HTTP do not forward `OperationOptions` yet — and the
+Windows half of it has no local runtime evidence at all. This foundation is
+neither production-readiness nor a complete cancellation-safety claim.
 
 **Deliberately absent.** UDP, routing, HTTP/2, a full HTTP client, native OS trust
-store integration, mTLS policy, I/O-integrated cancellation/deadline propagation,
+store integration, mTLS policy, cancellation/deadline propagation above `core`,
 and multi-threaded loops.
