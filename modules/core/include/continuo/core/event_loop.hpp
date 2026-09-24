@@ -14,12 +14,16 @@
 //
 // Threading contract:
 //   * `post()` and `stop()` are safe from any thread.
+//   * `OperationOptions::stop` may be requested from any thread; the
+//     cancellation is delivered on the loop thread.
 //   * everything else must be called on the thread running the loop.
 //
 // Resumption always happens outside the loop's internal lock, so a resumed
-// coroutine may freely submit more I/O, post work, or stop the loop.
+// coroutine may freely submit more I/O, post work, or stop the loop. It may
+// not destroy or replace the loop it is being resumed by — see `~EventLoop`.
 
 #include "continuo/core/error.hpp"
+#include "continuo/core/operation.hpp"
 #include "continuo/core/platform.hpp"
 #include "continuo/core/task.hpp"
 
@@ -53,6 +57,20 @@ public:
     ~EventLoop();
 
     // ── portable I/O (completion-shaped) ────────────────────────────────────
+    //
+    // Every operation below accepts `OperationOptions` for cancellation and a
+    // deadline. Shared rules, so that each one does not restate them:
+    //
+    //   * The options are evaluated **before** the first syscall. An operation
+    //     whose token is already stopped reports `Errc::cancelled` without
+    //     touching the handle; one whose deadline has already passed reports
+    //     `Errc::timed_out`. If both apply, cancellation wins — an explicit
+    //     request outranks an elapsed budget. This holds for zero-length
+    //     operations too, which therefore report the reason rather than 0.
+    //   * Within one `run_once`, a genuine completion is delivered before a
+    //     deadline or a cancellation that landed in the same batch, and an
+    //     operation resolves exactly once.
+    //   * Cancellation does **not** roll back I/O that already happened.
 
     /// Register `handle` with the loop before performing I/O on it.
     ///
@@ -70,14 +88,16 @@ public:
     /// reported as `Errc::eof` rather than a zero-length success, so that "no
     /// more data" cannot be mistaken for "nothing right now".
     [[nodiscard]] Task<Result<std::size_t>> read(NativeHandle handle,
-                                                 std::span<std::byte> destination);
+                                                 std::span<std::byte> destination,
+                                                 OperationOptions options = {});
 
     /// Write once from `source`, resolving with the byte count accepted.
     ///
     /// Short writes are normal; looping is the caller's business (see
     /// `write_all` in `stream.hpp`).
     [[nodiscard]] Task<Result<std::size_t>> write(NativeHandle handle,
-                                                  std::span<const std::byte> source);
+                                                  std::span<const std::byte> source,
+                                                  OperationOptions options = {});
 
     /// Accept one connection from a listening handle.
     ///
@@ -90,7 +110,9 @@ public:
     /// ...) passed straight through. The loop does not interpret it; IOCP
     /// simply needs to pre-create a socket of the right family before it can
     /// submit an accept.
-    [[nodiscard]] Task<Result<NativeHandle>> accept(NativeHandle listener, int address_family);
+    [[nodiscard]] Task<Result<NativeHandle>> accept(NativeHandle listener,
+                                                    int address_family,
+                                                    OperationOptions options = {});
 
     /// Connect `handle` to an already-encoded socket address.
     ///
@@ -98,18 +120,33 @@ public:
     /// syscall and never looks inside. That is what keeps `core` free of
     /// address-family knowledge while still being the only layer that talks to
     /// the OS — building the blob is the transport's job.
+    ///
+    /// Cancelling or timing out a connect abandons the *wait*; it does not
+    /// undo the connect the kernel already started. The socket is left in an
+    /// indeterminate state and the caller must close it. The loop never closes
+    /// a handle it was lent.
     [[nodiscard]] Task<Result<void>> connect(NativeHandle handle,
-                                             std::span<const std::byte> address);
+                                             std::span<const std::byte> address,
+                                             OperationOptions options = {});
 
     // ── timers and scheduling (portable) ────────────────────────────────────
 
     /// Suspend for at least `delay`.
-    [[nodiscard]] Task<Result<void>> sleep_for(Duration delay);
+    [[nodiscard]] Task<Result<void>> sleep_for(Duration delay, OperationOptions options = {});
 
     /// Suspend until `deadline`.
-    [[nodiscard]] Task<Result<void>> sleep_until(Clock::time_point deadline);
+    ///
+    /// Two distinct points in time are in play when `options.deadline` is also
+    /// set, and they mean different things: reaching `deadline` is this
+    /// operation *succeeding*, while reaching `options.deadline` is it being
+    /// cut short with `Errc::timed_out`. Whichever comes first decides.
+    [[nodiscard]] Task<Result<void>> sleep_until(Clock::time_point deadline,
+                                                 OperationOptions options = {});
 
     /// Reschedule the caller onto the loop thread without waiting for I/O.
+    ///
+    /// No options: a yield waits for nothing, so there is nothing to cancel or
+    /// time out. Code that loops on `yield()` must watch its own stop token.
     [[nodiscard]] Task<void> yield();
 
     /// Queue `work` to run on the loop thread. Safe from any thread.
@@ -148,10 +185,12 @@ public:
 
 #if CONTINUO_HAS_READINESS_API
     /// Suspend until `handle` is readable. POSIX only.
-    [[nodiscard]] Task<Result<void>> wait_readable(NativeHandle handle);
+    [[nodiscard]] Task<Result<void>> wait_readable(NativeHandle handle,
+                                                   OperationOptions options = {});
 
     /// Suspend until `handle` is writable. POSIX only.
-    [[nodiscard]] Task<Result<void>> wait_writable(NativeHandle handle);
+    [[nodiscard]] Task<Result<void>> wait_writable(NativeHandle handle,
+                                                   OperationOptions options = {});
 #endif
 
 private:
@@ -159,7 +198,8 @@ private:
 
     explicit EventLoop(std::unique_ptr<Impl> impl) noexcept;
 
-    [[nodiscard]] Task<Result<void>> wait_for(NativeHandle handle, bool writable);
+    [[nodiscard]] Task<Result<void>>
+    wait_for(NativeHandle handle, bool writable, OperationOptions options);
 
     std::unique_ptr<Impl> impl_;
 };

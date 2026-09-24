@@ -703,11 +703,14 @@ Result<void> EventLoop::run() {
 
 // ── portable completion API, mapped straight onto IOCP ───────────────────────
 
-Task<Result<std::size_t>> EventLoop::read(NativeHandle handle, std::span<std::byte> destination) {
+Task<Result<std::size_t>> EventLoop::read(NativeHandle handle,
+                                          std::span<std::byte> destination,
+                                          OperationOptions options) {
     if (destination.empty()) {
         co_return std::size_t{0};
     }
     Impl* impl = impl_.get();
+    static_cast<void>(options);
     auto submit = [impl, handle, destination](std::coroutine_handle<> coroutine,
                                               Result<std::size_t>* result) {
         return impl->submit_read(handle, destination, coroutine, result);
@@ -715,11 +718,14 @@ Task<Result<std::size_t>> EventLoop::read(NativeHandle handle, std::span<std::by
     co_return co_await detail::OperationAwaiter<Result<std::size_t>, decltype(submit)>{submit};
 }
 
-Task<Result<std::size_t>> EventLoop::write(NativeHandle handle, std::span<const std::byte> source) {
+Task<Result<std::size_t>> EventLoop::write(NativeHandle handle,
+                                           std::span<const std::byte> source,
+                                           OperationOptions options) {
     if (source.empty()) {
         co_return std::size_t{0};
     }
     Impl* impl = impl_.get();
+    static_cast<void>(options);
     auto submit = [impl, handle, source](std::coroutine_handle<> coroutine,
                                          Result<std::size_t>* result) {
         return impl->submit_write(handle, source, coroutine, result);
@@ -727,8 +733,10 @@ Task<Result<std::size_t>> EventLoop::write(NativeHandle handle, std::span<const 
     co_return co_await detail::OperationAwaiter<Result<std::size_t>, decltype(submit)>{submit};
 }
 
-Task<Result<NativeHandle>> EventLoop::accept(NativeHandle listener, int address_family) {
+Task<Result<NativeHandle>>
+EventLoop::accept(NativeHandle listener, int address_family, OperationOptions options) {
     Impl* impl = impl_.get();
+    static_cast<void>(options);
     auto submit = [impl, listener, address_family](std::coroutine_handle<> coroutine,
                                                    Result<std::size_t>* result) {
         return impl->submit_accept(listener, address_family, coroutine, result);
@@ -749,11 +757,14 @@ Task<Result<NativeHandle>> EventLoop::accept(NativeHandle listener, int address_
     co_return static_cast<NativeHandle>(*accepted);
 }
 
-Task<Result<void>> EventLoop::connect(NativeHandle handle, std::span<const std::byte> address) {
+Task<Result<void>> EventLoop::connect(NativeHandle handle,
+                                      std::span<const std::byte> address,
+                                      OperationOptions options) {
     if (address.size() < sizeof(sockaddr)) {
         co_return fail(Errc::invalid_argument);
     }
     Impl* impl = impl_.get();
+    static_cast<void>(options);
     auto submit = [impl, handle, address](std::coroutine_handle<> coroutine,
                                           Result<std::size_t>* result) {
         return impl->submit_connect(handle, address, coroutine, result);
@@ -770,22 +781,23 @@ Task<Result<void>> EventLoop::connect(NativeHandle handle, std::span<const std::
 
 // ── timers and scheduling ────────────────────────────────────────────────────
 
-Task<Result<void>> EventLoop::wait_for(NativeHandle, bool) {
+Task<Result<void>> EventLoop::wait_for(NativeHandle, bool, OperationOptions) {
     // No readiness concept on IOCP. The portable surface never calls this;
     // `wait_readable`/`wait_writable` are not declared on this platform.
     co_return fail(Errc::not_supported);
 }
 
-Task<Result<void>> EventLoop::sleep_until(Clock::time_point deadline) {
+Task<Result<void>> EventLoop::sleep_until(Clock::time_point deadline, OperationOptions options) {
     Impl* impl = impl_.get();
+    static_cast<void>(options);
     auto submit = [impl, deadline](std::coroutine_handle<> coroutine, Result<void>* result) {
         return impl->add_timer(deadline, coroutine, result);
     };
     co_return co_await detail::OperationAwaiter<Result<void>, decltype(submit)>{submit};
 }
 
-Task<Result<void>> EventLoop::sleep_for(Duration delay) {
-    return sleep_until(Clock::now() + delay);
+Task<Result<void>> EventLoop::sleep_for(Duration delay, OperationOptions options) {
+    return sleep_until(Clock::now() + delay, std::move(options));
 }
 
 Task<void> EventLoop::yield() {

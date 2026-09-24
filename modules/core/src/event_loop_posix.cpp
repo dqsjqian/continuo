@@ -465,7 +465,9 @@ Result<void> EventLoop::run() {
 
 // ── portable completion API, emulated on readiness ───────────────────────────
 
-Task<Result<std::size_t>> EventLoop::read(NativeHandle handle, std::span<std::byte> destination) {
+Task<Result<std::size_t>> EventLoop::read(NativeHandle handle,
+                                          std::span<std::byte> destination,
+                                          OperationOptions options) {
     if (!impl_ || impl_->shutting_down()) co_return fail(Errc::cancelled);
     if (destination.empty()) {
         co_return std::size_t{0};
@@ -486,14 +488,16 @@ Task<Result<std::size_t>> EventLoop::read(NativeHandle handle, std::span<std::by
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
             co_return fail(last_os_error());
         }
-        Result<void> ready = co_await wait_for(handle, /*writable=*/false);
+        Result<void> ready = co_await wait_for(handle, /*writable=*/false, options);
         if (!ready) {
             co_return fail(ready.error());
         }
     }
 }
 
-Task<Result<std::size_t>> EventLoop::write(NativeHandle handle, std::span<const std::byte> source) {
+Task<Result<std::size_t>> EventLoop::write(NativeHandle handle,
+                                           std::span<const std::byte> source,
+                                           OperationOptions options) {
     if (!impl_ || impl_->shutting_down()) co_return fail(Errc::cancelled);
     if (source.empty()) {
         co_return std::size_t{0};
@@ -509,14 +513,15 @@ Task<Result<std::size_t>> EventLoop::write(NativeHandle handle, std::span<const 
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
             co_return fail(last_os_error());
         }
-        Result<void> ready = co_await wait_for(handle, /*writable=*/true);
+        Result<void> ready = co_await wait_for(handle, /*writable=*/true, options);
         if (!ready) {
             co_return fail(ready.error());
         }
     }
 }
 
-Task<Result<NativeHandle>> EventLoop::accept(NativeHandle listener, int address_family) {
+Task<Result<NativeHandle>>
+EventLoop::accept(NativeHandle listener, int address_family, OperationOptions options) {
     if (!impl_ || impl_->shutting_down()) co_return fail(Errc::cancelled);
     // address_family is only needed by IOCP, which must pre-create the socket.
     // accept() reports the family itself, so POSIX ignores it.
@@ -546,14 +551,16 @@ Task<Result<NativeHandle>> EventLoop::accept(NativeHandle listener, int address_
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
             co_return fail(last_os_error());
         }
-        Result<void> ready = co_await wait_for(listener, /*writable=*/false);
+        Result<void> ready = co_await wait_for(listener, /*writable=*/false, options);
         if (!ready) {
             co_return fail(ready.error());
         }
     }
 }
 
-Task<Result<void>> EventLoop::connect(NativeHandle handle, std::span<const std::byte> address) {
+Task<Result<void>> EventLoop::connect(NativeHandle handle,
+                                      std::span<const std::byte> address,
+                                      OperationOptions options) {
     if (!impl_ || impl_->shutting_down()) co_return fail(Errc::cancelled);
     if (address.empty()) {
         co_return fail(Errc::invalid_argument);
@@ -577,7 +584,7 @@ Task<Result<void>> EventLoop::connect(NativeHandle handle, std::span<const std::
         // A non-blocking connect reports completion by becoming writable, but
         // writability alone does not mean success: the actual outcome lives in
         // SO_ERROR and must be read, or a refused connection looks connected.
-        Result<void> ready = co_await wait_for(handle, /*writable=*/true);
+        Result<void> ready = co_await wait_for(handle, /*writable=*/true, options);
         if (!ready) {
             co_return fail(ready.error());
         }
@@ -596,8 +603,10 @@ Task<Result<void>> EventLoop::connect(NativeHandle handle, std::span<const std::
 
 // ── timers and scheduling ────────────────────────────────────────────────────
 
-Task<Result<void>> EventLoop::wait_for(NativeHandle handle, bool writable) {
+Task<Result<void>>
+EventLoop::wait_for(NativeHandle handle, bool writable, OperationOptions options) {
     Impl* impl = impl_.get();
+    static_cast<void>(options);
     auto submit = [impl, handle, writable](std::coroutine_handle<> coroutine,
                                            Result<void>* result) {
         return impl->add_waiter(handle, writable, coroutine, result);
@@ -605,16 +614,17 @@ Task<Result<void>> EventLoop::wait_for(NativeHandle handle, bool writable) {
     co_return co_await detail::OperationAwaiter<Result<void>, decltype(submit)>{submit};
 }
 
-Task<Result<void>> EventLoop::sleep_until(Clock::time_point deadline) {
+Task<Result<void>> EventLoop::sleep_until(Clock::time_point deadline, OperationOptions options) {
     Impl* impl = impl_.get();
+    static_cast<void>(options);
     auto submit = [impl, deadline](std::coroutine_handle<> coroutine, Result<void>* result) {
         return impl->add_timer(deadline, coroutine, result);
     };
     co_return co_await detail::OperationAwaiter<Result<void>, decltype(submit)>{submit};
 }
 
-Task<Result<void>> EventLoop::sleep_for(Duration delay) {
-    return sleep_until(Clock::now() + delay);
+Task<Result<void>> EventLoop::sleep_for(Duration delay, OperationOptions options) {
+    return sleep_until(Clock::now() + delay, std::move(options));
 }
 
 Task<void> EventLoop::yield() {
@@ -631,12 +641,12 @@ Task<void> EventLoop::yield() {
 }
 
     #if CONTINUO_HAS_READINESS_API
-Task<Result<void>> EventLoop::wait_readable(NativeHandle handle) {
-    return wait_for(handle, /*writable=*/false);
+Task<Result<void>> EventLoop::wait_readable(NativeHandle handle, OperationOptions options) {
+    return wait_for(handle, /*writable=*/false, std::move(options));
 }
 
-Task<Result<void>> EventLoop::wait_writable(NativeHandle handle) {
-    return wait_for(handle, /*writable=*/true);
+Task<Result<void>> EventLoop::wait_writable(NativeHandle handle, OperationOptions options) {
+    return wait_for(handle, /*writable=*/true, std::move(options));
 }
     #endif
 
