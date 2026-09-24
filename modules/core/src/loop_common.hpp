@@ -2,19 +2,24 @@
 
 // Internal pieces shared by every event-loop backend — NOT a public header.
 //
-// Timers, the posted-work queue, and the suspension awaiter behave identically
-// whether completions arrive from kqueue, epoll, or IOCP. Keeping them here
-// means the POSIX and Windows backends differ only where the platforms
-// genuinely differ, instead of drifting apart in code that should be the same.
+// Timers, the posted-work queue, operation identity, and the suspension
+// awaiter behave identically whether completions arrive from kqueue, epoll, or
+// IOCP. Keeping them here means the POSIX and Windows backends differ only
+// where the platforms genuinely differ, instead of drifting apart in code that
+// should be the same.
 
 #include "continuo/core/error.hpp"
+#include "continuo/core/operation.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <coroutine>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
+#include <iterator>
 #include <map>
-#include <mutex>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -22,35 +27,66 @@ namespace continuo::detail {
 
 using Clock = std::chrono::steady_clock;
 
-/// A suspended coroutine plus where to leave its outcome.
+/// Stable identity for one in-flight operation.
 ///
-/// `result` points into the awaiter, which lives in the suspended coroutine's
-/// frame — valid for exactly as long as the operation is registered.
-template<typename T>
-struct Suspension {
-    std::coroutine_handle<> handle{};
-    T* result{nullptr};
+/// Monotonic and never reused. That single property is what makes every
+/// indirect reference safe: a timer, a cancellation request, or a readiness
+/// event naming an operation that has already resolved finds *nothing* rather
+/// than finding a different operation that happens to occupy the same slot.
+/// It is the generation counter other designs bolt on separately, except that
+/// it cannot be forgotten at a comparison site — there is no slot to compare.
+using OperationId = std::uint64_t;
 
-    void complete(T value) const {
-        if (result) {
-            *result = std::move(value);
-        }
-        handle.resume();
-    }
+/// Reserved: "no operation". Never handed out, so a zeroed field is
+/// unambiguously empty rather than pointing at the first operation ever made.
+inline constexpr OperationId kNoOperation = 0;
+
+/// Which operation a timer belongs to, and what its firing means.
+struct TimerTarget {
+    OperationId operation{kNoOperation};
+
+    /// `false`: the operation *succeeds* when this fires — a sleep reaching
+    /// the time it asked for. `true`: the operation is cut short with
+    /// `Errc::timed_out`. One queue holds both, because they are the same
+    /// mechanism answering to different words.
+    bool is_deadline{false};
 };
 
-/// Suspension whose outcome is success-or-error with no payload.
-using VoidSuspension = Suspension<Result<void>>;
+/// Reference to a registered timer, or `{}` for "none".
+struct TimerHandle {
+    Clock::time_point deadline{};
+    std::uint64_t serial{0};
 
-/// Deadline-ordered timer queue.
+    [[nodiscard]] bool valid() const noexcept { return serial != 0; }
+};
+
+/// Deadline-ordered timer queue with cancellable entries.
 ///
-/// Not thread-safe on its own; the owning backend holds its lock. A multimap
-/// keeps insertion cheap and "nearest deadline" O(1), which is all the loop
-/// asks of it.
+/// Not thread-safe on its own; the owning backend holds its lock.
+///
+/// Entries carry an `OperationId` rather than a coroutine handle. A timer that
+/// outlives the operation it was registered for therefore cannot resume a
+/// stale frame — it names something that is no longer in the table, and the
+/// lookup fails harmlessly.
+///
+/// Keyed by `(deadline, serial)` so that cancellation is a single `erase` of a
+/// key the caller already holds: no second index to keep in step, and
+/// cancelling twice is naturally a no-op.
 class TimerQueue {
 public:
-    void add(Clock::time_point deadline, VoidSuspension suspension) {
-        timers_.emplace(deadline, suspension);
+    [[nodiscard]] TimerHandle add(Clock::time_point deadline, TimerTarget target) {
+        const std::uint64_t serial = ++serial_;  // from 1: 0 means "no timer"
+        timers_.emplace(Key{deadline, serial}, target);
+        return TimerHandle{deadline, serial};
+    }
+
+    /// Idempotent. Cancelling a timer that already fired, or was never
+    /// registered, is the ordinary path for an operation that completed some
+    /// other way.
+    void cancel(TimerHandle handle) noexcept {
+        if (handle.valid()) {
+            timers_.erase(Key{handle.deadline, handle.serial});
+        }
     }
 
     [[nodiscard]] bool empty() const noexcept { return timers_.empty(); }
@@ -58,27 +94,37 @@ public:
 
     /// Nearest deadline, or `time_point::max()` when idle.
     [[nodiscard]] Clock::time_point earliest() const noexcept {
-        return timers_.empty() ? Clock::time_point::max() : timers_.begin()->first;
+        return timers_.empty() ? Clock::time_point::max() : timers_.begin()->first.deadline;
     }
 
-    /// Move every timer due at `now` into `out`.
-    void extract_expired(Clock::time_point now, std::vector<VoidSuspension>& out) {
-        while (!timers_.empty() && timers_.begin()->first <= now) {
+    /// Append every timer due at `now` to `out`, wake-ups before deadlines.
+    ///
+    /// The partition is the point, not an optimisation: when a sleep reaches
+    /// its target in the same instant that some operation's deadline expires,
+    /// the sleep must be seen to have succeeded. Insertion order would get
+    /// that right by coincidence, since the wake-up is registered first; the
+    /// partition says it on purpose.
+    void extract_expired(Clock::time_point now, std::vector<TimerTarget>& out) {
+        const auto appended = static_cast<std::ptrdiff_t>(out.size());
+        while (!timers_.empty() && timers_.begin()->first.deadline <= now) {
             out.push_back(timers_.begin()->second);
             timers_.erase(timers_.begin());
         }
-    }
-
-    /// Move every timer into `out`, regardless of deadline (shutdown path).
-    void extract_all(std::vector<VoidSuspension>& out) {
-        for (const auto& [deadline, suspension] : timers_) {
-            out.push_back(suspension);
-        }
-        timers_.clear();
+        std::stable_partition(std::next(out.begin(), appended),
+                              out.end(),
+                              [](const TimerTarget& target) noexcept { return !target.is_deadline; });
     }
 
 private:
-    std::multimap<Clock::time_point, VoidSuspension> timers_{};
+    struct Key {
+        Clock::time_point deadline;
+        std::uint64_t serial;
+
+        friend auto operator<=>(const Key&, const Key&) = default;
+    };
+
+    std::map<Key, TimerTarget> timers_{};
+    std::uint64_t serial_{0};
 };
 
 /// Convert a caller timeout, the nearest deadline, and queued work into the
@@ -86,6 +132,11 @@ private:
 ///
 /// Returns a negative value to mean "block indefinitely" — the convention both
 /// `epoll_wait` and `GetQueuedCompletionStatus` already use.
+///
+/// Invariant for callers: the wake-up byte a backend writes may be collapsed
+/// or drained spuriously, so it is never the thing that guarantees progress.
+/// **Every queue whose arrival triggers a wake must be reported through
+/// `work_already_queued`**, or the loop can block with work sitting in it.
 [[nodiscard]] inline int resolve_timeout_ms(Clock::duration caller_timeout,
                                             Clock::time_point earliest_deadline,
                                             bool work_already_queued) {
@@ -113,11 +164,16 @@ private:
     return limit;
 }
 
-/// Awaiter that parks the caller until a backend completes its operation.
+/// Awaiter that parks the caller until a backend resolves its operation.
 ///
 /// `await_suspend` returns `bool` so that a submission failure can decline to
 /// suspend: the coroutine continues immediately and observes the error, rather
 /// than parking on an operation that was never started.
+///
+/// `Submit` yields the operation's `OperationId` on success. The id is what a
+/// later cancellation names; it is deliberately not a pointer to this awaiter,
+/// which lives in a coroutine frame and must not be reachable from anything
+/// that could outlive the suspension.
 template<typename T, typename Submit>
 class OperationAwaiter {
 public:
@@ -126,7 +182,7 @@ public:
     [[nodiscard]] bool await_ready() const noexcept { return false; }
 
     bool await_suspend(std::coroutine_handle<> handle) {
-        Result<void> submitted = submit_(handle, &result_);
+        const auto submitted = submit_(handle, &result_);
         if (!submitted) {
             result_ = fail(submitted.error());
             return false;

@@ -35,6 +35,7 @@
     #include <memory>
     #include <mswsock.h>
     #include <mutex>
+    #include <optional>
     #include <unordered_map>
     #include <utility>
     #include <vector>
@@ -101,14 +102,29 @@ template<typename Fn>
 
 class EventLoop::Impl {
 public:
-    /// One in-flight overlapped operation.
+    /// What an operation is, which decides how it resolves.
+    ///
+    /// The split that matters is `timer` against everything else: a timer has
+    /// no completion packet, so it resolves the moment it fires, while every
+    /// kernel-backed operation must wait for its packet even after being
+    /// cancelled.
+    enum class Kind { timer, read, write, accept, connect };
+
+    /// One in-flight operation.
     ///
     /// `overlapped` must stay first: the kernel hands back its address, and
     /// the loop casts it straight back to this object.
     struct Operation {
         OVERLAPPED overlapped{};
+        detail::OperationId id{detail::kNoOperation};
+        Kind kind{Kind::timer};
         std::coroutine_handle<> handle{};
-        Result<std::size_t>* result{nullptr};
+        /// One slot or the other, depending on `kind`. A timer reports
+        /// success or failure with no payload; everything else reports a byte
+        /// count (or, for accept, the socket). Two pointers and a discriminant
+        /// beat a variant here — the backend already knows which it submitted.
+        Result<void>* void_result{nullptr};
+        Result<std::size_t>* size_result{nullptr};
         WSABUF buffer{};
 
         /// Accept-only state. AcceptEx requires the socket to exist *before*
@@ -123,9 +139,16 @@ public:
         SOCKET listener{INVALID_SOCKET};
         /// Two sockaddr slots plus the 16-byte padding AcceptEx demands.
         std::array<std::byte, 2 * (sizeof(SOCKADDR_STORAGE) + 16)> address_scratch{};
-        bool is_accept{false};
-        bool is_connect{false};
-        bool cancel_requested{false};
+
+        /// `detach` ran: the caller is about to close the handle, so never
+        /// query Winsock with it and never `CancelIoEx` on it again.
+        bool handle_closed{false};
+
+        detail::TimerHandle wake{};
+        detail::TimerHandle deadline{};
+
+        /// True when the kernel owes this operation a completion packet.
+        [[nodiscard]] bool kernel_backed() const noexcept { return kind != Kind::timer; }
     };
 
     explicit Impl(HANDLE port) noexcept : port_(port) {}
@@ -141,28 +164,43 @@ public:
         }
         stop_requested_.store(true, std::memory_order_release);
 
-        std::vector<detail::VoidSuspension> orphan_timers;
-        std::vector<Operation*> orphan_ops;
+        std::vector<detail::OperationId> orphans;
+        std::vector<std::pair<SOCKET, OVERLAPPED*>> to_cancel;
         std::vector<std::function<void()>> discarded_work;
+        std::size_t kernel_backed = 0;
         {
             const std::lock_guard lock{mutex_};
-            timers_.extract_all(orphan_timers);
             posted_.drain_into(discarded_work);
-            for (auto& [pointer, owned] : operations_) {
-                orphan_ops.push_back(pointer);
+            orphans.reserve(operations_.size());
+            for (auto& entry : operations_) {
+                Operation& operation = *entry.second;
+                orphans.push_back(operation.id);
+                if (!operation.kernel_backed()) {
+                    continue;
+                }
+                ++kernel_backed;
+                if (!operation.handle_closed) {
+                    to_cancel.emplace_back(operation.socket, &operation.overlapped);
+                }
             }
         }
 
-        // CancelIoEx 只提出取消请求；完成包到达前，内核仍可访问
-        // OVERLAPPED、AcceptEx 地址缓冲和调用方的读写缓冲。
-        for (Operation* operation : orphan_ops) {
-            ::CancelIoEx(reinterpret_cast<HANDLE>(operation->socket), &operation->overlapped);
+        // CancelIoEx only *asks*. Until the completion packet is dequeued the
+        // kernel may still write into the OVERLAPPED, the AcceptEx address
+        // buffer, and the caller's read or write buffer.
+        for (const auto& [socket, overlapped] : to_cancel) {
+            ::CancelIoEx(reinterpret_cast<HANDLE>(socket), overlapped);
         }
 
-        // 即使取消返回 ERROR_NOT_FOUND，操作也可能已完成但尚未出队。
-        // 排空全部 I/O 后才能释放 posted 捕获或恢复任何可能回收缓冲的协程。
-        std::size_t remaining = orphan_ops.size();
-        while (remaining != 0) {
+        // Even when a cancel reports ERROR_NOT_FOUND the operation may have
+        // completed without being dequeued. Drain every kernel-backed one
+        // before releasing a buffer or resuming a coroutine that might.
+        //
+        // The count is exact because an operation leaves `operations_` at the
+        // moment its packet is dequeued, so "still in the table and
+        // kernel-backed" is the same set as "packet not yet dequeued". Timers
+        // are excluded: counting them would wait for a packet that never comes.
+        while (kernel_backed != 0) {
             DWORD transferred = 0;
             ULONG_PTR key = 0;
             OVERLAPPED* overlapped = nullptr;
@@ -170,7 +208,8 @@ public:
                 ::GetQueuedCompletionStatus(port_, &transferred, &key, &overlapped, INFINITE);
             if (overlapped == nullptr) {
                 if (ok == FALSE) {
-                    // 无法确认内核已结束访问时，不能继续析构并造成 UAF。
+                    // Without confirmation that the kernel is finished,
+                    // continuing to destruct would be a use-after-free.
                     std::terminate();
                 }
                 continue;
@@ -178,24 +217,14 @@ public:
             if (key == kWakeupKey) {
                 continue;
             }
-            // 失败的 I/O 同样返回非空 OVERLAPPED，必须计入已排空数量。
-            --remaining;
+            // A failed I/O also returns a non-null OVERLAPPED, and it counts.
+            --kernel_backed;
         }
 
-        // 在锁外恢复；shutdown 标记阻止恢复后的协程再次提交操作。
-        for (Operation* operation : orphan_ops) {
-            if (operation->accepted != INVALID_SOCKET) {
-                ::closesocket(operation->accepted);
-            }
-            if (operation->result) {
-                *operation->result = fail(Errc::cancelled);
-            }
-            std::coroutine_handle<> handle = operation->handle;
-            release_operation(operation);
-            handle.resume();
-        }
-        for (const detail::VoidSuspension& timer : orphan_timers) {
-            timer.complete(fail(Errc::cancelled));
+        // The kernel has let go; only now may a coroutine that reclaims a
+        // buffer run. The shutdown flag stops any of them re-submitting.
+        for (const detail::OperationId id : orphans) {
+            finalize(id, fail(Errc::cancelled));
         }
         discarded_work.clear();
 
@@ -209,7 +238,7 @@ public:
     /// Associate the handle with the completion port. Required exactly once
     /// per handle before any overlapped operation on it.
     [[nodiscard]] Result<void> attach(NativeHandle handle) noexcept {
-        if (shutting_down_.load(std::memory_order_acquire)) {
+        if (shutting_down()) {
             return fail(Errc::cancelled);
         }
         if (handle == invalid_handle) {
@@ -232,9 +261,9 @@ public:
         // operation leaks.
         {
             const std::lock_guard lock{mutex_};
-            for (auto& [pointer, owned] : operations_) {
-                if (owned->socket == static_cast<SOCKET>(handle)) {
-                    owned->cancel_requested = true;
+            for (auto& entry : operations_) {
+                if (entry.second->socket == static_cast<SOCKET>(handle)) {
+                    entry.second->handle_closed = true;
                 }
             }
         }
@@ -243,15 +272,17 @@ public:
 
     // ── submission ──────────────────────────────────────────────────────────
 
-    [[nodiscard]] Result<void> submit_read(NativeHandle handle,
-                                           std::span<std::byte> destination,
-                                           std::coroutine_handle<> coroutine,
-                                           Result<std::size_t>* result) {
-        if (shutting_down_.load(std::memory_order_acquire)) {
+    [[nodiscard]] Result<detail::OperationId> submit_read(NativeHandle handle,
+                                                          std::span<std::byte> destination,
+                                                          std::coroutine_handle<> coroutine,
+                                                          Result<std::size_t>* result) {
+        if (shutting_down()) {
             return fail(Errc::cancelled);
         }
 
-        Operation* operation = acquire_operation(coroutine, result);
+        const Acquired acquired = acquire_operation(Kind::read, coroutine);
+        Operation* operation = acquired.operation;
+        operation->size_result = result;
         operation->socket = static_cast<SOCKET>(handle);
         operation->buffer.buf = reinterpret_cast<CHAR*>(destination.data());
         operation->buffer.len = static_cast<ULONG>(destination.size());
@@ -267,23 +298,25 @@ public:
         if (status == 0 || ::WSAGetLastError() == WSA_IO_PENDING) {
             // Even an inline completion is posted to the port, so the
             // resumption path stays identical either way.
-            return Result<void>{};
+            return acquired.id;
         }
 
         const Error error = last_socket_error();
-        release_operation(operation);
+        discard(acquired.id);
         return fail(error);
     }
 
-    [[nodiscard]] Result<void> submit_write(NativeHandle handle,
-                                            std::span<const std::byte> source,
-                                            std::coroutine_handle<> coroutine,
-                                            Result<std::size_t>* result) {
-        if (shutting_down_.load(std::memory_order_acquire)) {
+    [[nodiscard]] Result<detail::OperationId> submit_write(NativeHandle handle,
+                                                           std::span<const std::byte> source,
+                                                           std::coroutine_handle<> coroutine,
+                                                           Result<std::size_t>* result) {
+        if (shutting_down()) {
             return fail(Errc::cancelled);
         }
 
-        Operation* operation = acquire_operation(coroutine, result);
+        const Acquired acquired = acquire_operation(Kind::write, coroutine);
+        Operation* operation = acquired.operation;
+        operation->size_result = result;
         operation->socket = static_cast<SOCKET>(handle);
         operation->buffer.buf = const_cast<CHAR*>(reinterpret_cast<const CHAR*>(source.data()));
         operation->buffer.len = static_cast<ULONG>(source.size());
@@ -296,19 +329,19 @@ public:
                                      &operation->overlapped,
                                      nullptr);
         if (status == 0 || ::WSAGetLastError() == WSA_IO_PENDING) {
-            return Result<void>{};
+            return acquired.id;
         }
 
         const Error error = last_socket_error();
-        release_operation(operation);
+        discard(acquired.id);
         return fail(error);
     }
 
-    [[nodiscard]] Result<void> submit_accept(NativeHandle listener,
-                                             int address_family,
-                                             std::coroutine_handle<> coroutine,
-                                             Result<std::size_t>* result) {
-        if (shutting_down_.load(std::memory_order_acquire)) {
+    [[nodiscard]] Result<detail::OperationId> submit_accept(NativeHandle listener,
+                                                            int address_family,
+                                                            std::coroutine_handle<> coroutine,
+                                                            Result<std::size_t>* result) {
+        if (shutting_down()) {
             return fail(Errc::cancelled);
         }
 
@@ -330,8 +363,9 @@ public:
             return fail(last_socket_error());
         }
 
-        Operation* operation = acquire_operation(coroutine, result);
-        operation->is_accept = true;
+        const Acquired acquired = acquire_operation(Kind::accept, coroutine);
+        Operation* operation = acquired.operation;
+        operation->size_result = result;
         operation->socket = listening;
         operation->accepted = accepted;
         operation->listener = listening;
@@ -347,20 +381,20 @@ public:
                                    &operation->overlapped);
 
         if (ok == TRUE || ::WSAGetLastError() == ERROR_IO_PENDING) {
-            return Result<void>{};
+            return acquired.id;
         }
 
         const Error error = last_socket_error();
         ::closesocket(accepted);
-        release_operation(operation);
+        discard(acquired.id);
         return fail(error);
     }
 
-    [[nodiscard]] Result<void> submit_connect(NativeHandle handle,
-                                              std::span<const std::byte> address,
-                                              std::coroutine_handle<> coroutine,
-                                              Result<std::size_t>* result) {
-        if (shutting_down_.load(std::memory_order_acquire)) {
+    [[nodiscard]] Result<detail::OperationId> submit_connect(NativeHandle handle,
+                                                             std::span<const std::byte> address,
+                                                             std::coroutine_handle<> coroutine,
+                                                             Result<std::size_t>* result) {
+        if (shutting_down()) {
             return fail(Errc::cancelled);
         }
 
@@ -389,8 +423,9 @@ public:
             return fail(last_socket_error());
         }
 
-        Operation* operation = acquire_operation(coroutine, result);
-        operation->is_connect = true;
+        const Acquired acquired = acquire_operation(Kind::connect, coroutine);
+        Operation* operation = acquired.operation;
+        operation->size_result = result;
         operation->socket = socket;
 
         const BOOL ok = connect_ex_(socket,
@@ -401,32 +436,34 @@ public:
                                     nullptr,
                                     &operation->overlapped);
         if (ok == TRUE || ::WSAGetLastError() == ERROR_IO_PENDING) {
-            return Result<void>{};
+            return acquired.id;
         }
 
         const Error error = last_socket_error();
-        release_operation(operation);
+        discard(acquired.id);
         return fail(error);
     }
 
-    [[nodiscard]] Result<void> add_timer(detail::Clock::time_point deadline,
-                                         std::coroutine_handle<> coroutine,
-                                         Result<void>* result) {
-        {
-            const std::lock_guard lock{mutex_};
-            if (shutting_down_.load(std::memory_order_acquire)) {
-                return fail(Errc::cancelled);
-            }
-            timers_.add(deadline, detail::VoidSuspension{coroutine, result});
+    [[nodiscard]] Result<detail::OperationId> add_timer(detail::Clock::time_point wake_at,
+                                                        std::coroutine_handle<> coroutine,
+                                                        Result<void>* result) {
+        if (shutting_down()) {
+            return fail(Errc::cancelled);
         }
+        const Acquired acquired = acquire_operation(Kind::timer, coroutine, wake_at);
+        acquired.operation->void_result = result;
         wake();
-        return Result<void>{};
+        return acquired.id;
+    }
+
+    [[nodiscard]] bool shutting_down() const noexcept {
+        return shutting_down_.load(std::memory_order_acquire);
     }
 
     [[nodiscard]] Result<void> post(std::function<void()> work) {
         {
             const std::lock_guard lock{mutex_};
-            if (shutting_down_.load(std::memory_order_acquire)) {
+            if (shutting_down()) {
                 return fail(Errc::cancelled);
             }
             posted_.push(std::move(work));
@@ -446,13 +483,15 @@ public:
 
     [[nodiscard]] std::size_t outstanding() const noexcept {
         const std::lock_guard lock{mutex_};
-        return posted_.size() + timers_.size() + operations_.size();
+        // Timers index operations rather than being work in their own right:
+        // a read carrying a deadline is one outstanding thing, not two.
+        return operations_.size() + posted_.size();
     }
 
     // ── driving ─────────────────────────────────────────────────────────────
 
     Result<void> run_once(Duration timeout) {
-        if (shutting_down_.load(std::memory_order_acquire)) {
+        if (shutting_down()) {
             return fail(Errc::cancelled);
         }
         std::array<OVERLAPPED_ENTRY, kEventBatch> entries{};
@@ -481,8 +520,11 @@ public:
             removed = 0;
         }
 
-        std::vector<std::pair<Operation*, Result<std::size_t>>> finished;
-        finished.reserve(removed);
+        // `(id, outcome)` rather than `Operation*`: by the time these are
+        // delivered, an earlier resumption may already have resolved one of
+        // them, and a stale id resolves to nothing.
+        std::vector<std::pair<detail::OperationId, Result<std::size_t>>> resolved;
+        resolved.reserve(removed);
 
         for (ULONG i = 0; i < removed; ++i) {
             const OVERLAPPED_ENTRY& entry = entries[i];
@@ -491,69 +533,14 @@ public:
             }
 
             auto* operation = reinterpret_cast<Operation*>(entry.lpOverlapped);
-            const DWORD status = static_cast<DWORD>(entry.Internal);
-            const DWORD transferred = entry.dwNumberOfBytesTransferred;
-
-            Result<std::size_t> outcome = [&]() -> Result<std::size_t> {
-                // detach may have closed the socket before its completion
-                // arrived. Do not query Winsock with a stale/reused handle.
-                if (operation->cancel_requested) {
-                    return fail(Errc::cancelled);
-                }
-                if (status != 0) {
-                    // `entry.Internal` is an NTSTATUS (STATUS_CONNECTION_REFUSED
-                    // is 0xC0000236), which is a third numbering space on top of
-                    // Win32 and Winsock. Only WSAGetOverlappedResult maps it back
-                    // to the Winsock number a caller can reason about — feeding
-                    // the raw NTSTATUS to system_category() produces an error
-                    // that matches no std::errc at all.
-                    DWORD ignored_bytes = 0;
-                    DWORD ignored_flags = 0;
-                    if (operation->socket != INVALID_SOCKET &&
-                        ::WSAGetOverlappedResult(operation->socket,
-                                                 &operation->overlapped,
-                                                 &ignored_bytes,
-                                                 FALSE,
-                                                 &ignored_flags) == FALSE) {
-                        return fail(socket_error(::WSAGetLastError()));
-                    }
-                    return fail(std::error_code{static_cast<int>(status), std::system_category()});
-                }
-                if (operation->is_accept) {
-                    // An accept completes with zero bytes transferred — that is
-                    // success, not eof. The accepted socket also does not
-                    // inherit the listener's state unless told to, and skipping
-                    // this leaves getsockname/shutdown broken in ways that only
-                    // show up much later.
-                    ::setsockopt(operation->accepted,
-                                 SOL_SOCKET,
-                                 SO_UPDATE_ACCEPT_CONTEXT,
-                                 reinterpret_cast<const char*>(&operation->listener),
-                                 sizeof(operation->listener));
-                    return static_cast<std::size_t>(operation->accepted);
-                }
-                if (operation->is_connect) {
-                    // A connect also completes with zero bytes. Only a recv
-                    // may read zero as "peer closed".
-                    return std::size_t{0};
-                }
-                if (transferred == 0) {
-                    // Zero bytes on a completed recv means the peer closed.
-                    return fail(Errc::eof);
-                }
-                return static_cast<std::size_t>(transferred);
-            }();
-
-            // A failed accept must not leak the socket it pre-created.
-            if (operation->is_accept && !outcome.has_value() &&
-                operation->accepted != INVALID_SOCKET) {
-                ::closesocket(operation->accepted);
-            }
-
-            finished.emplace_back(operation, outcome);
+            // An operation leaves `operations_` exactly when its packet is
+            // dequeued, which is happening right now, so this memory is
+            // necessarily still alive.
+            const detail::OperationId id = operation->id;
+            resolved.emplace_back(id, classify(*operation, entry));
         }
 
-        std::vector<detail::VoidSuspension> expired;
+        std::vector<detail::TimerTarget> expired;
         std::vector<std::function<void()>> to_run;
         {
             const std::lock_guard lock{mutex_};
@@ -562,18 +549,19 @@ public:
             wake_pending_.store(false, std::memory_order_release);
         }
 
+        // Completions first, then deadlines — the order `extract_expired`
+        // already sorted within itself, extended across the whole batch.
+        for (const detail::TimerTarget& target : expired) {
+            resolved.emplace_back(target.operation,
+                                  target.is_deadline
+                                      ? Result<std::size_t>{fail(Errc::timed_out)}
+                                      : Result<std::size_t>{std::size_t{0}});
+        }
+
         // Everything below runs outside the lock: resumed coroutines may
         // submit more I/O, post work, or stop the loop.
-        for (auto& [operation, outcome] : finished) {
-            if (operation->result) {
-                *operation->result = outcome;
-            }
-            std::coroutine_handle<> handle = operation->handle;
-            release_operation(operation);
-            handle.resume();
-        }
-        for (const detail::VoidSuspension& timer : expired) {
-            timer.complete(Result<void>{});
+        for (const auto& [id, outcome] : resolved) {
+            finalize(id, outcome);
         }
         for (auto& work : to_run) {
             work();
@@ -583,33 +571,154 @@ public:
     }
 
 private:
+    /// Turn one completion packet into the outcome its caller asked for.
+    [[nodiscard]] Result<std::size_t> classify(Operation& operation,
+                                               const OVERLAPPED_ENTRY& entry) noexcept {
+        const auto status = static_cast<DWORD>(entry.Internal);
+        const DWORD transferred = entry.dwNumberOfBytesTransferred;
+
+        // detach may have closed the socket before its completion arrived. Do
+        // not query Winsock with a stale, possibly reused, handle.
+        if (operation.handle_closed) {
+            return fail(Errc::cancelled);
+        }
+        if (status != 0) {
+            // `entry.Internal` is an NTSTATUS (STATUS_CONNECTION_REFUSED is
+            // 0xC0000236), which is a third numbering space on top of Win32
+            // and Winsock. Only WSAGetOverlappedResult maps it back to the
+            // Winsock number a caller can reason about — feeding the raw
+            // NTSTATUS to system_category() produces an error that matches no
+            // std::errc at all.
+            DWORD ignored_bytes = 0;
+            DWORD ignored_flags = 0;
+            if (operation.socket != INVALID_SOCKET &&
+                ::WSAGetOverlappedResult(operation.socket,
+                                         &operation.overlapped,
+                                         &ignored_bytes,
+                                         FALSE,
+                                         &ignored_flags) == FALSE) {
+                return fail(socket_error(::WSAGetLastError()));
+            }
+            return fail(std::error_code{static_cast<int>(status), std::system_category()});
+        }
+        switch (operation.kind) {
+        case Kind::accept:
+            // An accept completes with zero bytes transferred — that is
+            // success, not eof. The accepted socket also does not inherit the
+            // listener's state unless told to, and skipping this leaves
+            // getsockname/shutdown broken in ways that only show up much later.
+            ::setsockopt(operation.accepted,
+                         SOL_SOCKET,
+                         SO_UPDATE_ACCEPT_CONTEXT,
+                         reinterpret_cast<const char*>(&operation.listener),
+                         sizeof(operation.listener));
+            return static_cast<std::size_t>(operation.accepted);
+        case Kind::connect:
+            // A connect also completes with zero bytes. Only a recv may read
+            // zero as "peer closed".
+            return std::size_t{0};
+        case Kind::read:
+            if (transferred == 0) {
+                // Zero bytes on a completed recv means the peer closed.
+                return fail(Errc::eof);
+            }
+            return static_cast<std::size_t>(transferred);
+        case Kind::write:
+            return static_cast<std::size_t>(transferred);
+        case Kind::timer:
+            // A timer has no completion packet, so it never reaches here.
+            break;
+        }
+        return fail(Errc::not_supported);
+    }
+
+    struct Acquired {
+        detail::OperationId id{detail::kNoOperation};
+        Operation* operation{nullptr};
+    };
+
     /// Allocate an operation owned by the loop, not by the coroutine.
     ///
     /// The kernel writes into this memory until the completion arrives, so its
-    /// lifetime cannot be tied to a frame that might unwind first.
-    [[nodiscard]] Operation* acquire_operation(std::coroutine_handle<> coroutine,
-                                               Result<std::size_t>* result) {
+    /// lifetime cannot be tied to a frame that might unwind first. The
+    /// `unique_ptr` is what keeps the OVERLAPPED at a fixed address across
+    /// rehashes of the table.
+    ///
+    /// `wake_at` registers the timer under the same lock as the insertion:
+    /// a timer naming an operation that is not in the table yet would fire
+    /// into nothing.
+    [[nodiscard]] Acquired
+    acquire_operation(Kind kind,
+                      std::coroutine_handle<> coroutine,
+                      std::optional<detail::Clock::time_point> wake_at = std::nullopt) {
         auto owned = std::make_unique<Operation>();
+        owned->kind = kind;
         owned->handle = coroutine;
-        owned->result = result;
         Operation* pointer = owned.get();
 
         const std::lock_guard lock{mutex_};
-        operations_.emplace(pointer, std::move(owned));
-        return pointer;
+        const detail::OperationId id = ++next_id_;
+        pointer->id = id;
+        if (wake_at) {
+            pointer->wake = timers_.add(*wake_at, detail::TimerTarget{.operation = id});
+        }
+        operations_.emplace(id, std::move(owned));
+        return Acquired{id, pointer};
     }
 
-    void release_operation(Operation* operation) noexcept {
+    /// Drop an operation whose coroutine never suspended.
+    ///
+    /// Deliberately no resume: the submission failed, so the coroutine is
+    /// still running and resuming it here would run its continuation twice.
+    /// The kernel never took the OVERLAPPED, so freeing it now is safe.
+    void discard(detail::OperationId id) noexcept {
+        [[maybe_unused]] const std::unique_ptr<Operation> dropped = take(id);
+    }
+
+    /// The one place an operation resolves. Idempotent by id.
+    ///
+    /// Releasing the record — and therefore the caller's buffer view and the
+    /// AcceptEx scratch space — before the coroutine runs is safe only because
+    /// the kernel has already dequeued this operation's completion packet.
+    void finalize(detail::OperationId id, Result<std::size_t> outcome) {
+        std::unique_ptr<Operation> owned = take(id);
+        if (!owned) {
+            return;
+        }
+        // An accept that did not succeed must not leak the socket AcceptEx
+        // required it to pre-create. On success the socket travels back to the
+        // caller, which owns it from then on.
+        if (owned->kind == Kind::accept && !outcome.has_value() &&
+            owned->accepted != INVALID_SOCKET) {
+            ::closesocket(std::exchange(owned->accepted, INVALID_SOCKET));
+        }
+        if (owned->void_result) {
+            *owned->void_result =
+                outcome.has_value() ? Result<void>{} : Result<void>{fail(outcome.error())};
+        }
+        if (owned->size_result) {
+            *owned->size_result = outcome;
+        }
+        const std::coroutine_handle<> handle = owned->handle;
+        owned.reset();
+        handle.resume();
+    }
+
+    /// Remove an operation and its timers from the table, if it is still there.
+    [[nodiscard]] std::unique_ptr<Operation> take(detail::OperationId id) noexcept {
         std::unique_ptr<Operation> owned;
         {
             const std::lock_guard lock{mutex_};
-            auto it = operations_.find(operation);
-            if (it != operations_.end()) {
-                owned = std::move(it->second);
-                operations_.erase(it);
+            auto it = operations_.find(id);
+            if (it == operations_.end()) {
+                return {};
             }
+            owned = std::move(it->second);
+            operations_.erase(it);
+            timers_.cancel(owned->wake);
+            timers_.cancel(owned->deadline);
         }
-        // `owned` frees here, outside the lock.
+        return owned;  // frees at the caller, outside the lock
     }
 
     void wake() noexcept {
@@ -622,9 +731,10 @@ private:
     HANDLE port_{nullptr};
 
     mutable std::mutex mutex_;
-    std::unordered_map<Operation*, std::unique_ptr<Operation>> operations_{};
+    std::unordered_map<detail::OperationId, std::unique_ptr<Operation>> operations_{};
     detail::TimerQueue timers_{};
     detail::PostQueue posted_{};
+    detail::OperationId next_id_{detail::kNoOperation};
 
     LPFN_ACCEPTEX accept_ex_{nullptr};
     LPFN_CONNECTEX connect_ex_{nullptr};

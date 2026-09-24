@@ -44,18 +44,55 @@ constexpr std::size_t kEventBatch = 64;
 
 class EventLoop::Impl {
 public:
-    struct FdWaiters {
-        detail::VoidSuspension read{};
-        detail::VoidSuspension write{};
+    /// What a suspended operation is waiting for.
+    ///
+    /// Two kinds, not one per public call: on POSIX the loop only ever waits
+    /// for readiness or for the clock. `read`, `write`, `accept` and `connect`
+    /// are built *out of* readiness by the retry loops further down, so they
+    /// need no state of their own here.
+    enum class Kind { readiness, timer };
 
-        [[nodiscard]] bool empty() const noexcept { return !read.handle && !write.handle; }
+    /// One suspended operation. Everything that could reach the coroutine
+    /// lives in exactly this record, so resolving it is one lookup and one
+    /// erase rather than a sweep over several indices.
+    struct Operation {
+        detail::OperationId id{detail::kNoOperation};
+        std::coroutine_handle<> handle{};
+        /// Points into the awaiter, which lives in the suspended coroutine's
+        /// frame — valid for exactly as long as the operation is registered.
+        Result<void>* result{nullptr};
+        Kind kind{Kind::readiness};
+
+        int fd{-1};
+        bool writable{false};
+        /// True while a one-shot registration is still live in the kernel.
+        /// Cleared when it fires, so that an operation resolving normally does
+        /// not spend a syscall removing something already gone.
+        bool armed{false};
+
+        /// When a sleep should succeed, and when the caller's deadline cuts
+        /// the operation short. Independent, and either may be absent.
+        detail::TimerHandle wake{};
+        detail::TimerHandle deadline{};
+    };
+
+    /// Who is waiting on each direction of a descriptor. Ids, not handles:
+    /// a readiness event that arrives for a resolved operation then finds
+    /// nothing instead of finding whatever reused the slot.
+    struct FdWaiters {
+        detail::OperationId read{detail::kNoOperation};
+        detail::OperationId write{detail::kNoOperation};
+
+        [[nodiscard]] bool empty() const noexcept {
+            return read == detail::kNoOperation && write == detail::kNoOperation;
+        }
 
         [[nodiscard]] detail::Interest interest() const noexcept {
-            auto set = static_cast<detail::Interest>(0u);
-            if (read.handle) {
+            auto set = detail::Interest::none;
+            if (read != detail::kNoOperation) {
                 set = set | detail::Interest::read;
             }
-            if (write.handle) {
+            if (write != detail::kNoOperation) {
                 set = set | detail::Interest::write;
             }
             return set;
@@ -80,26 +117,22 @@ public:
         // return promptly — the loop is already unusable by then.
         if (shutting_down_.exchange(true, std::memory_order_acq_rel)) return;
 
-        std::vector<detail::VoidSuspension> orphans;
+        std::vector<detail::OperationId> orphans;
         std::vector<std::function<void()>> discarded_work;
         {
             const std::lock_guard lock{mutex_};
-            for (auto& [fd, waiters] : fd_waiters_) {
-                if (waiters.read.handle) {
-                    orphans.push_back(waiters.read);
-                }
-                if (waiters.write.handle) {
-                    orphans.push_back(waiters.write);
-                }
+            orphans.reserve(operations_.size());
+            for (const auto& [id, operation] : operations_) {
+                orphans.push_back(id);
             }
-            fd_waiters_.clear();
-            timers_.extract_all(orphans);
             posted_.drain_into(discarded_work);
         }
 
-        // Resume outside the lock: a resumed coroutine may call back in.
-        for (const detail::VoidSuspension& orphan : orphans) {
-            orphan.complete(fail(Errc::cancelled));
+        // Resume outside the lock: a resumed coroutine may call back in. It
+        // may also resolve a sibling operation, which is why this goes through
+        // `finalize` by id — one that is already gone is simply not found.
+        for (const detail::OperationId id : orphans) {
+            finalize(id, fail(Errc::cancelled));
         }
     }
 
@@ -132,61 +165,71 @@ public:
 
     // ── suspension ──────────────────────────────────────────────────────────
 
-    [[nodiscard]] Result<void>
+    [[nodiscard]] Result<detail::OperationId>
     add_waiter(int fd, bool writable, std::coroutine_handle<> handle, Result<void>* result) {
         if (fd < 0) {
             return fail(Errc::invalid_argument);
         }
-        if (shutting_down_.load(std::memory_order_acquire)) {
+        if (shutting_down()) {
             return fail(Errc::cancelled);
         }
 
+        detail::OperationId id = detail::kNoOperation;
         detail::Interest combined{};
         {
             const std::lock_guard lock{mutex_};
             FdWaiters& waiters = fd_waiters_[fd];
-            detail::VoidSuspension& slot = writable ? waiters.write : waiters.read;
-            if (slot.handle) {
+            detail::OperationId& slot = writable ? waiters.write : waiters.read;
+            if (slot != detail::kNoOperation) {
                 // Two coroutines waiting on the same direction of the same
                 // descriptor would race over a single wakeup. Refusing beats
                 // silently picking a winner.
                 return fail(Errc::invalid_argument);
             }
-            slot = detail::VoidSuspension{handle, result};
+            id = ++next_id_;
+            operations_.emplace(id,
+                                Operation{.id = id,
+                                          .handle = handle,
+                                          .result = result,
+                                          .kind = Kind::readiness,
+                                          .fd = fd,
+                                          .writable = writable,
+                                          .armed = true});
+            slot = id;
             combined = waiters.interest();
         }
 
-        // The syscall runs outside the lock; a failure must undo the slot.
-        Result<void> armed = poller_.arm(fd, combined);
-        if (!armed) {
-            const std::lock_guard lock{mutex_};
-            auto it = fd_waiters_.find(fd);
-            if (it != fd_waiters_.end()) {
-                detail::VoidSuspension& slot = writable ? it->second.write : it->second.read;
-                slot = detail::VoidSuspension{};
-                if (it->second.empty()) {
-                    fd_waiters_.erase(it);
-                }
-            }
+        // The syscall runs outside the lock; a failure must undo the record.
+        if (Result<void> armed = poller_.arm(fd, combined); !armed) {
+            // `discard`, not `finalize`: the coroutine has not suspended yet,
+            // so resuming it here would run its continuation twice.
+            discard(id);
             return fail(armed.error());
         }
-        return Result<void>{};
+        return id;
     }
 
     [[nodiscard]] bool shutting_down() const noexcept {
         return shutting_down_.load(std::memory_order_acquire);
     }
 
-    Result<void> add_timer(detail::Clock::time_point deadline,
-                           std::coroutine_handle<> handle,
-                           Result<void>* result) {
+    [[nodiscard]] Result<detail::OperationId> add_timer(detail::Clock::time_point wake_at,
+                                                        std::coroutine_handle<> handle,
+                                                        Result<void>* result) {
         if (shutting_down()) return fail(Errc::cancelled);
+        detail::OperationId id = detail::kNoOperation;
         {
             const std::lock_guard lock{mutex_};
-            timers_.add(deadline, detail::VoidSuspension{handle, result});
+            id = ++next_id_;
+            // Record and timer registered under one lock: a timer naming an
+            // operation that is not in the table yet could fire into nothing.
+            Operation& operation = operations_[id];
+            operation = Operation{
+                .id = id, .handle = handle, .result = result, .kind = Kind::timer};
+            operation.wake = timers_.add(wake_at, detail::TimerTarget{.operation = id});
         }
         wake();  // a nearer deadline may shorten the current wait
-        return Result<void>{};
+        return id;
     }
 
     void post(std::function<void()> work) {
@@ -209,11 +252,9 @@ public:
 
     [[nodiscard]] std::size_t outstanding() const noexcept {
         const std::lock_guard lock{mutex_};
-        std::size_t count = posted_.size() + timers_.size();
-        for (const auto& [fd, waiters] : fd_waiters_) {
-            count += (waiters.read.handle ? 1u : 0u) + (waiters.write.handle ? 1u : 0u);
-        }
-        return count;
+        // Timers index operations rather than being work in their own right:
+        // a read carrying a deadline is one outstanding thing, not two.
+        return operations_.size() + posted_.size();
     }
 
     [[nodiscard]] Result<void> arm_wakeup() noexcept {
@@ -239,13 +280,34 @@ public:
             return fail(ready.error());
         }
 
-        std::vector<detail::VoidSuspension> to_resume;
+        // `(id, outcome)` rather than anything pointing at a frame: by the
+        // time these are delivered, an earlier resumption may already have
+        // resolved one of them, and a stale id resolves to nothing.
+        std::vector<std::pair<detail::OperationId, Result<void>>> resolved;
         std::vector<std::function<void()>> to_run;
         std::vector<std::pair<int, detail::Interest>> to_rearm;
+        std::vector<detail::TimerTarget> expired;
         bool wakeup_fired = false;
 
         {
             const std::lock_guard lock{mutex_};
+
+            /// Take whoever waits on one direction, if anyone does.
+            ///
+            /// Clearing the slot here — under the lock, before anything is
+            /// resumed — is what lets `interest()` below describe the
+            /// *remaining* waiters, and what stops a second event in the same
+            /// batch from resolving the same operation twice.
+            const auto claim = [&](detail::OperationId& slot) {
+                if (slot == detail::kNoOperation) {
+                    return;
+                }
+                const detail::OperationId id = std::exchange(slot, detail::kNoOperation);
+                if (auto operation = operations_.find(id); operation != operations_.end()) {
+                    operation->second.armed = false;  // the one-shot has fired
+                }
+                resolved.emplace_back(id, Result<void>{});
+            };
 
             for (std::size_t i = 0; i < *ready; ++i) {
                 const detail::ReadyEvent& event = events[i];
@@ -257,6 +319,10 @@ public:
 
                 auto it = fd_waiters_.find(event.fd);
                 if (it == fd_waiters_.end()) {
+                    // Nobody is waiting: the operation resolved some other way,
+                    // or this is a stale one-shot left over from a descriptor
+                    // number that has since been reused. Both are harmless —
+                    // the retry loops treat a spurious wakeup as EAGAIN.
                     continue;
                 }
 
@@ -266,11 +332,11 @@ public:
                 const bool take_read = event.readable || event.failed;
                 const bool take_write = event.writable || event.failed;
 
-                if (take_read && it->second.read.handle) {
-                    to_resume.push_back(std::exchange(it->second.read, detail::VoidSuspension{}));
+                if (take_read) {
+                    claim(it->second.read);
                 }
-                if (take_write && it->second.write.handle) {
-                    to_resume.push_back(std::exchange(it->second.write, detail::VoidSuspension{}));
+                if (take_write) {
+                    claim(it->second.write);
                 }
 
                 if (it->second.empty()) {
@@ -282,22 +348,35 @@ public:
                 }
             }
 
-            timers_.extract_expired(detail::Clock::now(), to_resume);
+            timers_.extract_expired(detail::Clock::now(), expired);
             posted_.drain_into(to_run);
             wake_pending_.store(false, std::memory_order_release);
         }
 
+        // Completions first, then deadlines — the order `extract_expired`
+        // already sorted within itself, extended across the whole batch.
+        for (const detail::TimerTarget& target : expired) {
+            resolved.emplace_back(target.operation,
+                                  target.is_deadline ? Result<void>{fail(Errc::timed_out)}
+                                                     : Result<void>{});
+        }
+
+        Result<void> status{};
         if (wakeup_fired) {
             drain_wakeup();
-            Result<void> rearmed = arm_wakeup();
-            if (!rearmed) {
-                return rearmed;
+            // Record the failure instead of returning here. Everything in
+            // `resolved` and `to_run` has already been taken out of its queue
+            // under the lock, so an early return would strand all of it:
+            // coroutines suspended forever with nothing armed on their behalf.
+            // (By construction — there is no way to make `arm()` fail against
+            // the loop's own pipe, so this path has no test.)
+            if (Result<void> rearmed = arm_wakeup(); !rearmed) {
+                status = rearmed;
             }
         }
 
         for (const auto& [fd, interest] : to_rearm) {
-            Result<void> rearmed = poller_.arm(fd, interest);
-            if (!rearmed) {
+            if (Result<void> rearmed = poller_.arm(fd, interest); !rearmed) {
                 // Surface it rather than leaving a coroutine suspended forever
                 // with nothing armed on its behalf.
                 fail_waiters(fd, rearmed.error());
@@ -306,36 +385,131 @@ public:
 
         // Everything below runs outside the lock. Resumed coroutines may
         // submit more I/O, post work, or stop the loop.
-        for (const detail::VoidSuspension& suspension : to_resume) {
-            suspension.complete(Result<void>{});
+        for (const auto& [id, outcome] : resolved) {
+            finalize(id, outcome);
         }
         for (auto& work : to_run) {
             work();
         }
 
-        return Result<void>{};
+        return status;
     }
 
 private:
+    /// Fail every waiter on `fd`, on the understanding that the descriptor has
+    /// **no live registration** — the caller either just removed it or failed
+    /// to install one. Marking the operations unarmed keeps `finalize` from
+    /// spending syscalls putting back something that is already gone.
     void fail_waiters(int fd, Error error) {
-        std::vector<detail::VoidSuspension> broken;
+        std::array<detail::OperationId, 2> broken{detail::kNoOperation, detail::kNoOperation};
         {
             const std::lock_guard lock{mutex_};
             auto it = fd_waiters_.find(fd);
             if (it == fd_waiters_.end()) {
                 return;
             }
-            if (it->second.read.handle) {
-                broken.push_back(std::exchange(it->second.read, detail::VoidSuspension{}));
-            }
-            if (it->second.write.handle) {
-                broken.push_back(std::exchange(it->second.write, detail::VoidSuspension{}));
+            broken = {it->second.read, it->second.write};
+            for (const detail::OperationId id : broken) {
+                if (auto operation = operations_.find(id); operation != operations_.end()) {
+                    operation->second.armed = false;
+                }
             }
             fd_waiters_.erase(it);
         }
-        for (const detail::VoidSuspension& suspension : broken) {
-            suspension.complete(fail(error));
+        for (const detail::OperationId id : broken) {
+            finalize(id, fail(error));
         }
+    }
+
+    /// What `unlink` hands back, so that the syscall and the resumption happen
+    /// outside the lock.
+    struct Unlinked {
+        bool found{false};
+        std::coroutine_handle<> handle{};
+        Result<void>* result{nullptr};
+        int fd{-1};
+        detail::Interest remaining{detail::Interest::none};
+        /// `fd` and `remaining` are meaningful only when this is set: the
+        /// operation still had a live kernel registration to take back.
+        bool registered{false};
+    };
+
+    /// Remove an operation from every index that names it. Caller holds the
+    /// lock. Returning `found == false` is how "exactly once" is enforced:
+    /// whoever gets here second finds nothing.
+    [[nodiscard]] Unlinked unlink(detail::OperationId id) {
+        auto it = operations_.find(id);
+        if (it == operations_.end()) {
+            return {};
+        }
+        const Operation operation = it->second;
+        operations_.erase(it);
+
+        Unlinked out{.found = true, .handle = operation.handle, .result = operation.result};
+        if (operation.kind == Kind::readiness) {
+            if (auto waiters = fd_waiters_.find(operation.fd); waiters != fd_waiters_.end()) {
+                detail::OperationId& slot =
+                    operation.writable ? waiters->second.write : waiters->second.read;
+                // Only when the slot still names *this* operation: a coroutine
+                // resumed earlier in the same batch may already have
+                // registered a new one in it.
+                if (slot == id) {
+                    slot = detail::kNoOperation;
+                }
+                out.fd = operation.fd;
+                out.remaining = waiters->second.interest();
+                out.registered = operation.armed;
+                if (waiters->second.empty()) {
+                    fd_waiters_.erase(waiters);
+                }
+            }
+        }
+        timers_.cancel(operation.wake);
+        timers_.cancel(operation.deadline);
+        return out;
+    }
+
+    /// Give back the kernel registration an unlinked operation left behind.
+    void release_registration(const Unlinked& unlinked) noexcept {
+        if (!unlinked.registered || unlinked.fd < 0 || shutting_down()) {
+            return;  // nothing live, or the poller is being torn down anyway
+        }
+        // `disarm` only once nothing is left: it removes *both* directions,
+        // which would silently cancel a waiter on the other one.
+        if (unlinked.remaining == detail::Interest::none) {
+            (void)poller_.disarm(unlinked.fd);
+        } else {
+            (void)poller_.arm(unlinked.fd, unlinked.remaining);
+        }
+    }
+
+    /// Undo a registration whose coroutine never suspended. Never resumes.
+    void discard(detail::OperationId id) {
+        Unlinked unlinked;
+        {
+            const std::lock_guard lock{mutex_};
+            unlinked = unlink(id);
+        }
+        release_registration(unlinked);
+    }
+
+    /// The one place an operation resolves. Idempotent by id, and the
+    /// resumption happens outside the lock so that the coroutine may submit
+    /// more I/O, close the descriptor, or stop the loop.
+    void finalize(detail::OperationId id, Result<void> outcome) {
+        Unlinked unlinked;
+        {
+            const std::lock_guard lock{mutex_};
+            unlinked = unlink(id);
+        }
+        if (!unlinked.found) {
+            return;
+        }
+        release_registration(unlinked);
+        if (unlinked.result) {
+            *unlinked.result = outcome;
+        }
+        unlinked.handle.resume();
     }
 
     /// Nudge a loop that may be blocked in `poll()`.
@@ -371,9 +545,11 @@ private:
     int wake_write_{-1};
 
     mutable std::mutex mutex_;
+    std::unordered_map<detail::OperationId, Operation> operations_{};
     std::unordered_map<int, FdWaiters> fd_waiters_{};
     detail::TimerQueue timers_{};
     detail::PostQueue posted_{};
+    detail::OperationId next_id_{detail::kNoOperation};
 
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> wake_pending_{false};

@@ -24,6 +24,7 @@ namespace continuo::detail {
 
 /// What a waiter is waiting for.
 enum class Interest : unsigned {
+    none = 0u,
     read = 1u << 0,
     write = 1u << 1,
 };
@@ -69,7 +70,10 @@ public:
     /// Register a one-shot interest in `fd`.
     [[nodiscard]] Result<void> arm(int fd, Interest interest) noexcept;
 
-    /// Cancel any pending interest in `fd`.
+    /// Cancel any pending interest in `fd` — **both** directions.
+    ///
+    /// Callers that only want to drop one direction must `arm()` the remaining
+    /// one instead, or they will silently cancel a waiter on the other.
     ///
     /// Not an error if nothing was armed: a waiter cancelled in the same tick
     /// its event fired is a normal race, not a failure.
