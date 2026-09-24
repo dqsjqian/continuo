@@ -115,7 +115,14 @@ public:
         // Wake everything still suspended so those coroutine frames unwind
         // rather than leak. They observe `cancelled` and are expected to
         // return promptly — the loop is already unusable by then.
+        //
+        // The flag is set before the dispatch check so that shutdown's own
+        // `finalize` calls, which raise the depth themselves, are not mistaken
+        // for a coroutine destroying the loop it is being resumed by.
         if (shutting_down_.exchange(true, std::memory_order_acq_rel)) return;
+        if (dispatch_depth_ != 0) {
+            detail::report_dispatch_violation("destroyed or replaced while dispatching");
+        }
 
         std::vector<detail::OperationId> orphans;
         std::vector<std::function<void()>> discarded_work;
@@ -165,13 +172,19 @@ public:
 
     // ── suspension ──────────────────────────────────────────────────────────
 
-    [[nodiscard]] Result<detail::OperationId>
-    add_waiter(int fd, bool writable, std::coroutine_handle<> handle, Result<void>* result) {
+    [[nodiscard]] Result<detail::OperationId> add_waiter(int fd,
+                                                         bool writable,
+                                                         const OperationOptions& options,
+                                                         std::coroutine_handle<> handle,
+                                                         Result<void>* result) {
         if (fd < 0) {
             return fail(Errc::invalid_argument);
         }
         if (shutting_down()) {
             return fail(Errc::cancelled);
+        }
+        if (const std::optional<Error> rejected = detail::rejected_before_submit(options)) {
+            return fail(*rejected);
         }
 
         detail::OperationId id = detail::kNoOperation;
@@ -187,14 +200,21 @@ public:
                 return fail(Errc::invalid_argument);
             }
             id = ++next_id_;
-            operations_.emplace(id,
-                                Operation{.id = id,
-                                          .handle = handle,
-                                          .result = result,
-                                          .kind = Kind::readiness,
-                                          .fd = fd,
-                                          .writable = writable,
-                                          .armed = true});
+            // Record and deadline registered under one lock: a timer naming an
+            // operation not yet in the table would fire into nothing.
+            Operation& operation = operations_[id];
+            operation = Operation{.id = id,
+                                  .handle = handle,
+                                  .result = result,
+                                  .kind = Kind::readiness,
+                                  .fd = fd,
+                                  .writable = writable,
+                                  .armed = true};
+            if (options.deadline) {
+                operation.deadline = timers_.add(
+                    *options.deadline,
+                    detail::TimerTarget{.operation = id, .is_deadline = true});
+            }
             slot = id;
             combined = waiters.interest();
         }
@@ -206,6 +226,9 @@ public:
             discard(id);
             return fail(armed.error());
         }
+        if (options.deadline) {
+            wake();  // a nearer deadline may shorten the current wait
+        }
         return id;
     }
 
@@ -214,22 +237,52 @@ public:
     }
 
     [[nodiscard]] Result<detail::OperationId> add_timer(detail::Clock::time_point wake_at,
+                                                        const OperationOptions& options,
                                                         std::coroutine_handle<> handle,
                                                         Result<void>* result) {
         if (shutting_down()) return fail(Errc::cancelled);
+        if (const std::optional<Error> rejected = detail::rejected_before_submit(options)) {
+            return fail(*rejected);
+        }
         detail::OperationId id = detail::kNoOperation;
         {
             const std::lock_guard lock{mutex_};
             id = ++next_id_;
-            // Record and timer registered under one lock: a timer naming an
-            // operation that is not in the table yet could fire into nothing.
             Operation& operation = operations_[id];
             operation = Operation{
                 .id = id, .handle = handle, .result = result, .kind = Kind::timer};
+            // Two timers, not `min(wake_at, deadline)`: they mean opposite
+            // things, and whichever fires first resolves the operation while
+            // `unlink` cancels the other. One combined timer would have to
+            // remember which of the two it was standing in for.
             operation.wake = timers_.add(wake_at, detail::TimerTarget{.operation = id});
+            if (options.deadline) {
+                operation.deadline = timers_.add(
+                    *options.deadline,
+                    detail::TimerTarget{.operation = id, .is_deadline = true});
+            }
         }
         wake();  // a nearer deadline may shorten the current wait
         return id;
+    }
+
+    /// Ask for an operation to be cancelled. Safe from any thread.
+    ///
+    /// Records the request and nudges the loop, nothing more. The resumption
+    /// has to happen on the loop thread, and it must not happen here at all:
+    /// a `std::stop_callback` constructed on an already-stopped token runs
+    /// synchronously, inside the `await_suspend` that registered it.
+    void request_cancel(detail::OperationId id) {
+        {
+            const std::lock_guard lock{mutex_};
+            if (!operations_.contains(id)) {
+                return;  // already resolved
+            }
+            // No de-duplication: `finalize` is idempotent by id, so a repeated
+            // request costs one wasted lookup and nothing else.
+            pending_cancels_.push_back(id);
+        }
+        wake();
     }
 
     void post(std::function<void()> work) {
@@ -265,13 +318,23 @@ public:
 
     Result<void> run_once(Duration timeout) {
         if (shutting_down()) return fail(Errc::cancelled);
+        if (dispatch_depth_ != 0) {
+            detail::report_dispatch_violation("run_once re-entered from a resumed coroutine");
+        }
+        const detail::DispatchScope dispatching{dispatch_depth_};
+
         std::array<detail::ReadyEvent, kEventBatch> events{};
 
         int timeout_ms = 0;
         {
             const std::lock_guard lock{mutex_};
-            timeout_ms = detail::resolve_timeout_ms(
-                timeout, timers_.earliest(), !posted_.empty() || stopped());
+            // Every queue whose arrival triggers `wake()` has to be reported
+            // here. The wake-up byte is collapsed when one is already pending
+            // and drained wholesale afterwards, so it is never what guarantees
+            // progress — leaving `pending_cancels_` out would let the loop
+            // block with a cancellation sitting in it.
+            const bool queued = !posted_.empty() || !pending_cancels_.empty() || stopped();
+            timeout_ms = detail::resolve_timeout_ms(timeout, timers_.earliest(), queued);
         }
 
         const Result<std::size_t> ready =
@@ -287,6 +350,7 @@ public:
         std::vector<std::function<void()>> to_run;
         std::vector<std::pair<int, detail::Interest>> to_rearm;
         std::vector<detail::TimerTarget> expired;
+        std::vector<detail::OperationId> cancels;
         bool wakeup_fired = false;
 
         {
@@ -349,16 +413,24 @@ public:
             }
 
             timers_.extract_expired(detail::Clock::now(), expired);
+            cancels.swap(pending_cancels_);
             posted_.drain_into(to_run);
             wake_pending_.store(false, std::memory_order_release);
         }
 
-        // Completions first, then deadlines — the order `extract_expired`
-        // already sorted within itself, extended across the whole batch.
+        // Real completions, then deadlines, then cancellations — the order
+        // `extract_expired` already applies within itself, extended across the
+        // whole batch. An operation that genuinely finished in this batch is
+        // reported as finished even if its deadline expired in the same
+        // instant; `finalize` is by id, so the later mention of it does
+        // nothing.
         for (const detail::TimerTarget& target : expired) {
             resolved.emplace_back(target.operation,
                                   target.is_deadline ? Result<void>{fail(Errc::timed_out)}
                                                      : Result<void>{});
+        }
+        for (const detail::OperationId id : cancels) {
+            resolved.emplace_back(id, fail(Errc::cancelled));
         }
 
         Result<void> status{};
@@ -549,7 +621,12 @@ private:
     std::unordered_map<int, FdWaiters> fd_waiters_{};
     detail::TimerQueue timers_{};
     detail::PostQueue posted_{};
+    std::vector<detail::OperationId> pending_cancels_{};
     detail::OperationId next_id_{detail::kNoOperation};
+
+    /// Non-zero while a batch is being delivered. Loop thread only, which is
+    /// the same restriction `run_once` and destroying the loop already carry.
+    int dispatch_depth_{0};
 
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> wake_pending_{false};
@@ -645,6 +722,11 @@ Task<Result<std::size_t>> EventLoop::read(NativeHandle handle,
                                           std::span<std::byte> destination,
                                           OperationOptions options) {
     if (!impl_ || impl_->shutting_down()) co_return fail(Errc::cancelled);
+    // Before the zero-length shortcut, not after: an operation the caller has
+    // already cancelled must say so rather than quietly succeed with 0 bytes.
+    if (const std::optional<Error> rejected = detail::rejected_before_submit(options)) {
+        co_return fail(*rejected);
+    }
     if (destination.empty()) {
         co_return std::size_t{0};
     }
@@ -675,6 +757,9 @@ Task<Result<std::size_t>> EventLoop::write(NativeHandle handle,
                                            std::span<const std::byte> source,
                                            OperationOptions options) {
     if (!impl_ || impl_->shutting_down()) co_return fail(Errc::cancelled);
+    if (const std::optional<Error> rejected = detail::rejected_before_submit(options)) {
+        co_return fail(*rejected);
+    }
     if (source.empty()) {
         co_return std::size_t{0};
     }
@@ -702,6 +787,9 @@ EventLoop::accept(NativeHandle listener, int address_family, OperationOptions op
     // address_family is only needed by IOCP, which must pre-create the socket.
     // accept() reports the family itself, so POSIX ignores it.
     static_cast<void>(address_family);
+    if (const std::optional<Error> rejected = detail::rejected_before_submit(options)) {
+        co_return fail(*rejected);
+    }
 
     for (;;) {
         const int accepted = ::accept(listener, nullptr, nullptr);
@@ -741,7 +829,13 @@ Task<Result<void>> EventLoop::connect(NativeHandle handle,
     if (address.empty()) {
         co_return fail(Errc::invalid_argument);
     }
+    if (const std::optional<Error> rejected = detail::rejected_before_submit(options)) {
+        co_return fail(*rejected);
+    }
 
+    // Cancelling a connect abandons the *wait*. The kernel's attempt carries
+    // on, so the socket is left in an indeterminate state and the caller has
+    // to close it; the loop never closes a handle it was lent.
     const auto* target = reinterpret_cast<const sockaddr*>(address.data());
     for (;;) {
         if (::connect(handle, target, static_cast<socklen_t>(address.size())) == 0) {
@@ -782,21 +876,24 @@ Task<Result<void>> EventLoop::connect(NativeHandle handle,
 Task<Result<void>>
 EventLoop::wait_for(NativeHandle handle, bool writable, OperationOptions options) {
     Impl* impl = impl_.get();
-    static_cast<void>(options);
-    auto submit = [impl, handle, writable](std::coroutine_handle<> coroutine,
-                                           Result<void>* result) {
-        return impl->add_waiter(handle, writable, coroutine, result);
+    auto submit = [impl, handle, writable, &options](std::coroutine_handle<> coroutine,
+                                                     Result<void>* result) {
+        return impl->add_waiter(handle, writable, options, coroutine, result);
     };
-    co_return co_await detail::OperationAwaiter<Result<void>, decltype(submit)>{submit};
+    // `options` is a by-value coroutine parameter, so capturing it by
+    // reference captures a slot in this frame, which outlives the awaiter.
+    co_return co_await detail::await_operation<Result<void>>(
+        std::move(submit), detail::cancel_through(impl), options.stop);
 }
 
 Task<Result<void>> EventLoop::sleep_until(Clock::time_point deadline, OperationOptions options) {
     Impl* impl = impl_.get();
-    static_cast<void>(options);
-    auto submit = [impl, deadline](std::coroutine_handle<> coroutine, Result<void>* result) {
-        return impl->add_timer(deadline, coroutine, result);
+    auto submit = [impl, deadline, &options](std::coroutine_handle<> coroutine,
+                                             Result<void>* result) {
+        return impl->add_timer(deadline, options, coroutine, result);
     };
-    co_return co_await detail::OperationAwaiter<Result<void>, decltype(submit)>{submit};
+    co_return co_await detail::await_operation<Result<void>>(
+        std::move(submit), detail::cancel_through(impl), options.stop);
 }
 
 Task<Result<void>> EventLoop::sleep_for(Duration delay, OperationOptions options) {
@@ -810,9 +907,10 @@ Task<void> EventLoop::yield() {
         // A yield is a tracked suspension, not disposable posted work.
         // An already-due timer runs on the next pump and is cancelled/resumed
         // by shutdown, keeping child scopes joinable.
-        return impl->add_timer(Clock::now(), coroutine, result);
+        return impl->add_timer(Clock::now(), OperationOptions{}, coroutine, result);
     };
-    (void)co_await detail::OperationAwaiter<Result<void>, decltype(submit)>{submit};
+    (void)co_await detail::await_operation<Result<void>>(
+        std::move(submit), detail::cancel_never(), std::stop_token{});
     co_return;
 }
 

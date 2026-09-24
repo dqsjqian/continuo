@@ -144,6 +144,16 @@ public:
         /// query Winsock with it and never `CancelIoEx` on it again.
         bool handle_closed{false};
 
+        /// The answer, decided before the operation could be resolved.
+        ///
+        /// A cancelled or timed-out kernel-backed operation stays in the table
+        /// until its completion packet arrives, because until then the kernel
+        /// may still be writing into the OVERLAPPED, the AcceptEx address
+        /// buffer, and the caller's own buffer. When the packet finally lands,
+        /// this reason is delivered instead of whatever the packet says — even
+        /// if the packet says success.
+        std::optional<Error> fixed_reason{};
+
         detail::TimerHandle wake{};
         detail::TimerHandle deadline{};
 
@@ -159,22 +169,35 @@ public:
     ~Impl() { shutdown(); }
 
     void shutdown() noexcept {
+        // The flag is set before the dispatch check so that shutdown's own
+        // `finalize` calls, which raise the depth themselves, are not mistaken
+        // for a coroutine destroying the loop it is being resumed by.
         if (shutting_down_.exchange(true, std::memory_order_acq_rel)) {
             return;
         }
+        if (dispatch_depth_ != 0) {
+            detail::report_dispatch_violation("destroyed or replaced while dispatching");
+        }
         stop_requested_.store(true, std::memory_order_release);
 
-        std::vector<detail::OperationId> orphans;
+        std::vector<std::pair<detail::OperationId, Error>> orphans;
         std::vector<std::pair<SOCKET, OVERLAPPED*>> to_cancel;
         std::vector<std::function<void()>> discarded_work;
         std::size_t kernel_backed = 0;
         {
             const std::lock_guard lock{mutex_};
             posted_.drain_into(discarded_work);
+            pending_cancels_.clear();
             orphans.reserve(operations_.size());
             for (auto& entry : operations_) {
                 Operation& operation = *entry.second;
-                orphans.push_back(operation.id);
+                // An operation already cut short keeps the reason it was given:
+                // a deadline that expired a moment ago is a truer answer than
+                // "the loop went away".
+                if (!operation.fixed_reason) {
+                    operation.fixed_reason = make_error_code(Errc::cancelled);
+                }
+                orphans.emplace_back(operation.id, *operation.fixed_reason);
                 if (!operation.kernel_backed()) {
                     continue;
                 }
@@ -223,8 +246,8 @@ public:
 
         // The kernel has let go; only now may a coroutine that reclaims a
         // buffer run. The shutdown flag stops any of them re-submitting.
-        for (const detail::OperationId id : orphans) {
-            finalize(id, fail(Errc::cancelled));
+        for (const auto& [id, reason] : orphans) {
+            finalize(id, fail(reason));
         }
         discarded_work.clear();
 
@@ -274,13 +297,18 @@ public:
 
     [[nodiscard]] Result<detail::OperationId> submit_read(NativeHandle handle,
                                                           std::span<std::byte> destination,
+                                                          const OperationOptions& options,
                                                           std::coroutine_handle<> coroutine,
                                                           Result<std::size_t>* result) {
         if (shutting_down()) {
             return fail(Errc::cancelled);
         }
+        if (const std::optional<Error> rejected = detail::rejected_before_submit(options)) {
+            return fail(*rejected);
+        }
 
-        const Acquired acquired = acquire_operation(Kind::read, coroutine);
+        const Acquired acquired =
+            acquire_operation(Kind::read, coroutine, std::nullopt, options);
         Operation* operation = acquired.operation;
         operation->size_result = result;
         operation->socket = static_cast<SOCKET>(handle);
@@ -308,13 +336,18 @@ public:
 
     [[nodiscard]] Result<detail::OperationId> submit_write(NativeHandle handle,
                                                            std::span<const std::byte> source,
+                                                           const OperationOptions& options,
                                                            std::coroutine_handle<> coroutine,
                                                            Result<std::size_t>* result) {
         if (shutting_down()) {
             return fail(Errc::cancelled);
         }
+        if (const std::optional<Error> rejected = detail::rejected_before_submit(options)) {
+            return fail(*rejected);
+        }
 
-        const Acquired acquired = acquire_operation(Kind::write, coroutine);
+        const Acquired acquired =
+            acquire_operation(Kind::write, coroutine, std::nullopt, options);
         Operation* operation = acquired.operation;
         operation->size_result = result;
         operation->socket = static_cast<SOCKET>(handle);
@@ -339,10 +372,14 @@ public:
 
     [[nodiscard]] Result<detail::OperationId> submit_accept(NativeHandle listener,
                                                             int address_family,
+                                                            const OperationOptions& options,
                                                             std::coroutine_handle<> coroutine,
                                                             Result<std::size_t>* result) {
         if (shutting_down()) {
             return fail(Errc::cancelled);
+        }
+        if (const std::optional<Error> rejected = detail::rejected_before_submit(options)) {
+            return fail(*rejected);
         }
 
         const auto listening = static_cast<SOCKET>(listener);
@@ -363,7 +400,8 @@ public:
             return fail(last_socket_error());
         }
 
-        const Acquired acquired = acquire_operation(Kind::accept, coroutine);
+        const Acquired acquired =
+            acquire_operation(Kind::accept, coroutine, std::nullopt, options);
         Operation* operation = acquired.operation;
         operation->size_result = result;
         operation->socket = listening;
@@ -392,10 +430,14 @@ public:
 
     [[nodiscard]] Result<detail::OperationId> submit_connect(NativeHandle handle,
                                                              std::span<const std::byte> address,
+                                                             const OperationOptions& options,
                                                              std::coroutine_handle<> coroutine,
                                                              Result<std::size_t>* result) {
         if (shutting_down()) {
             return fail(Errc::cancelled);
+        }
+        if (const std::optional<Error> rejected = detail::rejected_before_submit(options)) {
+            return fail(*rejected);
         }
 
         const auto socket = static_cast<SOCKET>(handle);
@@ -423,7 +465,8 @@ public:
             return fail(last_socket_error());
         }
 
-        const Acquired acquired = acquire_operation(Kind::connect, coroutine);
+        const Acquired acquired =
+            acquire_operation(Kind::connect, coroutine, std::nullopt, options);
         Operation* operation = acquired.operation;
         operation->size_result = result;
         operation->socket = socket;
@@ -445,12 +488,16 @@ public:
     }
 
     [[nodiscard]] Result<detail::OperationId> add_timer(detail::Clock::time_point wake_at,
+                                                        const OperationOptions& options,
                                                         std::coroutine_handle<> coroutine,
                                                         Result<void>* result) {
         if (shutting_down()) {
             return fail(Errc::cancelled);
         }
-        const Acquired acquired = acquire_operation(Kind::timer, coroutine, wake_at);
+        if (const std::optional<Error> rejected = detail::rejected_before_submit(options)) {
+            return fail(*rejected);
+        }
+        const Acquired acquired = acquire_operation(Kind::timer, coroutine, wake_at, options);
         acquired.operation->void_result = result;
         wake();
         return acquired.id;
@@ -458,6 +505,26 @@ public:
 
     [[nodiscard]] bool shutting_down() const noexcept {
         return shutting_down_.load(std::memory_order_acquire);
+    }
+
+    /// Ask for an operation to be cancelled. Safe from any thread.
+    ///
+    /// Never resumes: a `std::stop_callback` built on an already-stopped token
+    /// runs synchronously, inside the `await_suspend` that registered it, and
+    /// it may also run on a thread that is not the loop's.
+    void request_cancel(detail::OperationId id) {
+        const Fixed fixed = fix_reason(id, make_error_code(Errc::cancelled));
+        if (!fixed.applied) {
+            return;  // already resolved, or already cut short for some reason
+        }
+        cancel_io(fixed);
+        if (fixed.resolve_now) {
+            {
+                const std::lock_guard lock{mutex_};
+                pending_cancels_.push_back(id);
+            }
+            wake();
+        }
     }
 
     [[nodiscard]] Result<void> post(std::function<void()> work) {
@@ -494,13 +561,23 @@ public:
         if (shutting_down()) {
             return fail(Errc::cancelled);
         }
+        if (dispatch_depth_ != 0) {
+            detail::report_dispatch_violation("run_once re-entered from a resumed coroutine");
+        }
+        const detail::DispatchScope dispatching{dispatch_depth_};
+
         std::array<OVERLAPPED_ENTRY, kEventBatch> entries{};
 
         int timeout_ms = 0;
         {
             const std::lock_guard lock{mutex_};
-            timeout_ms = detail::resolve_timeout_ms(
-                timeout, timers_.earliest(), !posted_.empty() || stopped());
+            // Every queue whose arrival triggers `wake()` has to be reported
+            // here. The wake-up packet is collapsed when one is already
+            // pending, so it is never what guarantees progress — leaving
+            // `pending_cancels_` out would let the loop block with a
+            // cancellation sitting in it.
+            const bool queued = !posted_.empty() || !pending_cancels_.empty() || stopped();
+            timeout_ms = detail::resolve_timeout_ms(timeout, timers_.earliest(), queued);
         }
 
         ULONG removed = 0;
@@ -537,25 +614,57 @@ public:
             // dequeued, which is happening right now, so this memory is
             // necessarily still alive.
             const detail::OperationId id = operation->id;
-            resolved.emplace_back(id, classify(*operation, entry));
+            Result<std::size_t> outcome = classify(*operation, entry);
+            // A reason fixed earlier wins over what the packet reports,
+            // including a packet that reports success. The consequence is
+            // sharp and deliberate: a cancelled read whose buffer the kernel
+            // had already filled discards those bytes, which leaves a hole in
+            // the stream. That is why a cancelled read or write on Windows
+            // ends the connection's usefulness — see `event_loop.hpp`.
+            if (const std::optional<Error> fixed = fixed_reason_of(id)) {
+                outcome = fail(*fixed);
+            }
+            resolved.emplace_back(id, outcome);
         }
 
         std::vector<detail::TimerTarget> expired;
+        std::vector<detail::OperationId> cancels;
         std::vector<std::function<void()>> to_run;
         {
             const std::lock_guard lock{mutex_};
             timers_.extract_expired(detail::Clock::now(), expired);
+            cancels.swap(pending_cancels_);
             posted_.drain_into(to_run);
             wake_pending_.store(false, std::memory_order_release);
         }
 
-        // Completions first, then deadlines — the order `extract_expired`
-        // already sorted within itself, extended across the whole batch.
+        // Real completions, then deadlines, then cancellations. An operation
+        // that genuinely finished in this batch is reported as finished even
+        // if its deadline expired in the same instant; `finalize` is by id, so
+        // the later mention of it does nothing.
         for (const detail::TimerTarget& target : expired) {
-            resolved.emplace_back(target.operation,
-                                  target.is_deadline
-                                      ? Result<std::size_t>{fail(Errc::timed_out)}
-                                      : Result<std::size_t>{std::size_t{0}});
+            if (!target.is_deadline) {
+                resolved.emplace_back(target.operation, std::size_t{0});
+                continue;
+            }
+            // A deadline cannot resolve a kernel-backed operation by itself:
+            // the kernel may still be writing into its buffers. Pin the answer
+            // and ask for a cancel; the completion packet delivers it.
+            const Fixed fixed = fix_reason(target.operation, make_error_code(Errc::timed_out));
+            if (!fixed.applied) {
+                continue;
+            }
+            cancel_io(fixed);
+            if (fixed.resolve_now) {
+                resolved.emplace_back(target.operation, fail(Errc::timed_out));
+            }
+        }
+        for (const detail::OperationId id : cancels) {
+            // Only operations that owe no packet reach here; the rest were
+            // left for their completion to resolve.
+            if (const std::optional<Error> fixed = fixed_reason_of(id)) {
+                resolved.emplace_back(id, fail(*fixed));
+            }
         }
 
         // Everything below runs outside the lock: resumed coroutines may
@@ -632,6 +741,65 @@ private:
         return fail(Errc::not_supported);
     }
 
+    /// Outcome of pinning an operation's answer.
+    struct Fixed {
+        /// This call is the one that pinned it. A second attempt reports
+        /// `false`, which is what makes cancelling twice a no-op and keeps the
+        /// first reason authoritative.
+        bool applied{false};
+        /// No completion packet is owed, so the loop may resolve it directly.
+        bool resolve_now{false};
+        SOCKET socket{INVALID_SOCKET};
+        OVERLAPPED* overlapped{nullptr};
+    };
+
+    /// Pin an operation's answer without resolving it.
+    [[nodiscard]] Fixed fix_reason(detail::OperationId id, Error reason) {
+        const std::lock_guard lock{mutex_};
+        auto it = operations_.find(id);
+        if (it == operations_.end()) {
+            return {};
+        }
+        Operation& operation = *it->second;
+        if (operation.fixed_reason) {
+            return {};
+        }
+        operation.fixed_reason = reason;
+        // The deadline has either just fired or been overtaken; either way it
+        // has nothing left to say.
+        timers_.cancel(std::exchange(operation.deadline, detail::TimerHandle{}));
+
+        Fixed out{.applied = true, .resolve_now = !operation.kernel_backed()};
+        if (operation.kernel_backed() && !operation.handle_closed) {
+            out.socket = operation.socket;
+            out.overlapped = &operation.overlapped;
+        }
+        return out;
+    }
+
+    /// Ask the kernel to abandon one specific operation.
+    ///
+    /// Per-OVERLAPPED, never per-handle: `CancelIoEx(handle, nullptr)` would
+    /// take down every operation on the socket, which is exactly what
+    /// per-operation cancellation must not do.
+    static void cancel_io(const Fixed& fixed) noexcept {
+        if (fixed.overlapped == nullptr) {
+            return;
+        }
+        // ERROR_NOT_FOUND is not a failure: it means the packet is already on
+        // its way, which is the case this whole design is built around.
+        ::CancelIoEx(reinterpret_cast<HANDLE>(fixed.socket), fixed.overlapped);
+    }
+
+    [[nodiscard]] std::optional<Error> fixed_reason_of(detail::OperationId id) {
+        const std::lock_guard lock{mutex_};
+        auto it = operations_.find(id);
+        if (it == operations_.end()) {
+            return std::nullopt;
+        }
+        return it->second->fixed_reason;
+    }
+
     struct Acquired {
         detail::OperationId id{detail::kNoOperation};
         Operation* operation{nullptr};
@@ -644,13 +812,14 @@ private:
     /// `unique_ptr` is what keeps the OVERLAPPED at a fixed address across
     /// rehashes of the table.
     ///
-    /// `wake_at` registers the timer under the same lock as the insertion:
-    /// a timer naming an operation that is not in the table yet would fire
-    /// into nothing.
+    /// The timers are registered under the same lock as the insertion: one
+    /// naming an operation that is not in the table yet would fire into
+    /// nothing.
     [[nodiscard]] Acquired
     acquire_operation(Kind kind,
                       std::coroutine_handle<> coroutine,
-                      std::optional<detail::Clock::time_point> wake_at = std::nullopt) {
+                      std::optional<detail::Clock::time_point> wake_at = std::nullopt,
+                      const OperationOptions& options = {}) {
         auto owned = std::make_unique<Operation>();
         owned->kind = kind;
         owned->handle = coroutine;
@@ -660,7 +829,15 @@ private:
         const detail::OperationId id = ++next_id_;
         pointer->id = id;
         if (wake_at) {
+            // Two timers, not `min(wake_at, deadline)`: they mean opposite
+            // things, and whichever fires first resolves the operation while
+            // `take` cancels the other.
             pointer->wake = timers_.add(*wake_at, detail::TimerTarget{.operation = id});
+        }
+        if (options.deadline) {
+            pointer->deadline =
+                timers_.add(*options.deadline,
+                            detail::TimerTarget{.operation = id, .is_deadline = true});
         }
         operations_.emplace(id, std::move(owned));
         return Acquired{id, pointer};
@@ -734,7 +911,12 @@ private:
     std::unordered_map<detail::OperationId, std::unique_ptr<Operation>> operations_{};
     detail::TimerQueue timers_{};
     detail::PostQueue posted_{};
+    std::vector<detail::OperationId> pending_cancels_{};
     detail::OperationId next_id_{detail::kNoOperation};
+
+    /// Non-zero while a batch is being delivered. Loop thread only, which is
+    /// the same restriction `run_once` and destroying the loop already carry.
+    int dispatch_depth_{0};
 
     LPFN_ACCEPTEX accept_ex_{nullptr};
     LPFN_CONNECTEX connect_ex_{nullptr};
@@ -816,46 +998,58 @@ Result<void> EventLoop::run() {
 Task<Result<std::size_t>> EventLoop::read(NativeHandle handle,
                                           std::span<std::byte> destination,
                                           OperationOptions options) {
+    // Before the zero-length shortcut, not after: an operation the caller has
+    // already cancelled must say so rather than quietly succeed with 0 bytes.
+    if (const std::optional<Error> rejected = detail::rejected_before_submit(options)) {
+        co_return fail(*rejected);
+    }
     if (destination.empty()) {
         co_return std::size_t{0};
     }
     Impl* impl = impl_.get();
-    static_cast<void>(options);
-    auto submit = [impl, handle, destination](std::coroutine_handle<> coroutine,
-                                              Result<std::size_t>* result) {
-        return impl->submit_read(handle, destination, coroutine, result);
+    // `options` is a by-value coroutine parameter, so capturing it by
+    // reference captures a slot in this frame, which outlives the awaiter.
+    auto submit = [impl, handle, destination, &options](std::coroutine_handle<> coroutine,
+                                                        Result<std::size_t>* result) {
+        return impl->submit_read(handle, destination, options, coroutine, result);
     };
-    co_return co_await detail::OperationAwaiter<Result<std::size_t>, decltype(submit)>{submit};
+    co_return co_await detail::await_operation<Result<std::size_t>>(
+        std::move(submit), detail::cancel_through(impl), options.stop);
 }
 
 Task<Result<std::size_t>> EventLoop::write(NativeHandle handle,
                                            std::span<const std::byte> source,
                                            OperationOptions options) {
+    if (const std::optional<Error> rejected = detail::rejected_before_submit(options)) {
+        co_return fail(*rejected);
+    }
     if (source.empty()) {
         co_return std::size_t{0};
     }
     Impl* impl = impl_.get();
-    static_cast<void>(options);
-    auto submit = [impl, handle, source](std::coroutine_handle<> coroutine,
-                                         Result<std::size_t>* result) {
-        return impl->submit_write(handle, source, coroutine, result);
+    auto submit = [impl, handle, source, &options](std::coroutine_handle<> coroutine,
+                                                   Result<std::size_t>* result) {
+        return impl->submit_write(handle, source, options, coroutine, result);
     };
-    co_return co_await detail::OperationAwaiter<Result<std::size_t>, decltype(submit)>{submit};
+    co_return co_await detail::await_operation<Result<std::size_t>>(
+        std::move(submit), detail::cancel_through(impl), options.stop);
 }
 
 Task<Result<NativeHandle>>
 EventLoop::accept(NativeHandle listener, int address_family, OperationOptions options) {
+    if (const std::optional<Error> rejected = detail::rejected_before_submit(options)) {
+        co_return fail(*rejected);
+    }
     Impl* impl = impl_.get();
-    static_cast<void>(options);
-    auto submit = [impl, listener, address_family](std::coroutine_handle<> coroutine,
-                                                   Result<std::size_t>* result) {
-        return impl->submit_accept(listener, address_family, coroutine, result);
+    auto submit = [impl, listener, address_family, &options](std::coroutine_handle<> coroutine,
+                                                             Result<std::size_t>* result) {
+        return impl->submit_accept(listener, address_family, options, coroutine, result);
     };
 
     // The accepted socket travels back through the size_t slot; the loop has
     // already associated it with the completion port.
-    Result<std::size_t> accepted =
-        co_await detail::OperationAwaiter<Result<std::size_t>, decltype(submit)>{submit};
+    Result<std::size_t> accepted = co_await detail::await_operation<Result<std::size_t>>(
+        std::move(submit), detail::cancel_through(impl), options.stop);
     if (!accepted) {
         co_return fail(accepted.error());
     }
@@ -873,14 +1067,19 @@ Task<Result<void>> EventLoop::connect(NativeHandle handle,
     if (address.size() < sizeof(sockaddr)) {
         co_return fail(Errc::invalid_argument);
     }
+    if (const std::optional<Error> rejected = detail::rejected_before_submit(options)) {
+        co_return fail(*rejected);
+    }
     Impl* impl = impl_.get();
-    static_cast<void>(options);
-    auto submit = [impl, handle, address](std::coroutine_handle<> coroutine,
-                                          Result<std::size_t>* result) {
-        return impl->submit_connect(handle, address, coroutine, result);
+    auto submit = [impl, handle, address, &options](std::coroutine_handle<> coroutine,
+                                                    Result<std::size_t>* result) {
+        return impl->submit_connect(handle, address, options, coroutine, result);
     };
-    Result<std::size_t> connected =
-        co_await detail::OperationAwaiter<Result<std::size_t>, decltype(submit)>{submit};
+    // Cancelling abandons the *wait*. The kernel's connect attempt carries on,
+    // so the socket is left in an indeterminate state and the caller has to
+    // close it; the loop never closes a handle it was lent.
+    Result<std::size_t> connected = co_await detail::await_operation<Result<std::size_t>>(
+        std::move(submit), detail::cancel_through(impl), options.stop);
     if (!connected) {
         co_return fail(connected.error());
     }
@@ -899,11 +1098,12 @@ Task<Result<void>> EventLoop::wait_for(NativeHandle, bool, OperationOptions) {
 
 Task<Result<void>> EventLoop::sleep_until(Clock::time_point deadline, OperationOptions options) {
     Impl* impl = impl_.get();
-    static_cast<void>(options);
-    auto submit = [impl, deadline](std::coroutine_handle<> coroutine, Result<void>* result) {
-        return impl->add_timer(deadline, coroutine, result);
+    auto submit = [impl, deadline, &options](std::coroutine_handle<> coroutine,
+                                             Result<void>* result) {
+        return impl->add_timer(deadline, options, coroutine, result);
     };
-    co_return co_await detail::OperationAwaiter<Result<void>, decltype(submit)>{submit};
+    co_return co_await detail::await_operation<Result<void>>(
+        std::move(submit), detail::cancel_through(impl), options.stop);
 }
 
 Task<Result<void>> EventLoop::sleep_for(Duration delay, OperationOptions options) {
@@ -915,9 +1115,10 @@ Task<void> EventLoop::yield() {
     auto submit = [impl](std::coroutine_handle<> coroutine, Result<void>* result) {
         // Keep yield in the tracked timer queue so shutdown resumes it after
         // draining kernel I/O, instead of discarding a continuation in post().
-        return impl->add_timer(Clock::now(), coroutine, result);
+        return impl->add_timer(Clock::now(), OperationOptions{}, coroutine, result);
     };
-    (void)co_await detail::OperationAwaiter<Result<void>, decltype(submit)>{submit};
+    (void)co_await detail::await_operation<Result<void>>(
+        std::move(submit), detail::cancel_never(), std::stop_token{});
     co_return;
 }
 

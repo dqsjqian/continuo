@@ -36,6 +36,9 @@ continuo_add_terminate_tests(task_scope continuo_task_scope_tests
 continuo_add_terminate_tests(task_contract continuo_core_tests
     sync-get-suspended abandoned-awaiter)
 
+continuo_add_terminate_tests(event_loop continuo_event_loop_tests
+    destroy-during-dispatch reentrant-run-once)
+
 # An event-loop bug tends to hang rather than fail. A timeout turns that into
 # a red test instead of a stuck CI job.
 set_tests_properties(event_loop PROPERTIES TIMEOUT 60)

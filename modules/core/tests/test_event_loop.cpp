@@ -16,17 +16,23 @@
 #include "continuo/core/platform.hpp"
 #include "continuo/core/task.hpp"
 
+#include "continuo/core/operation.hpp"
+
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <coroutine>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #if !CONTINUO_PLATFORM_WINDOWS
@@ -141,6 +147,47 @@ public:
         if (second_ >= 0) {
             ::close(second_);
             second_ = -1;
+        }
+#endif
+    }
+
+    /// Write until the send buffer refuses more, so the write direction is
+    /// genuinely *not* ready. Returns how much went in, or 0 on failure.
+    ///
+    /// Needed because a fresh socketpair is always writable, and a writer that
+    /// is immediately ready can never be observed parked — which is the only
+    /// state in which "cancelling the read direction left the write
+    /// registration alone" is an observable claim rather than a hope. Requires
+    /// the descriptor to be non-blocking, which `attach` has already ensured.
+    [[nodiscard]] std::size_t fill_send_buffer() const {
+#if CONTINUO_PLATFORM_WINDOWS
+        return 0;
+#else
+        std::array<std::byte, 4096> block{};
+        std::size_t total = 0;
+        for (;;) {
+            const ssize_t written = ::write(first_, block.data(), block.size());
+            if (written < 0) {
+                return (errno == EAGAIN || errno == EWOULDBLOCK) ? total : 0;
+            }
+            total += static_cast<std::size_t>(written);
+        }
+#endif
+    }
+
+    /// Consume some of what we sent, making room in the send buffer again.
+    void peer_drain(std::size_t bytes) const {
+#if CONTINUO_PLATFORM_WINDOWS
+        (void)bytes;
+#else
+        std::array<std::byte, 4096> block{};
+        std::size_t left = bytes;
+        while (left > 0) {
+            const ssize_t got = ::read(second_, block.data(), std::min(left, block.size()));
+            if (got <= 0) {
+                break;
+            }
+            left -= static_cast<std::size_t>(got);
         }
 #endif
     }
@@ -500,9 +547,670 @@ void test_yield_returns_to_loop() {
     CHECK(stage == 2);
 }
 
+// ── per-operation cancellation and deadlines ─────────────────────────────────
+
+/// Read into a caller-owned slot, recording the outcome and completion.
+struct Reader {
+    static DetachedTask go(EventLoop& target,
+                           NativeHandle handle,
+                           std::span<std::byte> scratch,
+                           OperationOptions options,
+                           Result<std::size_t>& slot,
+                           std::atomic<int>& counter) {
+        slot = co_await target.read(handle, scratch, std::move(options));
+        counter.fetch_add(1, std::memory_order_release);
+        co_return;
+    }
+};
+
+void test_options_rejected_before_submit() {
+    test::section("options are decided before the first syscall");
+
+    HandlePair pair;
+    if (!pair.valid()) {
+        std::printf("   skipped: no handle pair on this platform\n");
+        return;
+    }
+
+    Result<EventLoop> created = EventLoop::create();
+    CHECK(created.has_value());
+    EventLoop& loop = created.value();
+    CHECK(loop.attach(pair.first()).has_value());
+
+    std::array<std::byte, 16> scratch{};
+    const auto read_with = [&](OperationOptions options) {
+        std::atomic<int> done{0};
+        Result<std::size_t> outcome = std::size_t{999};
+        Reader::go(loop, pair.first(), scratch, std::move(options), outcome, done);
+        // Nothing was submitted, so the answer is already there.
+        CHECK(done.load(std::memory_order_acquire) == 1);
+        CHECK(loop.outstanding() == 0);
+        return outcome;
+    };
+
+    std::stop_source stopped;
+    stopped.request_stop();
+    const auto past = EventLoop::Clock::now() - 1ms;
+
+    const Result<std::size_t> cancelled = read_with({.stop = stopped.get_token()});
+    CHECK(!cancelled.has_value());
+    CHECK(cancelled.error() == Errc::cancelled);
+
+    const Result<std::size_t> expired = read_with({.deadline = past});
+    CHECK(!expired.has_value());
+    CHECK(expired.error() == Errc::timed_out);
+
+    // Both apply: an explicit request outranks an elapsed budget.
+    const Result<std::size_t> both =
+        read_with({.stop = stopped.get_token(), .deadline = past});
+    CHECK(!both.has_value());
+    CHECK(both.error() == Errc::cancelled);
+
+    // Data is waiting, so a read without options would succeed immediately.
+    // The options still win, which is what "before the first syscall" means.
+    pair.peer_send("ready");
+    const Result<std::size_t> refused = read_with({.stop = stopped.get_token()});
+    CHECK(!refused.has_value());
+    CHECK(refused.error() == Errc::cancelled);
+
+    // A zero-length read normally shortcuts to 0 bytes; a cancelled one has to
+    // report the reason instead of a success it never performed.
+    std::atomic<int> done{0};
+    Result<std::size_t> empty = std::size_t{999};
+    Reader::go(loop,
+               pair.first(),
+               std::span<std::byte>{},
+               {.stop = stopped.get_token()},
+               empty,
+               done);
+    CHECK(done.load(std::memory_order_acquire) == 1);
+    CHECK(!empty.has_value());
+    CHECK(empty.error() == Errc::cancelled);
+
+    // Without options it still shortcuts.
+    std::atomic<int> plain_done{0};
+    Result<std::size_t> plain = fail(Errc::cancelled);
+    Reader::go(loop, pair.first(), std::span<std::byte>{}, {}, plain, plain_done);
+    CHECK(plain_done.load(std::memory_order_acquire) == 1);
+    CHECK(plain.value_or(999) == 0);
+
+#if CONTINUO_HAS_READINESS_API
+    // The readiness extension has no syscall of its own to guard, so its only
+    // check is the one every submission shares. Without it the wait would
+    // park, be cancelled by the callback, and need a pump to come back —
+    // observably different from never starting.
+    std::atomic<int> wait_done{0};
+    Result<void> waited{};
+
+    struct Waiter {
+        static DetachedTask go(EventLoop& target,
+                               NativeHandle handle,
+                               OperationOptions options,
+                               Result<void>& slot,
+                               std::atomic<int>& counter) {
+            slot = co_await target.wait_readable(handle, std::move(options));
+            counter.fetch_add(1, std::memory_order_release);
+            co_return;
+        }
+    };
+
+    Waiter::go(loop, pair.first(), {.stop = stopped.get_token()}, waited, wait_done);
+    CHECK(wait_done.load(std::memory_order_acquire) == 1);
+    CHECK(loop.outstanding() == 0);
+    CHECK(!waited.has_value());
+    CHECK(waited.error() == Errc::cancelled);
+
+    Result<void> expired_wait{};
+    std::atomic<int> expired_done{0};
+    Waiter::go(loop, pair.first(), {.deadline = past}, expired_wait, expired_done);
+    CHECK(expired_done.load(std::memory_order_acquire) == 1);
+    CHECK(loop.outstanding() == 0);
+    CHECK(!expired_wait.has_value());
+    CHECK(expired_wait.error() == Errc::timed_out);
+#endif
+}
+
+void test_cancel_in_flight() {
+    test::section("cancelling a suspended operation");
+
+    HandlePair pair;
+    if (!pair.valid()) {
+        std::printf("   skipped: no handle pair on this platform\n");
+        return;
+    }
+
+    Result<EventLoop> created = EventLoop::create();
+    CHECK(created.has_value());
+    EventLoop& loop = created.value();
+    CHECK(loop.attach(pair.first()).has_value());
+
+    std::stop_source source;
+    std::array<std::byte, 16> scratch{};
+    std::atomic<int> done{0};
+    Result<std::size_t> outcome = std::size_t{999};
+
+    Reader::go(loop, pair.first(), scratch, {.stop = source.get_token()}, outcome, done);
+    CHECK(loop.run_once(0ms).has_value());
+    CHECK(done.load(std::memory_order_acquire) == 0);  // genuinely suspended
+    CHECK(loop.outstanding() == 1);
+
+    // The request only queues work; nothing is resumed until the loop runs.
+    source.request_stop();
+    CHECK(done.load(std::memory_order_acquire) == 0);
+
+    // Requesting twice must not queue a second resumption, and the loop must
+    // not block when all it has left is a pending cancellation.
+    source.request_stop();
+    CHECK(loop.run_once(EventLoop::Duration::min()).has_value());
+    CHECK(done.load(std::memory_order_acquire) == 1);
+    CHECK(!outcome.has_value());
+    CHECK(outcome.error() == Errc::cancelled);
+    CHECK(loop.outstanding() == 0);
+
+    // A readiness event arriving after the cancellation resolves nothing: the
+    // operation is gone, and its id is never reused.
+    pair.peer_send("late");
+    CHECK(loop.run_once(0ms).has_value());
+    CHECK(done.load(std::memory_order_acquire) == 1);
+}
+
+void test_cancel_leaves_other_direction_armed() {
+    test::section("cancelling one direction leaves the other waiting");
+
+    HandlePair pair;
+    if (!pair.valid()) {
+        std::printf("   skipped: no handle pair on this platform\n");
+        return;
+    }
+
+    Result<EventLoop> created = EventLoop::create();
+    CHECK(created.has_value());
+    EventLoop& loop = created.value();
+    CHECK(loop.attach(pair.first()).has_value());
+
+    // Both waiters have to be genuinely parked for this to prove anything, so
+    // the send buffer is filled first: otherwise the writer is ready in the
+    // very batch that delivers the cancellation, and would complete no matter
+    // what happened to its registration.
+    const std::size_t buffered = pair.fill_send_buffer();
+    CHECK(buffered > 0);
+    if (buffered == 0) {
+        return;
+    }
+
+    std::stop_source stop_reader;
+    std::atomic<int> done{0};
+    Result<void> read_outcome = fail(Errc::eof);
+    Result<void> write_outcome = fail(Errc::eof);
+
+    struct Waiter {
+        static DetachedTask readable(EventLoop& target,
+                                     NativeHandle handle,
+                                     OperationOptions options,
+                                     Result<void>& slot,
+                                     std::atomic<int>& counter) {
+            slot = co_await target.wait_readable(handle, std::move(options));
+            counter.fetch_add(1, std::memory_order_release);
+            co_return;
+        }
+
+        static DetachedTask writable(EventLoop& target,
+                                     NativeHandle handle,
+                                     Result<void>& slot,
+                                     std::atomic<int>& counter) {
+            slot = co_await target.wait_writable(handle);
+            counter.fetch_add(1, std::memory_order_release);
+            co_return;
+        }
+    };
+
+    Waiter::writable(loop, pair.first(), write_outcome, done);
+    Waiter::readable(loop, pair.first(), {.stop = stop_reader.get_token()}, read_outcome, done);
+    CHECK(loop.outstanding() == 2);
+
+    // Neither direction is ready.
+    CHECK(loop.run_once(0ms).has_value());
+    CHECK(done.load(std::memory_order_acquire) == 0);
+
+    // Readiness is per direction, and so is its kernel registration. Dropping
+    // the whole descriptor's interest — which is what `disarm` does — would
+    // strand the writer here with nothing armed on its behalf.
+    stop_reader.request_stop();
+    CHECK(loop.run_once(EventLoop::Duration::min()).has_value());
+    CHECK(done.load(std::memory_order_acquire) == 1);
+    CHECK(!read_outcome.has_value());
+    CHECK(read_outcome.error() == Errc::cancelled);
+    CHECK(loop.outstanding() == 1);
+
+    // Make room again: the surviving writer must still be registered.
+    pair.peer_drain(buffered);
+    for (int i = 0; i < 200 && done.load(std::memory_order_acquire) < 2; ++i) {
+        CHECK(loop.run_once(50ms).has_value());
+    }
+    CHECK(done.load(std::memory_order_acquire) == 2);
+    CHECK(write_outcome.has_value());
+    CHECK(loop.outstanding() == 0);
+}
+
+void test_deadline_on_a_suspended_read() {
+    test::section("deadline on a read that never becomes ready");
+
+    HandlePair pair;
+    if (!pair.valid()) {
+        std::printf("   skipped: no handle pair on this platform\n");
+        return;
+    }
+
+    Result<EventLoop> created = EventLoop::create();
+    CHECK(created.has_value());
+    EventLoop& loop = created.value();
+    CHECK(loop.attach(pair.first()).has_value());
+
+    std::array<std::byte, 16> scratch{};
+    std::atomic<int> done{0};
+    Result<std::size_t> outcome = std::size_t{999};
+    const auto started = EventLoop::Clock::now();
+
+    Reader::go(loop,
+               pair.first(),
+               scratch,
+               {.deadline = started + 20ms},
+               outcome,
+               done);
+    CHECK(loop.run_once(0ms).has_value());
+    CHECK(done.load(std::memory_order_acquire) == 0);
+    // One outstanding thing, not two: the deadline indexes the read rather
+    // than being work of its own.
+    CHECK(loop.outstanding() == 1);
+
+    for (int i = 0; i < 200 && done.load(std::memory_order_acquire) == 0; ++i) {
+        CHECK(loop.run_once(50ms).has_value());
+    }
+    CHECK(done.load(std::memory_order_acquire) == 1);
+    CHECK(!outcome.has_value());
+    CHECK(outcome.error() == Errc::timed_out);
+    CHECK(EventLoop::Clock::now() - started >= 20ms);
+    CHECK(loop.outstanding() == 0);
+}
+
+void test_deadline_is_absolute_across_retries() {
+    test::section("retries do not refresh the deadline");
+
+    HandlePair pair;
+    if (!pair.valid()) {
+        std::printf("   skipped: no handle pair on this platform\n");
+        return;
+    }
+
+    Result<EventLoop> created = EventLoop::create();
+    CHECK(created.has_value());
+    EventLoop& loop = created.value();
+    CHECK(loop.attach(pair.first()).has_value());
+
+    // A one-byte buffer forces a fresh submission for every byte the peer
+    // dribbles in. Each retry registers a *new* operation, so a deadline held
+    // per-operation as a duration would restart every time and the read would
+    // outlive its budget indefinitely.
+    std::array<std::byte, 1> scratch{};
+    const auto deadline = EventLoop::Clock::now() + 40ms;
+    int reads = 0;
+    std::atomic<bool> finished{false};
+    Result<std::size_t> outcome = std::size_t{999};
+
+    struct Dribble {
+        static DetachedTask go(EventLoop& target,
+                               const HandlePair& pair,
+                               std::span<std::byte> scratch,
+                               EventLoop::Clock::time_point deadline,
+                               int& reads,
+                               Result<std::size_t>& slot,
+                               std::atomic<bool>& flag) {
+            for (;;) {
+                pair.peer_send("x");
+                const Result<std::size_t> step =
+                    co_await target.read(pair.first(), scratch, {.deadline = deadline});
+                if (!step) {
+                    slot = step;
+                    break;
+                }
+                ++reads;
+                (void)co_await target.sleep_for(5ms);
+            }
+            flag.store(true, std::memory_order_release);
+            co_return;
+        }
+    };
+
+    Dribble::go(loop, pair, scratch, deadline, reads, outcome, finished);
+    for (int i = 0; i < 400 && !finished.load(std::memory_order_acquire); ++i) {
+        CHECK(loop.run_once(10ms).has_value());
+    }
+
+    CHECK(finished.load(std::memory_order_acquire));
+    CHECK(!outcome.has_value());
+    CHECK(outcome.error() == Errc::timed_out);
+    // Several successful reads happened first, which is what makes this a test
+    // of the budget rather than of an immediate timeout.
+    CHECK(reads > 1);
+    CHECK(EventLoop::Clock::now() >= deadline);
+}
+
+void test_sleep_deadline_beats_wake_up() {
+    test::section("sleep: wake-up and deadline are different answers");
+
+    Result<EventLoop> created = EventLoop::create();
+    CHECK(created.has_value());
+    EventLoop& loop = created.value();
+
+    struct Sleeper {
+        static DetachedTask go(EventLoop& target,
+                               EventLoop::Duration delay,
+                               OperationOptions options,
+                               Result<void>& slot,
+                               std::atomic<bool>& flag) {
+            slot = co_await target.sleep_for(delay, std::move(options));
+            flag.store(true, std::memory_order_release);
+            co_return;
+        }
+    };
+
+    // Deadline first: the sleep is cut short.
+    std::atomic<bool> cut{false};
+    Result<void> cut_outcome{};
+    Sleeper::go(loop,
+                std::chrono::hours{1},
+                {.deadline = EventLoop::Clock::now() + 10ms},
+                cut_outcome,
+                cut);
+    // Two timers for one operation.
+    CHECK(loop.outstanding() == 1);
+    for (int i = 0; i < 200 && !cut.load(std::memory_order_acquire); ++i) {
+        CHECK(loop.run_once(50ms).has_value());
+    }
+    CHECK(cut.load(std::memory_order_acquire));
+    CHECK(!cut_outcome.has_value());
+    CHECK(cut_outcome.error() == Errc::timed_out);
+    // Both timers are gone, not just the one that fired.
+    CHECK(loop.outstanding() == 0);
+
+    // Wake-up first: reaching the requested time is success, even though a
+    // deadline was also set.
+    std::atomic<bool> slept{false};
+    Result<void> slept_outcome = fail(Errc::cancelled);
+    Sleeper::go(loop,
+                5ms,
+                {.deadline = EventLoop::Clock::now() + std::chrono::hours{1}},
+                slept_outcome,
+                slept);
+    for (int i = 0; i < 200 && !slept.load(std::memory_order_acquire); ++i) {
+        CHECK(loop.run_once(50ms).has_value());
+    }
+    CHECK(slept.load(std::memory_order_acquire));
+    CHECK(slept_outcome.has_value());
+    CHECK(loop.outstanding() == 0);
+
+    // Both due in the same batch, with the deadline having expired first.
+    // Whichever came first decides, so this is a timeout — and the timer queue
+    // has to deliver them in time order for that to come out right.
+    std::atomic<bool> overtaken{false};
+    Result<void> overtaken_outcome{};
+    const auto wake_at = EventLoop::Clock::now() + 60ms;
+    Sleeper::go(loop,
+                60ms,
+                {.deadline = EventLoop::Clock::now() + 10ms},
+                overtaken_outcome,
+                overtaken);
+    // Spin past both, so that one pump finds the pair of them expired.
+    while (EventLoop::Clock::now() < wake_at + 10ms) {
+    }
+    CHECK(loop.run_once(0ms).has_value());
+    CHECK(overtaken.load(std::memory_order_acquire));
+    CHECK(!overtaken_outcome.has_value());
+    CHECK(overtaken_outcome.error() == Errc::timed_out);
+    CHECK(loop.outstanding() == 0);
+
+    // Cancelling a sleep cancels both of its timers.
+    std::stop_source source;
+    std::atomic<bool> stopped{false};
+    Result<void> stopped_outcome{};
+    Sleeper::go(loop,
+                std::chrono::hours{1},
+                {.stop = source.get_token(),
+                 .deadline = EventLoop::Clock::now() + std::chrono::hours{2}},
+                stopped_outcome,
+                stopped);
+    CHECK(loop.outstanding() == 1);
+    source.request_stop();
+    CHECK(loop.run_once(EventLoop::Duration::min()).has_value());
+    CHECK(stopped.load(std::memory_order_acquire));
+    CHECK(!stopped_outcome.has_value());
+    CHECK(stopped_outcome.error() == Errc::cancelled);
+    CHECK(loop.outstanding() == 0);
+}
+
+void test_completion_beats_deadline_in_one_batch() {
+    test::section("a completion in the same batch outranks its deadline");
+
+    HandlePair pair;
+    if (!pair.valid()) {
+        std::printf("   skipped: no handle pair on this platform\n");
+        return;
+    }
+
+    Result<EventLoop> created = EventLoop::create();
+    CHECK(created.has_value());
+    EventLoop& loop = created.value();
+    CHECK(loop.attach(pair.first()).has_value());
+
+    std::array<std::byte, 16> scratch{};
+    std::atomic<int> done{0};
+    Result<std::size_t> outcome = fail(Errc::cancelled);
+
+    // Deadline already in the past *and* data already waiting. The read
+    // suspends first (so the options check at submission has passed), then a
+    // single pump sees both the readiness and the expired timer.
+    Reader::go(loop, pair.first(), scratch, {.deadline = EventLoop::Clock::now() + 5ms},
+               outcome, done);
+    CHECK(loop.run_once(0ms).has_value());
+    CHECK(done.load(std::memory_order_acquire) == 0);
+
+    pair.peer_send("data");
+    // Wait past the deadline so that both are due in the same iteration.
+    const auto until = EventLoop::Clock::now() + 20ms;
+    while (EventLoop::Clock::now() < until) {
+    }
+    CHECK(loop.run_once(0ms).has_value());
+
+    CHECK(done.load(std::memory_order_acquire) == 1);
+    CHECK(outcome.has_value());
+    CHECK(outcome.value_or(0) == 4);
+    CHECK(loop.outstanding() == 0);
+
+    // Same rule for a cancellation that lands in the batch the data does. The
+    // read genuinely finished; reporting it as cancelled would throw away
+    // bytes that have already left the kernel's buffer.
+    std::stop_source source;
+    std::atomic<int> raced_done{0};
+    Result<std::size_t> raced = fail(Errc::cancelled);
+    Reader::go(loop, pair.first(), scratch, {.stop = source.get_token()}, raced, raced_done);
+    CHECK(loop.run_once(0ms).has_value());
+    CHECK(raced_done.load(std::memory_order_acquire) == 0);
+
+    pair.peer_send("more");
+    source.request_stop();
+    CHECK(loop.run_once(0ms).has_value());
+
+    CHECK(raced_done.load(std::memory_order_acquire) == 1);
+    CHECK(raced.has_value());
+    CHECK(raced.value_or(0) == 4);
+    CHECK(loop.outstanding() == 0);
+}
+
+void test_shutdown_cancels_deadlines_too() {
+    test::section("shutdown resolves reads, sleeps, and their deadlines");
+
+    HandlePair pair;
+    if (!pair.valid()) {
+        std::printf("   skipped: no handle pair on this platform\n");
+        return;
+    }
+
+    std::atomic<int> done{0};
+    Result<std::size_t> read_outcome = std::size_t{999};
+    Result<void> sleep_outcome{};
+    std::array<std::byte, 16> scratch{};
+
+    struct Sleeper {
+        static DetachedTask go(EventLoop& target,
+                               OperationOptions options,
+                               Result<void>& slot,
+                               std::atomic<int>& counter) {
+            slot = co_await target.sleep_for(std::chrono::hours{1}, std::move(options));
+            counter.fetch_add(1, std::memory_order_release);
+            co_return;
+        }
+    };
+
+    {
+        Result<EventLoop> created = EventLoop::create();
+        CHECK(created.has_value());
+        EventLoop& loop = created.value();
+        CHECK(loop.attach(pair.first()).has_value());
+
+        Reader::go(loop,
+                   pair.first(),
+                   scratch,
+                   {.deadline = EventLoop::Clock::now() + std::chrono::hours{1}},
+                   read_outcome,
+                   done);
+        Sleeper::go(loop,
+                    {.deadline = EventLoop::Clock::now() + std::chrono::hours{2}},
+                    sleep_outcome,
+                    done);
+        CHECK(loop.run_once(0ms).has_value());
+        CHECK(done.load(std::memory_order_acquire) == 0);
+        CHECK(loop.outstanding() == 2);
+        // The loop dies here with both still suspended.
+    }
+
+    CHECK(done.load(std::memory_order_acquire) == 2);
+    CHECK(!read_outcome.has_value());
+    CHECK(read_outcome.error() == Errc::cancelled);
+    CHECK(!sleep_outcome.has_value());
+    CHECK(sleep_outcome.error() == Errc::cancelled);
+}
+
+void test_stop_from_another_thread() {
+    test::section("a stop request from another thread is delivered by the loop");
+
+    Result<EventLoop> created = EventLoop::create();
+    CHECK(created.has_value());
+    EventLoop& loop = created.value();
+
+    std::stop_source source;
+    std::atomic<bool> finished{false};
+    Result<void> outcome{};
+
+    struct Sleeper {
+        static DetachedTask go(EventLoop& target,
+                               OperationOptions options,
+                               Result<void>& slot,
+                               std::atomic<bool>& flag) {
+            slot = co_await target.sleep_for(std::chrono::hours{1}, std::move(options));
+            flag.store(true, std::memory_order_release);
+            co_return;
+        }
+    };
+
+    Sleeper::go(loop, {.stop = source.get_token()}, outcome, finished);
+    CHECK(loop.outstanding() == 1);
+
+    // Joined before pumping, so the assertion below is about the hand-off
+    // rather than about winning a race. What it establishes is that the
+    // callback ran off the loop thread and still only *queued* the request.
+    std::thread requester{[&source] { source.request_stop(); }};
+    requester.join();
+    CHECK(!finished.load(std::memory_order_acquire));
+
+    CHECK(loop.run_once(EventLoop::Duration::min()).has_value());
+    CHECK(finished.load(std::memory_order_acquire));
+    CHECK(!outcome.has_value());
+    CHECK(outcome.error() == Errc::cancelled);
+    CHECK(loop.outstanding() == 0);
+}
+
+void test_stop_token_outlives_its_scope() {
+    test::section("the stop state outlives the scope that owned it");
+
+    Result<EventLoop> created = EventLoop::create();
+    CHECK(created.has_value());
+    EventLoop& loop = created.value();
+
+    std::atomic<bool> finished{false};
+    Result<void> outcome{};
+    OperationOptions options;
+    {
+        // `OperationOptions` copies the token, so the shared stop state stays
+        // alive after its `stop_source` is gone. Without that, an operation
+        // still winding down after a TaskScope exits would hold a dead token.
+        std::stop_source source;
+        options.stop = source.get_token();
+        CHECK(options.stop.stop_possible());
+    }
+    CHECK(!options.stop.stop_requested());
+
+    struct Sleeper {
+        static DetachedTask go(EventLoop& target,
+                               OperationOptions options,
+                               Result<void>& slot,
+                               std::atomic<bool>& flag) {
+            slot = co_await target.sleep_for(5ms, std::move(options));
+            flag.store(true, std::memory_order_release);
+            co_return;
+        }
+    };
+
+    Sleeper::go(loop, options, outcome, finished);
+    for (int i = 0; i < 200 && !finished.load(std::memory_order_acquire); ++i) {
+        CHECK(loop.run_once(50ms).has_value());
+    }
+    CHECK(finished.load(std::memory_order_acquire));
+    CHECK(outcome.has_value());
+}
+
+// ── contract violations, asserted out-of-process ─────────────────────────────
+
+/// Each mode commits exactly one violation and must not return.
+int run_contract_violation(std::string_view mode) {
+    std::set_terminate([] { std::_Exit(77); });
+
+    Result<EventLoop> created = EventLoop::create();
+    if (!created) {
+        return 2;
+    }
+
+    if (mode == "destroy-during-dispatch") {
+        // A posted callable runs while the loop is dispatching a batch, with
+        // operations already taken out of its queues.
+        auto* loop = new Result<EventLoop>{std::move(created)};
+        loop->value().post([loop] { delete loop; });
+        (void)loop->value().run_once(0ms);
+    } else if (mode == "reentrant-run-once") {
+        EventLoop& loop = created.value();
+        loop.post([&loop] { (void)loop.run_once(0ms); });
+        (void)loop.run_once(0ms);
+    } else {
+        return 2;
+    }
+    return 0;  // reaching here means the violation was not caught
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2) {
+        return run_contract_violation(argv[1]);
+    }
     test_create_and_backend();
     test_post_and_stop();
     test_timers();
@@ -511,5 +1219,15 @@ int main() {
     test_double_waiter_is_refused();
     test_destruction_wakes_suspended();
     test_yield_returns_to_loop();
+    test_options_rejected_before_submit();
+    test_cancel_in_flight();
+    test_cancel_leaves_other_direction_armed();
+    test_deadline_on_a_suspended_read();
+    test_deadline_is_absolute_across_retries();
+    test_sleep_deadline_beats_wake_up();
+    test_completion_beats_deadline_in_one_batch();
+    test_shutdown_cancels_deadlines_too();
+    test_stop_from_another_thread();
+    test_stop_token_outlives_its_scope();
     return test::summary();
 }
