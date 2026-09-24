@@ -20,7 +20,8 @@ target_include_directories(continuo_transport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR
 target_compile_features(continuo_transport PUBLIC cxx_std_23)
 target_link_libraries(continuo_transport
     PUBLIC continuo::core
-    PRIVATE continuo::warnings
+    # See modules/core/CMakeLists.txt for why this is wrapped.
+    PRIVATE $<BUILD_INTERFACE:continuo::warnings>
 )
 
 if(WIN32)
@@ -30,7 +31,13 @@ endif()
 set_target_properties(continuo_transport PROPERTIES
     OUTPUT_NAME continuo-transport
     VERSION ${PROJECT_VERSION}
+    # The build-tree ALIAS is continuo::transport; without EXPORT_NAME the export
+    # uses the real target name and installs continuo::continuo_transport instead,
+    # so a consumer's link line would differ from an embedder's for no reason.
+    EXPORT_NAME transport
 )
+
+continuo_install_module(continuo_transport)
 
 if(CONTINUO_BUILD_TESTS)
     add_subdirectory(tests)

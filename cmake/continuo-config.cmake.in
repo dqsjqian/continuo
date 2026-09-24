@@ -1,0 +1,44 @@
+@PACKAGE_INIT@
+
+# Package config for Continuo.
+#
+#   find_package(continuo REQUIRED)
+#   target_link_libraries(my_app PRIVATE continuo::http continuo::transport)
+#
+# Available targets: continuo::core, continuo::transport, continuo::http, and
+# continuo::tls when the installation was built with TLS enabled.
+
+set(CONTINUO_WITH_TLS @CONTINUO_ENABLE_TLS@)
+
+# TLS is optional, so an installation built without it genuinely has no
+# `continuo::tls`. Checked before anything else, and reported by hand: CMake's
+# own wording for a missing component names neither the component nor the
+# cause, and a consumer who links the target without asking for the component
+# only finds out at build time, with a message about a target that "does not
+# exist" and no hint as to why.
+if(NOT CONTINUO_WITH_TLS AND "tls" IN_LIST continuo_FIND_COMPONENTS)
+    set(continuo_FOUND FALSE)
+    set(continuo_NOT_FOUND_MESSAGE
+        "this Continuo installation was built with CONTINUO_ENABLE_TLS=OFF, so continuo::tls \
+does not exist in it. Rebuild and reinstall Continuo with -DCONTINUO_ENABLE_TLS=ON, or drop \
+the tls component from find_package().")
+    return()
+endif()
+
+include(CMakeFindDependencyMacro)
+
+# continuo::core links Threads publicly, so every consumer needs it resolved.
+find_dependency(Threads)
+
+if(CONTINUO_WITH_TLS)
+    find_dependency(OpenSSL 3.0 COMPONENTS SSL Crypto)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/continuoTargets.cmake")
+
+set(continuo_core_FOUND TRUE)
+set(continuo_transport_FOUND TRUE)
+set(continuo_http_FOUND TRUE)
+set(continuo_tls_FOUND ${CONTINUO_WITH_TLS})
+
+check_required_components(continuo)

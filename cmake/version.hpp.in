@@ -1,0 +1,31 @@
+#pragma once
+
+// continuo/core/version.hpp — generated from the project version in CMake.
+//
+// Generated rather than hand-written so that the version cannot disagree with
+// the one the package config and the installed libraries carry. Editing this
+// file has no effect; change `project(continuo VERSION ...)` instead.
+//
+// The encoded form exists so that a consumer can compile against two versions
+// of Continuo while the API is still moving:
+//
+//   #if CONTINUO_VERSION >= CONTINUO_VERSION_NUMBER(0, 3, 0)
+//       // use the newer signature
+//   #endif
+//
+// While the major version is 0, breaking changes land in the minor version —
+// so the middle number is the one worth testing.
+
+#define CONTINUO_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define CONTINUO_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define CONTINUO_VERSION_PATCH @PROJECT_VERSION_PATCH@
+
+#define CONTINUO_VERSION_STRING "@PROJECT_VERSION@"
+
+/// Pack a version into one comparable integer.
+#define CONTINUO_VERSION_NUMBER(major, minor, patch) \
+    ((major) * 10000 + (minor) * 100 + (patch))
+
+#define CONTINUO_VERSION                                                     \
+    CONTINUO_VERSION_NUMBER(CONTINUO_VERSION_MAJOR, CONTINUO_VERSION_MINOR,  \
+                            CONTINUO_VERSION_PATCH)
