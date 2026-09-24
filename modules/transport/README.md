@@ -14,6 +14,13 @@ concept accepts one without naming it. Implemented here:
 This layer may include `continuo/core/…` and nothing above it; the layering
 check in `tools/ci/check_layering.py` fails the build otherwise.
 
+Every operation takes `OperationOptions` and forwards it to the event loop
+unchanged, which is what makes `Socket` a `BoundedStream`. `connect` keeps it
+separate from `ConnectOptions`: the latter configures a socket and may be
+reused across calls, while a stop token and an absolute deadline belong to one
+call, and storing them in a reusable struct is a deadline that silently belongs
+to whichever call ran first.
+
 ## Why `ListenOptions::exclusive` exists
 
 This option is where the disagreement that started the project gets an explicit
@@ -35,6 +42,3 @@ its own contract rather than being forced through `AsyncStream` — see the
 transport section of `docs/ARCHITECTURE.md`. Writing those before that contract
 exists is how a library ends up with a stream abstraction that quietly lies
 about one of its transports.
-
-**Per-operation cancellation and deadlines.** `OperationOptions` currently
-stops at `continuo::EventLoop`; nothing in this layer forwards it yet.

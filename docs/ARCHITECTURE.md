@@ -33,7 +33,7 @@ and remaining acceptance work must be described separately.
 | Concern | Current foundation | Remaining acceptance work |
 |---|---|---|
 | Execution and ownership | Lazy, move-only `Task` that terminates rather than destroy a started, unfinished frame; single-threaded `TaskScope` with immediate spawn and one-shot join; executor seam; single-threaded `EventLoop` whose operations carry never-reused identities | Explicit operation/buffer ownership across layers and continued join/drain validation; loop destruction during dispatch is refused rather than supported |
-| Cancellation and deadlines | `OperationOptions` gives every core operation a stop token and an absolute deadline on both backends, with one resolution point per operation; scope cooperative stop, timers and loop stop; yield is tracked through shutdown | Propagation through transport, TLS and HTTP — **the stack above `core` does not forward options yet**; Windows semantics rest on CI alone; `stop()` is still a stop-pumping request, not I/O cancellation |
+| Cancellation and deadlines | `OperationOptions` on every core operation, forwarded through TCP, TLS and the HTTP connection loop; `BoundedStream` distinguishes streams that can honour it; HTTP converts `idle_timeout` / `request_timeout` into a fresh deadline per request | Runtime evidence on Windows, where the IOCP semantics rest on CI alone; a cancelled IOCP read may lose bytes, so that connection must be closed; `stop()` is still a stop-pumping request, not I/O cancellation |
 | Transport and composition | TCP and completion-shaped kqueue/epoll/IOCP implementations; stream concepts | Equivalent observable semantics across backends, verified teardown, bounded queues; datagram contracts before UDP expansion |
 | Protocols and data flow | HTTP/1.1 parser, serializer and connection loop; buffered request bodies | Protocol conformance evidence, streamed bodies, slow-consumer backpressure and bounded aggregate memory |
 | Security and robustness | Optional OpenSSL TLS stream, parser limits and negative-input tests | Lifecycle-safe TLS cancellation, broader fuzzing, failure injection and resource-exhaustion tests |
@@ -187,6 +187,15 @@ transport, not an implemented capability. Richer operations can be composed
 on the minimal contract; the existing `write_all` helper is tested with a
 non-socket `MemoryStream`.
 
+`BoundedStream` refines this concept for streams that additionally accept an
+`OperationOptions`. It is a refinement rather than an extension of
+`AsyncStream` because the options parameter is defaulted, so every existing
+one-argument call and every existing implementer stays valid. The split exists
+because cancellation cannot be composed from the outside: only the layer that
+waits can stop waiting, so a wrapper cannot supply the capability on behalf of
+a stream that lacks it. Handing a budget to a stream that cannot honour it is
+therefore a compile error, not a deadline that silently does nothing.
+
 An asynchronous byte stream is not the same as a streamed HTTP body. Request
 bodies are currently buffered before handler delivery. End-to-end streaming
 must additionally define buffer ownership, incremental consumption, early
@@ -255,12 +264,13 @@ These are broader design/acceptance requirements, beyond the scope foundation:
 - **Ownership:** distinguish owned sockets, operation state and coroutine
   frames from borrowed streams and spans. Specify the destruction order of
   task, stream and loop, and which objects must survive kernel completion.
-- **Cancellation and deadlines:** `core` now carries a caller's stop token and
-  absolute deadline per operation, resolves each exactly once, and fixes the
-  precedence of the close/completion/cancellation/timeout races (see below).
-  Propagating them through transport, TLS and composed HTTP is still
-  outstanding, and until that lands the stack above `core` cannot be said to
-  support cancellation.
+- **Cancellation and deadlines:** a caller's stop token and absolute deadline
+  travel from `EventLoop` through TCP and TLS to the HTTP connection loop, each
+  operation resolving exactly once, with the precedence of the
+  close/completion/cancellation/timeout races fixed (see below). What composes
+  them for free is the deadline being absolute: no layer subtracts elapsed
+  time. What remains is evidence rather than mechanism — the Windows half has
+  no local runtime coverage at all.
 - **Backpressure:** bound outstanding operations, buffered bytes and work
   queues; define whether reaching each limit suspends or rejects a producer.
   Test slow peers and stalled consumers. A parser size limit or bounded TLS
@@ -345,6 +355,57 @@ pointer to an awaiter living in a coroutine frame.
 Local tests cover the loop thread and an off-thread request that is joined
 before the loop is pumped. Neither is a concurrency stress test, and no claim
 is made about racing a request against a resolution.
+
+### Composition through the stack
+
+`Socket::read_some` / `write_some`, `Listener::accept`, `connect`, and every
+`tls::Stream` operation take an `OperationOptions` and forward it downwards
+unchanged. That "unchanged" is the whole benefit of the deadline being
+absolute: one `{.deadline = T}` given to a TLS handshake becomes the same `T`
+on each of the arbitrarily many underlying reads and writes it performs, so
+"no underlying operation may extend past T" composes into "this handshake must
+finish by T" with no layer subtracting elapsed time. A duration would have
+required that subtraction at every level, and every level would have been a
+separate opportunity to get it wrong.
+
+`tls::Stream` requires a `BoundedStream` underneath for the same reason: a TLS
+operation drives its transport an unbounded number of times, so a handshake
+over a transport that cannot be cut short is a hang waiting to happen. The
+requirement is stated in the type rather than in a comment.
+
+`connect` keeps `OperationOptions` separate from `ConnectOptions`. The latter
+configures a socket and is meant to be reused; a stop token and an absolute
+deadline belong to one call, and storing them in a reusable struct produces a
+deadline that silently belongs to whichever call ran first.
+
+### HTTP takes durations, not a deadline
+
+`ServerOptions::idle_timeout` bounds waiting *between* requests;
+`request_timeout` bounds one exchange from its first byte to its last response
+byte, handler included. `serve_connection` converts whichever applies into a
+fresh absolute deadline on every iteration, and re-converts when the first byte
+of a request arrives.
+
+A single deadline would have been simpler and wrong: it would cover the whole
+keep-alive connection, so the hundredth request would inherit whatever budget
+the first one left. Two windows also distinguish two different failures — a
+peer that says nothing from a peer that says it slowly.
+
+Their outcomes deliberately differ. Idle expiry between requests returns
+**success**, because a quiet keep-alive connection being closed is how one
+normally ends; it is the same answer a polite close gets, and reporting it as
+an error would make every ordinary connection teardown look like a fault.
+Request expiry is `Errc::timed_out` and closes the connection.
+
+No 408 is sent on expiry. Writing one requires the stream under the deadline
+that just elapsed, so announcing the timeout would need a second budget the
+caller never granted — and a response written outside the caller's budget is
+the thing these options exist to prevent.
+
+Both windows default to zero, which disables them. That default is a
+compatibility choice, not a recommendation: it leaves a slow peer bounded by
+`limits` alone, which bounds one message's size and not the time it may take
+to arrive.
 
 ## What CI found that local testing could not
 
@@ -564,11 +625,15 @@ them.
 terminates instead of being undefined, and so does destroying, replacing or
 re-entering the loop while it is dispatching a batch. Both are refusals, not
 recoveries: the loop cannot make either safe by itself, so it says so loudly
-instead of continuing into a use-after-free. Cancellation is a `core` facility
-only — transport, TLS and HTTP do not forward `OperationOptions` yet — and the
-Windows half of it has no local runtime evidence at all. This foundation is
-neither production-readiness nor a complete cancellation-safety claim.
+instead of continuing into a use-after-free.
+
+Cancellation now reaches every layer, but two limits are worth stating plainly.
+The Windows half has no local runtime evidence, only CI. And a cancelled read
+or write on IOCP can discard bytes the kernel had already moved, so that
+connection is finished — a caller that reuses it reads a stream with a hole in
+it. This foundation is neither production-readiness nor a complete
+cancellation-safety claim.
 
 **Deliberately absent.** UDP, routing, HTTP/2, a full HTTP client, native OS trust
-store integration, mTLS policy, cancellation/deadline propagation above `core`,
-and multi-threaded loops.
+store integration, mTLS policy, streamed request bodies, end-to-end resource
+bounds, and multi-threaded loops.

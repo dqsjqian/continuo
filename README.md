@@ -58,14 +58,14 @@ flowchart TB
 | 领域 | 已实现的基础 | 尚未完成 / 待验证 |
 |---|---|---|
 | 执行与生命周期 | 惰性、仅可移动的 `Task`（销毁已启动未完成的帧会终止）；单线程 `TaskScope` 的 spawn / join 与协作 stop token；单线程 `EventLoop`、定时器与投递 | 跨层 join / drain 契约与持续生命周期验证；派发中销毁事件循环是明确拒绝，而非支持 |
-| 取消与截止时间 | `core` 层每个操作都接受 stop token 与绝对截止时间（`read`/`write`/`accept`/`connect`/`sleep`/`wait_*`），双后端实现，单一解析点、恰好一次 | **transport / TLS / HTTP 尚未透传**，因此整栈还不能说支持取消；Windows 语义只有 CI 证据 |
+| 取消与截止时间 | `OperationOptions` 贯穿 `EventLoop` → TCP → TLS → HTTP 连接循环；`BoundedStream` 区分「能承载预算」的流；HTTP 把 `idle_timeout` / `request_timeout` 逐请求换算成新的绝对截止时间 | Windows 侧只有 CI 证据，本机零运行覆盖；IOCP 上被取消的读可能丢弃内核已搬运的字节，该连接必须关闭而非复用 |
 | TCP | IPv4 / IPv6、监听、连接、短读写、默认独占绑定 | 关闭与完成竞争的持续验证；全链路操作与队列上限 |
-| TLS（可选） | OpenSSL 3、证书链和 DNS 名 / IP 验证、单 ALPN 标识、关闭通知 | 取消安全；移动端 TLS；更广泛互操作验证 |
+| TLS（可选） | OpenSSL 3、证书链和 DNS 名 / IP 验证、单 ALPN 标识、关闭通知；handshake / 读 / 写 / shutdown 均接受并向下透传 `OperationOptions` | 移动端 TLS；更广泛互操作验证 |
 | HTTP/1.1 | 增量解析、序列化、keep-alive、流水线请求处理、HEAD、分块响应 | 请求体目前有界缓冲；流式请求体、路由、完整客户端仍待实现 |
 | 安全与资源 | 解析限制、畸形输入负测、有界 TLS BIO | 端到端背压、总内存上限、广泛模糊测试与故障注入 |
 | 后续传输与协议 | TCP 流契约作为起点 | UDP / 数据报、DNS、更多协议与后端；HTTP/2、HTTP/3 尚未实现 |
 
-表中的“已实现”不代表相应领域已经完整验收。`stop()` 仍然 **不是取消**：它只请求 `run()` 返回。逐操作取消是 `OperationOptions` 的职责，且目前只到 `core` 一层。
+表中的“已实现”不代表相应领域已经完整验收。`stop()` 仍然 **不是取消**：它只请求 `run()` 返回。逐操作取消是 `OperationOptions` 的职责，它现在贯穿整栈——但「机制到位」不等于「证据到位」，Windows 的那一半只有 CI 跑过。
 
 ### 平台与证据边界
 
@@ -180,7 +180,7 @@ continuo::Task<int> count_after_delay(continuo::EventLoop& loop) {
 - `TaskScope` 不可复制或移动。`spawn(Task<void>)` 接管未启动、非空的任务并立即启动；已完成的子任务帧及时释放，不等到 scope 析构。
 - `join()` **只能调用一次，调用即关闭 spawn 接纳**，返回的惰性 `Task<void>` 必须驱动至完成。即使 `pending() == 0`，使用过的 scope 仍须 join。
 - 第一个观察到的子任务异常触发 `request_stop()`；join 等待所有子任务与帧清理后才重抛该异常，不提前丢弃兄弟任务。
-- `get_stop_token()` / `request_stop()` 本身只是协作信号。把该 token 交给 `OperationOptions{.stop = ...}` 才会真正取消 `core` 的 I/O；scope 不会自动这么做。scope 操作、子任务完成和 stop 回调须在同一线程执行。
+- `get_stop_token()` / `request_stop()` 本身只是协作信号。把该 token 交给 `OperationOptions{.stop = ...}` 才会真正取消 I/O；scope 不会自动这么做。scope 操作、子任务完成和 stop 回调须在同一线程执行。
 - 仅从未 spawn / join 的空 scope 可直接析构。其余 scope 必须等 join 完成（包括清理完成后重抛异常）；提前析构或销毁正在等待的 join 会 `std::terminate()`。丢弃未启动的 join 也不能免除析构前完成 join 的义务。这是 fail-fast，不是隐式取消或后台清理，更不会悄悄释放仍被 I/O 引用的子帧。
 - await 空的或已被消费的 `Task` 会抛出 `std::logic_error`；向 scope 传入空任务会抛出 `std::invalid_argument`。
 
@@ -255,6 +255,31 @@ continuo::Task<void> read_until_stopped(continuo::EventLoop& loop,
 
 stop 可以从**任意线程**请求，但一律在循环线程交付：回调只记录操作 id 并唤醒循环。这既避开了「`stop_callback` 在 `await_suspend` 内部同步触发」的重入陷阱，也是跨线程请求安全的原因。
 
+### 整栈透传：一个绝对时间点，逐层不做减法
+
+`OperationOptions` 不止停在 `EventLoop`：`Socket::read_some` / `write_some`、`Listener::accept`、`connect`、`tls::Stream` 的 handshake / 读 / 写 / shutdown 都接受它并原样往下传。
+
+这正是**绝对**截止时间的红利。交给 `tls::Stream` 的一个 `{.deadline = T}` 会原样转发给每一次底层读写，于是「任何底层操作都不得越过 T」自然组合成「整个 handshake 必须在 T 之前结束」，**没有任何一层需要扣减已耗时间**。若换成时长，每一层都得自己做减法，而且每一层都会算错。
+
+`AsyncStream` 概念**一行未改**：options 是带默认值的参数，单参调用依然成立。新增的是一个细化概念 `BoundedStream`，用于确实能承载 options 的流——因为取消无法从外部包装出来，只有真正在等待的那一层才能停止等待。不接受 options 的流在别处照用，只在「有人要把预算传下来」的位置变成**编译错误**，而不是一个静默失效的截止时间。
+
+`tls::Stream` 因此要求底层是 `BoundedStream`：一次 TLS 操作会驱动底层任意多次，底层若无法被中断，handshake 就是一个随时会挂死的等待。
+
+### HTTP：两个时长，而不是一个截止时间
+
+`ServerOptions` 收的是 `idle_timeout`（请求之间的空等）与 `request_timeout`（首字节到响应写完），`serve_connection` 每轮把它们换算成新的绝对时间点。若只收一个截止时间，它会覆盖整条 keep-alive 连接，那么第 100 个请求只能用第 1 个请求剩下的预算——没有哪个服务器想要这个。两个窗口也区分了两种不同的失败：对端**不说话**，和对端**说得很慢**。
+
+两者的结果**故意不同**：
+
+| 何时到期 | 结果 |
+|---|---|
+| 请求之间空等超时 | **成功**返回——安静的 keep-alive 连接被关掉是它正常的结束方式，和对端礼貌关闭是同一个答案 |
+| 请求进行中超时 | `Errc::timed_out` 并关闭连接 |
+
+不发 408：写它需要用那个刚刚过期的截止时间去操作同一条流，宣告超时就得再要一份调用方从未授予的预算。
+
+两个窗口**默认都是 0，即关闭**。暴露在公网的服务应当显式设置；留在默认值意味着慢速对端只受消息大小限制，不受时间限制。
+
 ## 构建与接入
 
 需要 **CMake 3.20+、C++23 编译器，以及同时提供 `std::expected` 和 `std::stop_token` 的标准库**。默认非 TLS 构建没有第三方依赖；TLS 显式启用后需要 OpenSSL 3。
@@ -303,8 +328,8 @@ python3 tools/ci/check_layering.py
 
 接下来的优先级：
 
-1. **把取消与截止时间透传到 transport / TLS / HTTP**：目前只有 `core` 支持，整栈尚不支持。
-2. **再建立端到端资源契约**：流式请求体、慢消费者背压、队列与内存上限。
+1. **建立端到端资源契约**：流式请求体、慢消费者背压、队列与内存上限。目前请求体是限额内缓冲，单条消息有上限，但连接级和进程级没有。
+2. **补齐 Windows 的运行证据**：取消语义在 IOCP 上只有 CI 编译加测试通过，本机无法运行。
 3. **以证据支持扩展**：跨平台负测、sanitizer、模糊测试、互操作与可复现基准；随后按需求扩展传输和协议。
 
 设计依据与详细验收要求见 [架构文档](docs/ARCHITECTURE.md)。路线是方向，不是已交付功能或发布时间承诺。

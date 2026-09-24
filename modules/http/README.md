@@ -48,7 +48,7 @@ can claim. Negative tests over crafted input are not the same as either.
 **HTTP/2 and HTTP/3.** Separate slots when they come, and they will talk to
 `core` only. Sibling protocol modules never include each other.
 
-**Per-operation cancellation and deadlines.** `OperationOptions` stops at
-`continuo::EventLoop`; neither `serve_connection` nor the stream concept
-forwards it yet, so a slow peer is bounded by message limits rather than by
-time.
+**A time bound that is on by default.** `ServerOptions::idle_timeout` and
+`request_timeout` exist and are forwarded, but both default to zero, which is
+off. A server exposed to the internet should set them; leaving them at the
+default bounds a slow peer by message size only.

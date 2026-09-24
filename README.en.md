@@ -58,14 +58,14 @@ Solid arrows show dependencies; dashed arrows show application composition. HTTP
 | Area | Implemented foundation | Incomplete / still needs validation |
 |---|---|---|
 | Execution and lifetimes | Lazy, move-only `Task` that terminates rather than destroy a started, unfinished frame; single-threaded `TaskScope` spawn / join and cooperative stop token; single-threaded `EventLoop`, timers and posted work | Cross-layer join / drain contracts and continued lifetime validation; destroying the loop mid-dispatch is refused rather than supported |
-| Cancellation and deadlines | Every `core` operation accepts a stop token and an absolute deadline (`read`/`write`/`accept`/`connect`/`sleep`/`wait_*`) on both backends, resolving exactly once through one point | **Transport, TLS and HTTP do not forward them yet**, so the stack above `core` cannot be said to support cancellation; the Windows semantics rest on CI alone |
+| Cancellation and deadlines | `OperationOptions` travels from `EventLoop` through TCP and TLS to the HTTP connection loop; `BoundedStream` marks the streams that can honour it; HTTP converts `idle_timeout` / `request_timeout` into a fresh absolute deadline per request | The Windows side has CI evidence only and none locally; a cancelled IOCP read may discard bytes the kernel already moved, so that connection must be closed rather than reused |
 | TCP | IPv4 / IPv6, listen, connect, short transfers, exclusive binding by default | Continued close / completion race validation; end-to-end operation and queue bounds |
-| TLS (optional) | OpenSSL 3, certificate-chain and DNS-name / IP verification, one ALPN identifier, close notifications | Cancellation safety; mobile TLS; broader interoperability evidence |
+| TLS (optional) | OpenSSL 3, certificate-chain and DNS-name / IP verification, one ALPN identifier, close notifications; handshake / read / write / shutdown accept `OperationOptions` and forward it downwards | Mobile TLS; broader interoperability evidence |
 | HTTP/1.1 | Incremental parsing, serialization, keep-alive, pipelined request handling, HEAD, chunked responses | Request bodies currently use bounded buffering; streaming requests, routing and a complete client remain unimplemented |
 | Security and resources | Parser limits, malformed-input tests, bounded TLS BIO | End-to-end backpressure, aggregate memory bounds, broader fuzzing and failure injection |
 | Future transports and protocols | TCP stream contracts as a starting point | UDP / datagrams, DNS, further protocols and backends; HTTP/2 and HTTP/3 are not implemented |
 
-“Implemented” does not mean that an area has passed complete acceptance testing. `stop()` is still **not cancellation**: it asks `run()` to return. Per-operation cancellation is what `OperationOptions` is for, and it currently reaches `core` only.
+“Implemented” does not mean that an area has passed complete acceptance testing. `stop()` is still **not cancellation**: it asks `run()` to return. Per-operation cancellation is what `OperationOptions` is for, and it now reaches every layer — but a mechanism being in place is not the same as evidence for it, and the Windows half has only ever run on CI.
 
 ### Platforms and evidence
 
@@ -255,6 +255,31 @@ Resolution rules:
 
 A stop may be requested from **any thread**, but is always delivered on the loop thread: the callback records an operation id and nudges the loop. That avoids the re-entrancy trap of a `std::stop_callback` firing synchronously inside `await_suspend`, and is also what makes an off-thread request safe.
 
+### Forwarded through the stack: one absolute point, no arithmetic per layer
+
+`OperationOptions` does not stop at `EventLoop`. `Socket::read_some` / `write_some`, `Listener::accept`, `connect`, and `tls::Stream`'s handshake / read / write / shutdown all take it and pass it down unchanged.
+
+This is the dividend of the deadline being **absolute**. One `{.deadline = T}` handed to `tls::Stream` is forwarded verbatim to every underlying read and write, so “no underlying operation may extend past T” composes into “this handshake must finish by T” with **no layer subtracting elapsed time**. A duration would have required that arithmetic at every level, and every level would have got it slightly wrong.
+
+The `AsyncStream` concept is **unchanged**: the options parameter has a default, so every one-argument call is still valid. What is new is a refinement, `BoundedStream`, for streams that genuinely accept options — because cancellation cannot be composed from the outside; only the layer that waits can stop waiting. A stream that does not accept options stays usable everywhere else, and becomes a **compile error** only where a budget is being handed down, rather than a deadline that quietly does nothing.
+
+`tls::Stream` therefore requires a `BoundedStream` underneath: a TLS operation drives its transport an unbounded number of times, so a handshake over a transport that cannot be cut short is a hang waiting to happen.
+
+### HTTP: two durations rather than one deadline
+
+`ServerOptions` takes `idle_timeout` (waiting between requests) and `request_timeout` (first byte through to the response being written), and `serve_connection` converts them into a fresh absolute point on every iteration. A single deadline would have covered the whole keep-alive connection, so its hundredth request would inherit whatever the first one left — not what any server wants. Two windows also separate two different failures: a peer that says **nothing**, and a peer that says it **slowly**.
+
+Their outcomes deliberately differ:
+
+| What expired | Outcome |
+|---|---|
+| The idle window, between requests | **Success** — a quiet keep-alive connection being closed is how one normally ends, the same answer a polite close gets |
+| The request window, mid-exchange | `Errc::timed_out`, and the connection closes |
+
+No 408 is sent: writing one needs the stream under the deadline that just expired, so announcing the timeout would take a second budget the caller never granted.
+
+Both windows **default to zero, meaning off**. A server exposed to the internet should set them; leaving them at the default bounds a slow peer by message size only, not by time.
+
 ## Build and integrate
 
 Requires **CMake 3.20+, a C++23 compiler and a standard library providing both `std::expected` and `std::stop_token`**. The default non-TLS build has no third-party dependency. Enabling TLS explicitly requires OpenSSL 3.
@@ -303,8 +328,8 @@ python3 tools/ci/check_layering.py
 
 Next priorities:
 
-1. **Forward cancellation and deadlines through transport, TLS and HTTP:** only `core` supports them today, so the stack as a whole does not.
-2. **Establish end-to-end resource contracts:** streaming request bodies, slow-consumer backpressure, queue and memory limits.
+1. **Establish end-to-end resource contracts:** streaming request bodies, slow-consumer backpressure, queue and memory limits. Bodies are buffered under a per-message cap today; there is no per-connection or per-process bound.
+2. **Get runtime evidence on Windows:** the IOCP cancellation semantics have only ever been compiled and tested by CI, never run on the development machine.
 3. **Expand with evidence:** cross-platform negative tests, sanitizers, fuzzing, interoperability and reproducible benchmarks; then additional transports and protocols as needed.
 
 See the [architecture document](docs/ARCHITECTURE.md) for design rationale and detailed acceptance criteria. The roadmap describes direction, not shipped functionality or release dates.
