@@ -1,35 +1,40 @@
-# modules/transport — reserved slot
+# modules/transport — TCP
 
-TCP, UDP, and Unix-domain transports live here: `Listener`, `Connector`,
-`Socket`, and the readiness backends behind them (kqueue / epoll / IOCP).
+`Socket` models `continuo::AsyncStream`, so a protocol written against the
+concept accepts one without naming it. Implemented here:
 
-Empty in v0.1 on purpose. A transport is only worth writing once the event loop
-and the readiness abstraction in `modules/core` are settled — writing sockets
-first is how a library ends up with its poll loop welded to one protocol.
+- `Endpoint` — numeric IPv4 / IPv6 addresses. No name resolution: DNS is a
+  protocol, and it belongs in its own module rather than inside the address
+  type every transport depends on.
+- `Listener` — `bind` with explicit `ListenOptions`, and `accept`.
+- `Socket` — `read_some` / `write_some` with short-transfer semantics,
+  `shutdown_send`, and `close`.
+- `connect` — an outgoing connection with `ConnectOptions`.
 
-Shape this will take, per `docs/ARCHITECTURE.md`:
+This layer may include `continuo/core/…` and nothing above it; the layering
+check in `tools/ci/check_layering.py` fails the build otherwise.
 
-```cpp
-namespace continuo::tcp {
+## Why `ListenOptions::exclusive` exists
 
-class Listener {
-public:
-    static Result<Listener> bind(const Endpoint& endpoint, ListenOptions options = {});
-    Task<Result<Socket>> accept();
-};
+This option is where the disagreement that started the project gets an explicit
+home. `SO_REUSEADDR` means two different things: on POSIX it permits rebinding
+a port left in `TIME_WAIT`, while on Windows the same constant lets a second
+process **steal** a port another process is actively bound to — so two servers
+both "successfully" listen on one port and split the incoming connections
+between them.
 
-class Socket {  // models continuo::AsyncStream
-public:
-    Task<Result<std::size_t>> read_some(std::span<std::byte> destination);
-    Task<Result<std::size_t>> write_some(std::span<const std::byte> source);
-    void close();
-};
+Continuo therefore does not expose `SO_REUSEADDR` as a portable flag. It
+exposes the *intent*, and each platform implements that intent with whatever
+combination of socket options actually produces it. `tcp.hpp` carries the full
+reasoning; this is a summary, not the specification.
 
-}  // namespace continuo::tcp
-```
+## Not here, and why
 
-`ListenOptions` is where the bind semantics that started this project get an
-explicit home: exclusive binding is a documented choice with a platform-correct
-default, not a per-OS surprise a consumer discovers in production.
+**UDP and Unix-domain sockets.** A datagram is not a byte stream, so it needs
+its own contract rather than being forced through `AsyncStream` — see the
+transport section of `docs/ARCHITECTURE.md`. Writing those before that contract
+exists is how a library ends up with a stream abstraction that quietly lies
+about one of its transports.
 
-This layer may include `continuo/core/…` and nothing above it.
+**Per-operation cancellation and deadlines.** `OperationOptions` currently
+stops at `continuo::EventLoop`; nothing in this layer forwards it yet.
