@@ -294,9 +294,11 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
         while (!head_ready || !body_drained) {
             const Result<ParseStep> step = parser.parse(input);
             if (!step) {
-                // The request is malformed. Answer once, then stop: the stream
-                // position is no longer trustworthy.
-                static_cast<void>(co_await detail::send_error(stream, 400, io));
+                // The request is malformed or over budget. Answer once with
+                // the status that matches — 413 for sizes, 400 for grammar —
+                // then stop: the stream position is no longer trustworthy.
+                const unsigned status = step.error() == Errc::limit_exceeded ? 413u : 400u;
+                static_cast<void>(co_await detail::send_error(stream, status, io));
                 co_return fail(step.error());
             }
 

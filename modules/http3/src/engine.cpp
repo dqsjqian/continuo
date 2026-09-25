@@ -396,6 +396,9 @@ bool Engine::ready() const noexcept {
 bool Engine::peer_goaway() const noexcept {
     return impl_->remote_going;
 }
+bool Engine::is_server() const noexcept {
+    return impl_->server;
+}
 Result<std::int64_t> Engine::request(const Headers& fields, std::span<const std::uint8_t> body) {
     auto& s = *impl_;
     if (!ready() || s.server || s.going || s.remote_going ||
