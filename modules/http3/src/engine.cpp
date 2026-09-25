@@ -434,7 +434,14 @@ std::vector<Event> Engine::take_events() {
 Result<void> Engine::consume(std::int64_t id, std::size_t bytes) {
     auto& s = *impl_;
     auto it = s.streams.find(id);
-    if (s.failed || it == s.streams.end() || bytes > it->second.unread)
+    if (s.failed)
+        return std::unexpected(http3_error(invalid));
+    // A fin chunk carries no bytes; by the time the application consumes it
+    // the stream record may already have been erased (closed and fully
+    // consumed). Consuming nothing from a finished stream is not an error.
+    if (it == s.streams.end())
+        return bytes == 0 ? Result<void>{} : std::unexpected(http3_error(invalid));
+    if (bytes > it->second.unread)
         return std::unexpected(http3_error(invalid));
     if (auto r = s.transport.consume(id, bytes); !r) return r;
     it->second.unread -= bytes;
