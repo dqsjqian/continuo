@@ -190,7 +190,7 @@ No 408 is sent: announcing it would require a second budget the caller never gra
 | iOS / Android | kqueue / epoll | Cross-compilation only (non-TLS), no on-device evidence; Android requires **NDK 29+** |
 | BSD | kqueue | Portability direction, no dedicated CI evidence |
 
-Most recent all-platform CI pass: 13/13 jobs (three desktop run + sanitizers + protocols + mobile cross-compile), covering all protocol code. Commands, results, and open items: [the phase-one handoff](docs/HANDOFF.md).
+Most recent all-platform CI pass: 13/13 jobs (three desktop run + sanitizers + protocols + mobile cross-compile), covering all protocol code. Rationale and the direction of open items: [the architecture document](docs/ARCHITECTURE.md).
 
 ## 🧪 Implemented, unverified, planned
 

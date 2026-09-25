@@ -190,7 +190,7 @@ auto client = continuo::tls::Context::client({
 | iOS / Android | kqueue / epoll | 仅非 TLS 模块交叉编译，无真机运行证据；Android 需 **NDK 29+** |
 | BSD | kqueue | 后端可移植方向，无专门 CI 证据 |
 
-最近一次全平台 CI 通过：13/13 job（三桌面运行 + sanitizers + protocols + 移动交叉编译），覆盖全部协议代码。具体命令、结果与未完成项见 [一期交接](docs/HANDOFF.md)。
+最近一次全平台 CI 通过：13/13 job（三桌面运行 + sanitizers + protocols + 移动交叉编译），覆盖全部协议代码。设计依据与未完成项的方向见 [架构文档](docs/ARCHITECTURE.md)。
 
 ## 🧪 已实现、待验证与规划
 
