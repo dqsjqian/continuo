@@ -6,7 +6,15 @@
 #include <type_traits>
 
 #if !defined(__cpp_lib_expected) || __cpp_lib_expected < 202202L
-    #error "Continuo requires a C++23 standard library with std::expected"
+    // Self-diagnosing: #error text is macro-expanded, so the reported values
+    // tell a failing toolchain apart (old standard vs old library) at a glance.
+    #define CONTINUO_DIAG_STR2(x) #x
+    #define CONTINUO_DIAG_STR(x) CONTINUO_DIAG_STR2(x)
+    #if !defined(__cpp_lib_expected)
+        #error "Continuo requires a C++23 standard library with std::expected; __cpp_lib_expected is undefined here (Continuo diagnostic: __cplusplus=" CONTINUO_DIAG_STR(__cplusplus) ")"
+    #else
+        #error "Continuo requires a C++23 standard library with std::expected; __cpp_lib_expected is too old (Continuo diagnostic: __cplusplus=" CONTINUO_DIAG_STR(__cplusplus) " __cpp_lib_expected=" CONTINUO_DIAG_STR(__cpp_lib_expected) ")"
+    #endif
 #endif
 
 namespace continuo {

@@ -42,7 +42,9 @@
     #include <utility>
     #include <vector>
 
+#if defined(_MSC_VER)
     #pragma comment(lib, "ws2_32.lib")
+#endif
 
 namespace continuo {
 namespace {
@@ -515,7 +517,7 @@ public:
         // ConnectEx requires an already-bound socket; POSIX connect() binds
         // implicitly, so this step has no counterpart in the other backend.
         SOCKADDR_STORAGE local{};
-        local.ss_family = target->sa_family;
+        local.ss_family = static_cast<decltype(local.ss_family)>(target->sa_family);
         const int local_length = target->sa_family == AF_INET6
                                      ? static_cast<int>(sizeof(sockaddr_in6))
                                      : static_cast<int>(sizeof(sockaddr_in));
