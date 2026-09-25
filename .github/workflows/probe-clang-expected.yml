@@ -5,36 +5,41 @@ on:
 
 jobs:
   probe:
-    name: probe libstdc++ expected guard
+    name: probe clang 19/20 expected fix
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install clang-18 exactly like Aria CI
+      - name: Install newer clangs
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-18
+          sudo apt-get install -y clang-19 clang-20 || sudo apt-get install -y clang-19
 
-      - name: What toolchain packages exist
+      - name: Feature macros per compiler
         run: |
-          dpkg -l | grep -E "g\+\+-1[0-9]|libstdc\+\+-1[0-9]-dev|clang-18" || true
+          for cxx in clang++-18 clang++-19 clang++-20 g++-14; do
+            if command -v $cxx >/dev/null; then
+              echo "=== $cxx ==="
+              echo | $cxx -std=c++23 -x c++ -dM -E - | grep -E "__cpp_concepts|cpp_lib_expected" || echo "(none)"
+            fi
+          done
 
-      - name: Inspect the <expected> header guard
+      - name: Compile std::expected probe per compiler
         run: |
-          ls -la /usr/include/c++/14/expected
-          echo '--- first 40 lines ---'
-          head -40 /usr/include/c++/14/expected
-          echo '--- guard lines ---'
-          grep -n "if __cplusplus\|ifdef\|ifndef _GLIBCXX" /usr/include/c++/14/expected | head -10
-
-      - name: Try with g++-14 installed as well
-        run: |
-          sudo apt-get install -y g++-14
-          echo '--- macros with g++-14 present ---'
-          echo | clang++-18 -std=c++23 -x c++ -dM -E - | grep -E "__cplusplus|cpp_lib_expected" || true
           cat > /tmp/probe.cpp <<'EOF'
           #include <expected>
           std::expected<int, int> probe() { return 42; }
           int main() { return probe().value() - 42; }
           EOF
-          clang++-18 -std=c++23 /tmp/probe.cpp -o /tmp/probe && /tmp/probe && echo EXPECTED_OK_WITH_GPP14
+          for cxx in clang++-19 clang++-20 g++-14; do
+            if command -v $cxx >/dev/null; then
+              echo "=== $cxx ==="
+              $cxx -std=c++23 /tmp/probe.cpp -o /tmp/probe && /tmp/probe && echo "OK: $cxx"
+            fi
+          done
+
+      - name: Compile Continuo error.cpp with clang-19
+        if: hashFiles('/usr/bin/clang++-19') != ''
+        run: |
+          clang++-19 -std=c++23 -O2 -Wall -Wextra -Werror \
+            -Imodules/core/include -c modules/core/src/error.cpp -o /tmp/error.o && echo CONTINUO_OK_CLANG19
