@@ -128,7 +128,7 @@ private:
             // while run_child is still executing on it. Storing the frame
             // address into the scope makes the allocation observable and
             // keeps the frames separate. Harmless on every other compiler.
-            scope.frame_guard = running.address();
+            scope.frame_guard_ = running.address();
             running.resume();
         }
     };
