@@ -5,7 +5,7 @@ on:
 
 jobs:
   probe:
-    name: probe clang-18 std::expected on ubuntu-24.04
+    name: probe libstdc++ expected guard
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -15,35 +15,26 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang-18
 
-      - name: Compiler identity
+      - name: What toolchain packages exist
         run: |
-          clang++-18 --version
-          echo '--- default stdlib/header search ---'
-          echo | clang++-18 -std=c++23 -x c++ -E -v - 2>&1 | grep -A6 "#include <...> search starts here" || true
+          dpkg -l | grep -E "g\+\+-1[0-9]|libstdc\+\+-1[0-9]-dev|clang-18" || true
 
-      - name: Feature macros at -std=c++23
+      - name: Inspect the <expected> header guard
         run: |
-          echo '--- all macros matching expected/cplusplus ---'
+          ls -la /usr/include/c++/14/expected
+          echo '--- first 40 lines ---'
+          head -40 /usr/include/c++/14/expected
+          echo '--- guard lines ---'
+          grep -n "if __cplusplus\|ifdef\|ifndef _GLIBCXX" /usr/include/c++/14/expected | head -10
+
+      - name: Try with g++-14 installed as well
+        run: |
+          sudo apt-get install -y g++-14
+          echo '--- macros with g++-14 present ---'
           echo | clang++-18 -std=c++23 -x c++ -dM -E - | grep -E "__cplusplus|cpp_lib_expected" || true
-          echo '--- with explicit -stdlib=libstdc++ ---'
-          echo | clang++-18 -std=c++23 -stdlib=libstdc++ -x c++ -dM -E - | grep -E "__cplusplus|cpp_lib_expected" || true
-
-      - name: Try compiling std::expected
-        run: |
           cat > /tmp/probe.cpp <<'EOF'
           #include <expected>
           std::expected<int, int> probe() { return 42; }
           int main() { return probe().value() - 42; }
           EOF
-          echo '--- default stdlib ---'
-          clang++-18 -std=c++23 /tmp/probe.cpp -o /tmp/probe && /tmp/probe && echo DEFAULT_OK
-          echo '--- explicit libstdc++ ---'
-          clang++-18 -std=c++23 -stdlib=libstdc++ /tmp/probe.cpp -o /tmp/probe2 && /tmp/probe2 && echo LIBSTDCXX_OK
-
-      - name: Try compiling Continuo error.hpp with Aria's exact flag set
-        run: |
-          clang++-18 -std=c++23 -O3 -DNDEBUG -fPIC -fvisibility=hidden \
-            -fvisibility-inlines-hidden -Wall -Wextra -Wpedantic -Wconversion \
-            -Wsign-conversion -Wshadow -Wnon-virtual-dtor -Wold-style-cast -Werror \
-            -Imodules/core/include -c modules/core/src/error.cpp -o /tmp/error.o \
-            && echo CONTINUO_ERROR_CPP_OK
+          clang++-18 -std=c++23 /tmp/probe.cpp -o /tmp/probe && /tmp/probe && echo EXPECTED_OK_WITH_GPP14
