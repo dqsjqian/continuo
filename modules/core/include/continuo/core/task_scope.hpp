@@ -122,6 +122,13 @@ private:
         void start(TaskScope& scope) noexcept {
             handle.promise().scope = &scope;
             auto running = std::exchange(handle, {});
+            // Defeat MSVC's coroutine frame fusion (HALO). run_child's only
+            // suspend is the child task itself, so MSVC fuses the two frames
+            // into one allocation; the Task awaiter then frees that block
+            // while run_child is still executing on it. Storing the frame
+            // address into the scope makes the allocation observable and
+            // keeps the frames separate. Harmless on every other compiler.
+            scope.frame_guard = running.address();
             running.resume();
         }
     };
@@ -176,6 +183,7 @@ private:
 
     std::stop_source stop_source_;
     std::exception_ptr failure_;
+    void* frame_guard_ = nullptr;  // MSVC HALO escape hatch, see Runner::start
     std::coroutine_handle<> waiter_{};
     std::size_t pending_{0};
     bool used_{false};
