@@ -36,32 +36,10 @@ void check(bool ok, const char* message) {
     if (!ok) throw std::runtime_error(message);
 }
 
-Task<void> run(EventLoop& loop, const char* certificate, const char* key) {
-    // Server: bind first so the client has somewhere to connect.
-    auto server_socket =
-        require(transport::udp::Socket::bind(loop, Endpoint::loopback(0)));
-    const Endpoint server_address = require(server_socket.local_endpoint());
-
-    quic::Options client_options;
-    client_options.local = Endpoint::loopback(0);
-    client_options.remote = server_address;
-    client_options.ca_file = certificate;
-    client_options.peer_name = "localhost";
-    client_options.alpn = "h3";
-
-    quic::Options server_options;
-    server_options.certificate_file = certificate;
-    server_options.private_key_file = key;
-    server_options.alpn = "h3";
-
-    std::array<std::byte, 65536> initial_buffer{};
-    std::vector<std::uint8_t> initial;
-
-    TaskScope scope;
-    std::optional<UdpConnection> client;
-    std::optional<UdpConnection> server;
-
-    auto server_task = [&]() -> Task<void> {
+Task<void> server_side(transport::udp::Socket& server_socket,
+                       std::array<std::byte, 65536>& initial_buffer,
+                       std::vector<std::uint8_t>& initial, quic::Options& server_options,
+                       const Endpoint& server_address, std::optional<UdpConnection>& server) {
         // Receive the Initial datagram, then hand the socket to the
         // connection — a QUIC listener routes by connection ID; this test
         // serves exactly one client per socket.
@@ -101,9 +79,10 @@ Task<void> run(EventLoop& loop, const char* certificate, const char* key) {
 
         auto end = co_await server->read(0, {.deadline = Clock::now() + 10s});
         check(end.has_value() && end->fin, "服务端未等到客户端 FIN");
-    };
+}
 
-    auto client_task = [&]() -> Task<void> {
+Task<void> client_side(EventLoop& loop, quic::Options& client_options,
+                       std::optional<UdpConnection>& client) {
         auto connected =
             co_await UdpConnection::connect(loop, client_options, {.deadline = Clock::now() + 10s});
         if (!connected) throw std::runtime_error(std::string("客户端握手失败: ") + connected.error().message() + " (" + std::to_string(connected.error().value()) + ")");
@@ -133,10 +112,37 @@ Task<void> run(EventLoop& loop, const char* certificate, const char* key) {
         check(total == payload.size(), "客户端回显字节数不符");
         require(co_await client->write(stream, {}, true, {.deadline = Clock::now() + 10s}));
         require(co_await client->close(0, {.deadline = Clock::now() + 10s}));
-    };
+}
 
-    scope.spawn(server_task());
-    scope.spawn(client_task());
+Task<void> run(EventLoop& loop, const char* certificate, const char* key) {
+    // Server: bind first so the client has somewhere to connect.
+    auto server_socket =
+        require(transport::udp::Socket::bind(loop, Endpoint::loopback(0)));
+    const Endpoint server_address = require(server_socket.local_endpoint());
+
+    quic::Options client_options;
+    client_options.local = Endpoint::loopback(0);
+    client_options.remote = server_address;
+    client_options.ca_file = certificate;
+    client_options.peer_name = "localhost";
+    client_options.alpn = "h3";
+
+    quic::Options server_options;
+    server_options.certificate_file = certificate;
+    server_options.private_key_file = key;
+    server_options.alpn = "h3";
+
+    std::array<std::byte, 65536> initial_buffer{};
+    std::vector<std::uint8_t> initial;
+
+    TaskScope scope;
+    std::optional<UdpConnection> client;
+    std::optional<UdpConnection> server;
+
+
+    scope.spawn(server_side(server_socket, initial_buffer, initial,
+                          server_options, server_address, server));
+    scope.spawn(client_side(loop, client_options, client));
     co_await scope.join();
 }
 
