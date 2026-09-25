@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 
 using namespace continuo;
@@ -38,7 +39,7 @@ void check(bool ok, const char* message) {
 Task<void> server_side(transport::udp::Socket& server_socket,
                        std::array<std::byte, 65536>& initial_buffer,
                        std::vector<std::uint8_t>& initial, quic::Options& server_options,
-                       const Endpoint& server_address, std::optional<H3Connection>& server) {
+                       const Endpoint& server_address, std::unique_ptr<H3Connection>& server) {
         auto datagram =
             co_await server_socket.receive_from(initial_buffer, {.deadline = Clock::now() + 5s});
         check(datagram.has_value(), "服务端未收到 Initial");
@@ -54,7 +55,7 @@ Task<void> server_side(transport::udp::Socket& server_socket,
                                                     {.deadline = Clock::now() + 10s});
         check(accepted.has_value(), "服务端握手失败");
         if (!accepted) co_return;
-        server.emplace(std::move(*accepted));
+        server = std::make_unique<H3Connection>(std::move(*accepted));
 
         // 等一个请求头，回显 body，再等流结束。
         for (;;) {
@@ -79,12 +80,12 @@ Task<void> server_side(transport::udp::Socket& server_socket,
 }
 
 Task<void> client_side(EventLoop& loop, quic::Options& client_options,
-                       std::optional<H3Connection>& client) {
+                       std::unique_ptr<H3Connection>& client) {
         auto connected = co_await H3Connection::connect(loop, client_options, http3::Limits{},
                                                           {.deadline = Clock::now() + 10s});
         check(connected.has_value(), "客户端握手失败");
         if (!connected) co_return;
-        client.emplace(std::move(*connected));
+        client = std::make_unique<H3Connection>(std::move(*connected));
 
         Bytes payload(20000, 0x48);
         payload[11] = 0;  // 二进制安全
@@ -141,8 +142,8 @@ Task<void> run(EventLoop& loop, const char* certificate, const char* key) {
     std::vector<std::uint8_t> initial;
 
     TaskScope scope;
-    std::optional<H3Connection> client;
-    std::optional<H3Connection> server;
+    std::unique_ptr<H3Connection> client;
+    std::unique_ptr<H3Connection> server;
 
 
     scope.spawn(server_side(server_socket, initial_buffer, initial,
@@ -158,7 +159,7 @@ int main(int argc, char** argv) {
     auto loop = EventLoop::create();
     if (!loop) return 2;
     try {
-        loop->run_until_complete(run(*loop, argv[1], argv[2]));
+        static_cast<void>(loop->run_until_complete(run(*loop, argv[1], argv[2])));
         std::cout << "HTTP/3 over UDP loopback：握手、POST/回显 20KB、流控与关闭通过\n";
         return 0;
     } catch (const std::exception& error) {

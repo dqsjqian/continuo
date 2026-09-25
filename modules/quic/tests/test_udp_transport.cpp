@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <stop_token>
 
@@ -39,7 +40,7 @@ void check(bool ok, const char* message) {
 Task<void> server_side(transport::udp::Socket& server_socket,
                        std::array<std::byte, 65536>& initial_buffer,
                        std::vector<std::uint8_t>& initial, quic::Options& server_options,
-                       const Endpoint& server_address, std::optional<UdpConnection>& server) {
+                       const Endpoint& server_address, std::unique_ptr<UdpConnection>& server) {
         // Receive the Initial datagram, then hand the socket to the
         // connection — a QUIC listener routes by connection ID; this test
         // serves exactly one client per socket.
@@ -58,7 +59,7 @@ Task<void> server_side(transport::udp::Socket& server_socket,
                                            {.deadline = Clock::now() + 10s});
         if (!accepted) throw std::runtime_error(std::string("服务端握手失败: ") + accepted.error().message() + " (" + std::to_string(accepted.error().value()) + ")");
         if (!accepted) co_return;
-        server.emplace(std::move(*accepted));
+        server = std::make_unique<UdpConnection>(std::move(*accepted));
         check(server->negotiated_protocol() == "h3", "服务端 ALPN 不符");
 
         // Echo the stream, then say goodbye on the same one.
@@ -82,12 +83,12 @@ Task<void> server_side(transport::udp::Socket& server_socket,
 }
 
 Task<void> client_side(EventLoop& loop, quic::Options& client_options,
-                       std::optional<UdpConnection>& client) {
+                       std::unique_ptr<UdpConnection>& client) {
         auto connected =
             co_await UdpConnection::connect(loop, client_options, {.deadline = Clock::now() + 10s});
         if (!connected) throw std::runtime_error(std::string("客户端握手失败: ") + connected.error().message() + " (" + std::to_string(connected.error().value()) + ")");
         if (!connected) co_return;
-        client.emplace(std::move(*connected));
+        client = std::make_unique<UdpConnection>(std::move(*connected));
         check(client->negotiated_protocol() == "h3", "客户端 ALPN 不符");
 
         const std::int64_t stream = require(client->open_stream());
@@ -136,8 +137,8 @@ Task<void> run(EventLoop& loop, const char* certificate, const char* key) {
     std::vector<std::uint8_t> initial;
 
     TaskScope scope;
-    std::optional<UdpConnection> client;
-    std::optional<UdpConnection> server;
+    std::unique_ptr<UdpConnection> client;
+    std::unique_ptr<UdpConnection> server;
 
 
     scope.spawn(server_side(server_socket, initial_buffer, initial,
@@ -153,7 +154,7 @@ int main(int argc, char** argv) {
     auto loop = EventLoop::create();
     if (!loop) return 2;
     try {
-        loop->run_until_complete(run(*loop, argv[1], argv[2]));
+        static_cast<void>(loop->run_until_complete(run(*loop, argv[1], argv[2])));
         std::cout << "QUIC over UDP loopback：握手、200KB 双向流、流控与关闭通过\n";
         return 0;
     } catch (const std::exception& error) {
