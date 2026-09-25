@@ -15,6 +15,7 @@
 
 #include <array>
 #include <chrono>
+#include <limits>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -195,7 +196,22 @@ public:
         co_return Result<void>{};
     }
 
+    /// Flush pending output, then process one inbound datagram or one timer
+    /// expiry, whichever arrives first. Returns when that round is done.
+    [[nodiscard]] Task<Result<void>> pump(OperationOptions io = {}) {
+        if (!engine_ || !transport_) co_return fail(Errc::invalid_argument);
+        if (pumping_) co_return fail(Errc::invalid_argument);
+        pumping_ = true;
+        const PumpGuard guard{pumping_};
+        auto round = co_await do_pump(io);
+        if (!round) co_return fail(round.error());
+        co_return Result<void>{};
+    }
+
     [[nodiscard]] bool ready() const noexcept { return engine_ && engine_->ready(); }
+    [[nodiscard]] bool closed() const noexcept {
+        return !engine_ || engine_->closed();
+    }
 
 private:
     struct PumpGuard {
@@ -275,7 +291,9 @@ private:
 
         const std::uint64_t now = detail::now_ns();
         OperationOptions wait = io;
-        if (const std::uint64_t expiry = engine_->expiry(); expiry > now) {
+        // See quic: NGTCP2_INFINITY must not become a deadline (overflow spin).
+        if (const std::uint64_t expiry = engine_->expiry();
+            expiry > now && expiry != std::numeric_limits<std::uint64_t>::max()) {
             const auto deadline = EventLoop::Clock::time_point{std::chrono::nanoseconds{expiry}};
             if (!wait.deadline || deadline < *wait.deadline) wait.deadline = deadline;
         }

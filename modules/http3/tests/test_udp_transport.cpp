@@ -75,6 +75,12 @@ Task<void> server_side(transport::udp::Socket& server_socket,
             require(co_await server->respond(
                 0, {{":status", "200"}, {"content-length", std::to_string(body.size())}}, body,
                 {.deadline = Clock::now() + 10s}));
+            // Keep pumping until the client closes: destroying the connection
+            // here would drop unacknowledged response datagrams (see quic).
+            while (!server->closed()) {
+                auto round = co_await server->pump({.deadline = Clock::now() + 10s});
+                if (!round) break;
+            }
             break;
         }
 }
@@ -108,7 +114,10 @@ Task<void> client_side(EventLoop& loop, quic::Options& client_options,
         bool fin = false;
         while (!fin) {
             auto chunk = co_await client->read_body(stream, {.deadline = Clock::now() + 10s});
-            check(chunk.has_value(), "客户端读取 body 失败");
+            if (!chunk)
+                throw std::runtime_error(std::string("客户端读取 body 失败: ") +
+                                         chunk.error().message() + " (" +
+                                         std::to_string(chunk.error().value()) + ")");
             if (!chunk) co_return;
             require(client->consume(stream, chunk->data.size()));
             check(std::all_of(chunk->data.begin(), chunk->data.end(),

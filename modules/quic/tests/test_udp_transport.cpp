@@ -78,8 +78,12 @@ Task<void> server_side(transport::udp::Socket& server_socket,
         check(total == 200000, "服务端收到的字节数不符");
         require(co_await server->write(0, reply, true, {.deadline = Clock::now() + 10s}));
 
-        auto end = co_await server->read(0, {.deadline = Clock::now() + 10s});
-        check(end.has_value() && end->fin, "服务端未等到客户端 FIN");
+        // Keep pumping until the client closes the connection: destroying
+        // the connection here would drop unacknowledged echo datagrams.
+        while (!server->closed()) {
+            auto round = co_await server->pump({.deadline = Clock::now() + 10s});
+            if (!round) break;
+        }
 }
 
 Task<void> client_side(EventLoop& loop, quic::Options& client_options,
@@ -94,7 +98,9 @@ Task<void> client_side(EventLoop& loop, quic::Options& client_options,
         const std::int64_t stream = require(client->open_stream());
         quic::Bytes payload(200000, 0x5a);
         payload[7] = 0;  // 二进制安全：中间有零
-        require(co_await client->write(stream, payload, false,
+        // FIN rides with the payload: the server echoes what it received
+        // only after seeing the end of stream, so splitting them deadlocks.
+        require(co_await client->write(stream, payload, true,
                                         {.deadline = Clock::now() + 10s}));
 
         std::uint64_t total = 0;
@@ -111,7 +117,6 @@ Task<void> client_side(EventLoop& loop, quic::Options& client_options,
             fin = chunk->fin;
         }
         check(total == payload.size(), "客户端回显字节数不符");
-        require(co_await client->write(stream, {}, true, {.deadline = Clock::now() + 10s}));
         require(co_await client->close(0, {.deadline = Clock::now() + 10s}));
 }
 

@@ -17,6 +17,9 @@ if(NOT (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERS
     target_link_libraries(test_http3_udp PRIVATE continuo::http3 continuo::warnings)
     target_include_directories(test_http3_udp PRIVATE ${CMAKE_SOURCE_DIR}/modules/core/tests)
     add_test(NAME http3_udp COMMAND test_http3_udp "${CONTINUO_QUIC_TEST_CERT}" "${CONTINUO_QUIC_TEST_KEY}")
-    # Known-open: stalls in the same closing exchange as quic_udp; see HANDOFF.
+    # Known-open: the request/response head and ~20KB of the echoed body
+    # transfer over the kernel's UDP, but the final body chunk fails a
+    # consume accounting check; quic_udp (same connection layer) passes
+    # end-to-end. See docs/HANDOFF.md before flipping.
     set_tests_properties(http3_udp PROPERTIES TIMEOUT 60 WILL_FAIL TRUE)
 endif()

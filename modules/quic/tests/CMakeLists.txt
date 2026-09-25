@@ -29,8 +29,5 @@ if(NOT (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERS
     target_link_libraries(test_quic_udp PRIVATE continuo::quic continuo::warnings)
     target_include_directories(test_quic_udp PRIVATE "${CMAKE_SOURCE_DIR}/modules/core/tests")
     add_test(NAME quic_udp COMMAND test_quic_udp "${CONTINUO_QUIC_TEST_CERT}" "${CONTINUO_QUIC_TEST_KEY}")
-    # Known-open: handshake and the 200KB bidirectional transfer complete over the
-    # kernel's UDP, but the final ACK/close exchange stalls until the idle timer
-    # (ngtcp2 max_ack_delay adaptation); see docs/HANDOFF.md before flipping.
-    set_tests_properties(quic_udp PROPERTIES TIMEOUT 60 WILL_FAIL TRUE)
+    set_tests_properties(quic_udp PROPERTIES TIMEOUT 60)
 endif()

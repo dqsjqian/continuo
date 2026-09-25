@@ -393,6 +393,9 @@ std::uint64_t Engine::expiry() const noexcept {
 bool Engine::ready() const noexcept {
     return impl_->initialized && !impl_->failed;
 }
+bool Engine::closed() const noexcept {
+    return impl_->transport.closed() || impl_->failed;
+}
 bool Engine::peer_goaway() const noexcept {
     return impl_->remote_going;
 }

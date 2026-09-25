@@ -18,6 +18,7 @@
 
 #include <array>
 #include <chrono>
+#include <limits>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -274,7 +275,11 @@ private:
 
         const std::uint64_t now = detail::now_ns();
         OperationOptions wait = io;
-        if (const std::uint64_t expiry = engine_->expiry(); expiry > now) {
+        // NGTCP2_INFINITY means "no timer armed"; a time_point built from it
+        // would overflow the loop's millisecond conversion and turn the
+        // receive into an immediate-timeout spin. Only clamp to real timers.
+        if (const std::uint64_t expiry = engine_->expiry();
+            expiry > now && expiry != std::numeric_limits<std::uint64_t>::max()) {
             const auto deadline =
                 EventLoop::Clock::time_point{std::chrono::nanoseconds{expiry}};
             if (!wait.deadline || deadline < *wait.deadline) wait.deadline = deadline;

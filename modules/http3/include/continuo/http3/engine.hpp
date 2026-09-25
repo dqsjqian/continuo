@@ -41,6 +41,7 @@ public:
     bool ready() const noexcept;
     bool peer_goaway() const noexcept;
     bool is_server() const noexcept;
+    bool closed() const noexcept;
     Result<std::int64_t> request(const Headers& fields, std::span<const std::uint8_t> body = {});
     Result<void>
     respond(std::int64_t stream, const Headers& fields, std::span<const std::uint8_t> body = {});
