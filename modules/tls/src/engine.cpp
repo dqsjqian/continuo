@@ -69,9 +69,21 @@ Result<Engine> Engine::create(const Context& context, std::string_view peer_name
         ERR_clear_error();
         SSL_set_connect_state(impl->ssl);
         ERR_clear_error();
+        ASN1_OCTET_STRING* ip = a2i_IPADDRESS(name.c_str());
+#if OPENSSL_VERSION_NUMBER >= 0x40000000L
+        // OpenSSL 4.0 deprecated SSL_set1_host in favour of the split
+        // dnsname/ipaddr entry points; SSL_set_hostflags is available on
+        // both major versions and is not deprecated.
+        SSL_set_hostflags(impl->ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+        ERR_clear_error();
+        const int expected = ip ? SSL_set1_ipaddr(impl->ssl, name.c_str())
+                                : SSL_set1_dnsname(impl->ssl, name.c_str());
+        if (ip) ASN1_OCTET_STRING_free(ip);
+        if (expected != 1)
+            return fail(make_error_code(Errc::configuration_error));
+#else
         X509_VERIFY_PARAM* parameters = SSL_get0_param(impl->ssl);
         X509_VERIFY_PARAM_set_hostflags(parameters, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
-        ASN1_OCTET_STRING* ip = a2i_IPADDRESS(name.c_str());
         if (ip) {
             ASN1_OCTET_STRING_free(ip);
             ERR_clear_error();
@@ -81,6 +93,9 @@ Result<Engine> Engine::create(const Context& context, std::string_view peer_name
             ERR_clear_error();
             if (SSL_set1_host(impl->ssl, name.c_str()) != 1)
                 return fail(make_error_code(Errc::configuration_error));
+        }
+#endif
+        {
             ERR_clear_error();
             // The convenience macro expands to a C-style cast on OpenSSL 3.0.
             // Use its underlying control call with an explicit C++ cast so

@@ -357,7 +357,14 @@ Engine::create(Options options, std::span<const std::uint8_t> initial, std::uint
         auto name = s->options.peer_name.c_str();
         if (transport::Endpoint::parse(s->options.peer_name, 0)) {
             if (X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(s->ssl), name) != 1) rv = -1;
-        } else if (SSL_set1_host(s->ssl, name) != 1 ||
+        } else if (
+#if OPENSSL_VERSION_NUMBER >= 0x40000000L
+                   // OpenSSL 4.0 deprecated SSL_set1_host in favour of the
+                   // split dnsname/ipaddr entry points.
+                   SSL_set1_dnsname(s->ssl, name) != 1 ||
+#else
+                   SSL_set1_host(s->ssl, name) != 1 ||
+#endif
                    // The convenience macro expands to a C-style cast; use its
                    // underlying control call so GCC's -Wold-style-cast stays
                    // enabled, matching the tls module's precedent.
