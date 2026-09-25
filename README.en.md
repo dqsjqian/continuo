@@ -88,7 +88,7 @@ Solid arrows show dependencies; dashed arrows show application composition. HTTP
 | iOS / Android | kqueue / epoll | Non-TLS cross-compilation only; no device runtime evidence. Android needs **NDK 29 or newer** — see the build requirements below |
 | BSD | kqueue | Backend portability direction; no dedicated CI evidence |
 
-The last recorded three-desktop CI baseline is `a123370`, not evidence for this round's new protocols. This round provides macOS runtime, partial MinGW compilation and NDK29 non-TLS cross-compilation evidence only: **there is no new Windows or Linux runtime evidence for UDP / DNS / H2 / H3**. MinGW cannot replace MSVC / IOCP execution, and the existing CI configuration does not establish that uncommitted code passed. Commands, results and remaining work are recorded in the [phase-one handoff](docs/HANDOFF.md).
+The latest full-platform CI pass is `092fe99` (13/13: three desktop runtimes + sanitizers + protocols (ubuntu/macos) + mobile cross-compilation), covering this round's protocol code. Development-machine evidence covers macOS runs, partial MinGW compilation and NDK29 non-TLS cross-compilation. Commands, results and remaining work are recorded in the [phase-one handoff](docs/HANDOFF.md).
 
 ## A look at the API
 

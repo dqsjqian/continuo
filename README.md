@@ -88,7 +88,7 @@ flowchart TB
 | iOS / Android | kqueue / epoll | 仅非 TLS 模块交叉编译；没有真机运行证据。Android 需 **NDK 29+**，见下文构建要求 |
 | BSD | kqueue | 后端可移植方向；没有专门 CI 证据 |
 
-最近记录的三桌面 CI 基线是 `a123370`，不是本轮新增协议的证据。本轮开发机只提供 macOS 运行、部分 MinGW 编译与 NDK29 非 TLS 交叉编译证据，**没有新 UDP / DNS / H2 / H3 的 Windows 或 Linux 运行证据**。MinGW 不能替代 MSVC / IOCP 运行，现有 CI 配置也不能证明当前未提交代码已通过。具体命令、结果与未完成项见 [一期交接](docs/HANDOFF.md)。
+最近记录的全平台 CI 通过是 `092fe99`（13/13：三桌面运行 + sanitizers + protocols(ubuntu/macos) + 移动交叉编译），它覆盖了本轮全部新协议代码。开发机证据为 macOS 运行、部分 MinGW 编译与 NDK29 非 TLS 交叉编译。具体命令、结果与未完成项见 [一期交接](docs/HANDOFF.md)。
 
 ## 看看 API
 
