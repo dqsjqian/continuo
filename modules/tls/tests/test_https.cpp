@@ -68,7 +68,8 @@ Certificate generate_certificate(EVP_PKEY* key,
                                  std::string_view common_name,
                                  long serial,
                                  X509* issuer = nullptr,
-                                 EVP_PKEY* issuer_key = nullptr) {
+                                 EVP_PKEY* issuer_key = nullptr,
+                                 const char* ext_key_usage = "serverAuth") {
     Certificate certificate{X509_new(), X509_free};
     require(certificate != nullptr);
     require(X509_set_version(certificate.get(), 2) == 1);
@@ -98,7 +99,7 @@ Certificate generate_certificate(EVP_PKEY* key,
     extension(certificate.get(), authority, NID_subject_key_identifier, "hash");
     if (issuer != nullptr) {
         extension(certificate.get(), authority, NID_authority_key_identifier, "keyid:always");
-        extension(certificate.get(), authority, NID_ext_key_usage, "serverAuth");
+        extension(certificate.get(), authority, NID_ext_key_usage, ext_key_usage);
         extension(certificate.get(), authority, NID_subject_alt_name, "DNS:localhost,IP:127.0.0.1");
     }
     require(X509_sign(certificate.get(), issuer_key != nullptr ? issuer_key : key, EVP_sha256()) >
@@ -113,6 +114,8 @@ struct Certificates {
     std::string other_ca;
     std::string server;
     std::string key;
+    std::string client;
+    std::string client_key;
 
     ~Certificates() {
         std::error_code ignored;
@@ -165,6 +168,11 @@ struct Certificates {
         other_ca = write("unrelated-ca.pem", unrelated_cert.get());
         server = write("server.pem", server_cert.get());
         key = write("server-key.pem", nullptr, server_key.get());
+        const auto client_key_pair = generate_key();
+        const auto client_cert = generate_certificate(
+            client_key_pair.get(), "test client", 4, ca_cert.get(), ca_key.get(), "clientAuth");
+        client = write("client.pem", client_cert.get());
+        client_key = write("client-key.pem", nullptr, client_key_pair.get());
     }
 };
 
@@ -816,6 +824,163 @@ void test_alpn(const Certificates& certificates) {
     CHECK(tls::Context::server_alpn(certificates.server, certificates.key, protocols).has_value());
 }
 
+struct MtlsExchange {
+    std::array<tcp::Socket, 2> sockets;
+    std::array<Error, 2> errors;
+    int done = 0;
+};
+
+DetachedTask run_mtls_peer(EventLoop& loop,
+                           tcp::Listener& listener,
+                           std::optional<tls::Context> context,
+                           MtlsExchange& exchange,
+                           std::size_t peer) {
+    Completion completion{exchange.done};
+    auto connected = peer == 0 ? co_await listener.accept()
+                               : co_await tcp::connect(loop, listener.local_endpoint());
+    if (!connected) {
+        exchange.errors[peer] = connected.error();
+        co_return;
+    }
+    auto& socket = exchange.sockets[peer];
+    socket = std::move(*connected);
+    auto stream = tls::Stream<tcp::Socket>::create(socket, *context, peer == 0 ? "" : "localhost");
+    if (!stream) {
+        exchange.errors[peer] = stream.error();
+        co_return;
+    }
+    const auto handshake = co_await stream->handshake();
+    if (!handshake) {
+        exchange.errors[peer] = handshake.error();
+        co_return;
+    }
+    if (peer == 0) {
+        const auto sent = co_await write_all(*stream, bytes_of("mtls"));
+        CHECK(sent.has_value());
+        const auto shutdown = co_await stream->shutdown();
+        CHECK(shutdown.has_value());
+    } else {
+        std::array<std::byte, 16> buffer{};
+        std::string received;
+        for (;;) {
+            const auto read = co_await stream->read_some(buffer);
+            if (!read) {
+                // TLS 1.3 客户端可能在服务端拒绝前完成握手：拒绝以 fatal
+                // alert 形式出现在第一次读上，而不是握手失败。只有 eof
+                // 表示数据完整到达。
+                if (read.error() != Errc::eof) exchange.errors[peer] = read.error();
+                break;
+            }
+            received.append(reinterpret_cast<const char*>(buffer.data()), *read);
+        }
+        if (exchange.errors[peer]) {
+            CHECK(exchange.errors[peer] == tls::Errc::protocol_error);
+        } else {
+            CHECK(received == "mtls");
+        }
+    }
+}
+
+void run_mtls_exchange(std::string_view name,
+                       tls::Context server_context,
+                       tls::Context client_context,
+                       bool expect_failure) {
+    test::section(name);
+    MtlsExchange exchange;
+    auto loop = EventLoop::create();
+    CHECK(loop.has_value());
+    if (!loop) return;
+    auto listener = tcp::Listener::bind(*loop, Endpoint::loopback(0));
+    CHECK(listener.has_value());
+    if (!listener) return;
+    struct Cleanup {
+        MtlsExchange& exchange;
+        ~Cleanup() {
+            for (auto& socket : exchange.sockets) socket.close();
+        }
+    } cleanup{exchange};
+    run_mtls_peer(*loop, *listener, std::move(server_context), exchange, 0);
+    run_mtls_peer(*loop, *listener, std::move(client_context), exchange, 1);
+    const auto deadline = EventLoop::Clock::now() + 5s;
+    while (exchange.done < 2 && EventLoop::Clock::now() < deadline) {
+        const auto iteration = loop->run_once(10ms);
+        CHECK(iteration.has_value());
+        if (!iteration) break;
+    }
+    CHECK(exchange.done == 2);
+    if (expect_failure) {
+        // 服务端验证客户端证书失败 → fatal alert；两侧都以协议错误收场。
+        CHECK(exchange.errors[0] == tls::Errc::protocol_error);
+        CHECK(exchange.errors[1] == tls::Errc::protocol_error);
+    } else {
+        CHECK(!exchange.errors[0]);
+        CHECK(!exchange.errors[1]);
+    }
+}
+
+void test_mtls(const Certificates& certificates) {
+    test::section("mTLS 客户端证书验证与协议版本配置");
+    const auto server_config = [&certificates] {
+        tls::Context::ServerConfig config;
+        config.cert_file = certificates.server;
+        config.key_file = certificates.key;
+        return config;
+    };
+    const auto client_config = [&certificates] {
+        tls::Context::ClientConfig config;
+        config.ca_file = certificates.ca;
+        return config;
+    };
+
+    // 未出示证书的客户端被强制模式拒绝。
+    auto require_cert = server_config();
+    require_cert.client_ca_file = certificates.ca;
+    auto server_ctx = tls::Context::server(require_cert);
+    auto anonymous = tls::Context::client(client_config());
+    CHECK(server_ctx.has_value());
+    CHECK(anonymous.has_value());
+    if (server_ctx && anonymous)
+        run_mtls_exchange("mTLS 未出示证书的客户端握手被拒",
+                          std::move(*server_ctx), std::move(*anonymous), true);
+
+    // 出示 CA 签发证书的客户端验证通过，并完成应用数据往返。
+    auto presenting = client_config();
+    presenting.cert_file = certificates.client;
+    presenting.key_file = certificates.client_key;
+    server_ctx = tls::Context::server(require_cert);
+    auto client_ctx = tls::Context::client(presenting);
+    CHECK(server_ctx.has_value());
+    CHECK(client_ctx.has_value());
+    if (server_ctx && client_ctx)
+        run_mtls_exchange("mTLS 客户端证书验证通过并可交换数据",
+                          std::move(*server_ctx), std::move(*client_ctx), false);
+
+    // min_version 只接受 1.2/1.3；1.3 服务端与普通客户端正常握手。
+    auto outdated = server_config();
+    outdated.min_version = "1.1";
+    const auto rejected = tls::Context::server(outdated);
+    CHECK(!rejected && rejected.error() == Errc::invalid_argument);
+    auto modern = server_config();
+    modern.min_version = "1.3";
+    auto modern_ctx = tls::Context::server(modern);
+    auto plain_client = tls::Context::client(client_config());
+    CHECK(modern_ctx.has_value());
+    CHECK(plain_client.has_value());
+    if (modern_ctx && plain_client)
+        run_mtls_exchange("min_version 1.3 与 TLS 1.3 客户端正常握手",
+                          std::move(*modern_ctx), std::move(*plain_client), false);
+
+    // 客户端证书与私钥必须成对出现。
+    auto half = client_config();
+    half.cert_file = certificates.client;
+    const auto missing_key = tls::Context::client(half);
+    CHECK(!missing_key && missing_key.error() == Errc::invalid_argument);
+    half.cert_file = {};
+    half.key_file = certificates.client_key;
+    const auto missing_cert = tls::Context::client(half);
+    CHECK(!missing_cert && missing_cert.error() == Errc::invalid_argument);
+}
+
 void test_configuration(const Certificates& certificates) {
     test::section("TLS 配置错误与错误域");
     const auto missing = (certificates.directory / "does-not-exist.pem").string();
@@ -835,6 +1000,7 @@ int main() {
         Certificates certificates;
         certificates.create();
         test_configuration(certificates);
+        test_mtls(certificates);
         test_alpn(certificates);
         test_concurrent_operations(certificates);
         test_options_reach_the_underlying_stream(certificates);

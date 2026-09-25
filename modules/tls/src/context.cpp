@@ -83,6 +83,54 @@ int select_protocol(SSL* ssl,
     }
     return SSL_TLSEXT_ERR_ALERT_FATAL;
 }
+
+/// 装载证书链与私钥并校验匹配。三个 OpenSSL 步骤共享同一错误域。
+Result<void> apply_identity(SSL_CTX* handle,
+                            std::string_view cert_file,
+                            std::string_view key_file) {
+    const std::string cert(cert_file);
+    const std::string key(key_file);
+    ERR_clear_error();
+    if (SSL_CTX_use_certificate_chain_file(handle, cert.c_str()) != 1)
+        return fail(make_error_code(Errc::configuration_error));
+    ERR_clear_error();
+    if (SSL_CTX_use_PrivateKey_file(handle, key.c_str(), SSL_FILETYPE_PEM) != 1)
+        return fail(make_error_code(Errc::configuration_error));
+    ERR_clear_error();
+    if (SSL_CTX_check_private_key(handle) != 1)
+        return fail(make_error_code(Errc::configuration_error));
+    return Result<void>{};
+}
+
+/// 最低协议版本只接受 "1.2"/"1.3"；TLS 1.0/1.1 从未在可选范围内。
+Result<void> apply_min_version(SSL_CTX* handle, std::string_view min_version) {
+    const int version = min_version == "1.2"   ? TLS1_2_VERSION
+                        : min_version == "1.3" ? TLS1_3_VERSION
+                                               : 0;
+    if (version == 0) return fail(continuo::Errc::invalid_argument);
+    ERR_clear_error();
+    if (SSL_CTX_set_min_proto_version(handle, version) != 1)
+        return fail(make_error_code(Errc::configuration_error));
+    return Result<void>{};
+}
+
+/// 服务端单协议 ALPN：把协议名挂到 SSL_CTX 的 ex_data 上并安装选择回调。
+/// SSL 保留 SSL_CTX 的引用；协议副本随 SSL_CTX 释放，不依赖 Context 的生命周期。
+Result<void> install_server_alpn(SSL_CTX* handle, std::span<const std::string_view> protocols) {
+    auto wire = encode_protocols(protocols);
+    if (!wire) return fail(wire.error());
+    if (wire->empty()) return Result<void>{};
+    const int index = protocol_index();
+    if (index < 0) return fail(make_error_code(Errc::configuration_error));
+    auto retained = std::make_unique<std::string>(std::move(*wire));
+    ERR_clear_error();
+    if (SSL_CTX_set_ex_data(handle, index, retained.get()) != 1)
+        return fail(make_error_code(Errc::configuration_error));
+    retained.release();
+    ERR_clear_error();
+    SSL_CTX_set_alpn_select_cb(handle, select_protocol, nullptr);
+    return Result<void>{};
+}
 }  // namespace
 
 Context::Context(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -137,37 +185,55 @@ Result<Context> Context::server_alpn(std::string_view cert_file,
                                      std::span<const std::string_view> protocols) {
     if (!valid_path(cert_file) || !valid_path(key_file))
         return fail(continuo::Errc::invalid_argument);
-    auto wire = encode_protocols(protocols);
-    if (!wire) return fail(wire.error());
     auto impl = std::make_unique<Impl>();
     auto handle = make_context();
     if (!handle) return fail(handle.error());
     impl->handle = *handle;
-    if (!wire->empty()) {
-        ERR_clear_error();
-        const int index = protocol_index();
-        if (index < 0) return fail(make_error_code(Errc::configuration_error));
-        // SSL 保留 SSL_CTX 的引用；协议副本随 SSL_CTX 释放，不依赖 Context 的生命周期。
-        auto retained = std::make_unique<std::string>(std::move(*wire));
-        ERR_clear_error();
-        if (SSL_CTX_set_ex_data(impl->handle, index, retained.get()) != 1)
-            return fail(make_error_code(Errc::configuration_error));
-        retained.release();
-        ERR_clear_error();
-        SSL_CTX_set_alpn_select_cb(impl->handle, select_protocol, nullptr);
-    }
-    const std::string cert(cert_file);
-    const std::string key(key_file);
-    ERR_clear_error();
-    if (SSL_CTX_use_certificate_chain_file(impl->handle, cert.c_str()) != 1)
-        return fail(make_error_code(Errc::configuration_error));
-    ERR_clear_error();
-    if (SSL_CTX_use_PrivateKey_file(impl->handle, key.c_str(), SSL_FILETYPE_PEM) != 1)
-        return fail(make_error_code(Errc::configuration_error));
-    ERR_clear_error();
-    if (SSL_CTX_check_private_key(impl->handle) != 1)
-        return fail(make_error_code(Errc::configuration_error));
+    auto alpn = install_server_alpn(impl->handle, protocols);
+    if (!alpn) return fail(alpn.error());
+    auto identity = apply_identity(impl->handle, cert_file, key_file);
+    if (!identity) return fail(identity.error());
     return Context(std::move(impl));
+}
+
+Result<Context> Context::server(ServerConfig config) {
+    if (!config.client_ca_file.empty() && !valid_path(config.client_ca_file))
+        return fail(continuo::Errc::invalid_argument);
+    auto protocols = config.protocol.empty()
+                         ? std::span<const std::string_view>{}
+                         : std::span<const std::string_view>{&config.protocol, 1};
+    auto base = server_alpn(config.cert_file, config.key_file, protocols);
+    if (!base) return base;
+    auto& impl = base->impl_;
+    auto min = apply_min_version(impl->handle, config.min_version);
+    if (!min) return fail(min.error());
+    if (!config.client_ca_file.empty()) {
+        const std::string ca(config.client_ca_file);
+        ERR_clear_error();
+        if (SSL_CTX_load_verify_locations(impl->handle, ca.c_str(), nullptr) != 1)
+            return fail(make_error_code(Errc::configuration_error));
+        ERR_clear_error();
+        // 强制模式：未出示可验证证书的客户端在握手期被拒绝。
+        SSL_CTX_set_verify(impl->handle,
+                           SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
+    }
+    return std::move(*base);
+}
+
+Result<Context> Context::client(ClientConfig config) {
+    const bool has_cert = !config.cert_file.empty();
+    const bool has_key = !config.key_file.empty();
+    if (has_cert != has_key) return fail(continuo::Errc::invalid_argument);
+    auto protocols = config.protocol.empty()
+                         ? std::span<const std::string_view>{}
+                         : std::span<const std::string_view>{&config.protocol, 1};
+    auto base = client_alpn(config.ca_file, protocols);
+    if (!base) return base;
+    if (has_cert) {
+        auto identity = apply_identity(base->impl_->handle, config.cert_file, config.key_file);
+        if (!identity) return fail(identity.error());
+    }
+    return std::move(*base);
 }
 
 }  // namespace continuo::tls
