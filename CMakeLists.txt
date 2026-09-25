@@ -22,8 +22,18 @@ if(PROJECT_IS_TOP_LEVEL)
 endif()
 
 option(CONTINUO_BUILD_TESTS "Build Continuo tests" ${PROJECT_IS_TOP_LEVEL})
+
+# Mobile/cross builds should not produce a host-style server unless requested.
+set(CONTINUO_BUILD_EXAMPLES_DEFAULT OFF)
+if(PROJECT_IS_TOP_LEVEL AND NOT CMAKE_CROSSCOMPILING)
+    set(CONTINUO_BUILD_EXAMPLES_DEFAULT ON)
+endif()
+option(CONTINUO_BUILD_EXAMPLES "Build Continuo examples" ${CONTINUO_BUILD_EXAMPLES_DEFAULT})
+
 option(CONTINUO_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(CONTINUO_ENABLE_TLS "Build the optional OpenSSL 3 TLS stream module" OFF)
+option(CONTINUO_ENABLE_HTTP2 "Build the optional nghttp2 HTTP/2 module" OFF)
+option(CONTINUO_ENABLE_HTTP3 "Build the optional QUIC and HTTP/3 modules (experimental)" OFF)
 
 # Off by default when embedded: a project that pulls Continuo in via
 # add_subdirectory() has not asked to install our headers alongside its own.
@@ -71,8 +81,16 @@ function(continuo_install_module target)
         return()
     endif()
 
+    set(export_set continuoTargets)
+    if(target STREQUAL "continuo_tls")
+        set(export_set continuoTlsTargets)
+    elseif(target STREQUAL "continuo_http2")
+        set(export_set continuoHttp2Targets)
+    elseif(target STREQUAL "continuo_quic" OR target STREQUAL "continuo_http3")
+        set(export_set continuoHttp3Targets)
+    endif()
     install(TARGETS ${target}
-        EXPORT continuoTargets
+        EXPORT ${export_set}
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
@@ -103,6 +121,32 @@ add_subdirectory(modules/http)
 if(CONTINUO_ENABLE_TLS)
     add_subdirectory(modules/tls)
 endif()
+if(CONTINUO_ENABLE_HTTP2)
+    add_subdirectory(modules/http2)
+endif()
+if(CONTINUO_ENABLE_HTTP3)
+    add_subdirectory(modules/quic)
+    add_subdirectory(modules/http3)
+endif()
+
+# ── Examples ────────────────────────────────────────────────────────────────
+
+if(CONTINUO_BUILD_EXAMPLES)
+    add_executable(continuo_echo_server examples/echo_server.cpp)
+    target_link_libraries(continuo_echo_server PRIVATE continuo::transport continuo::warnings)
+
+    if(CONTINUO_BUILD_TESTS)
+        find_package(Python3 COMPONENTS Interpreter QUIET)
+        if(Python3_Interpreter_FOUND)
+            add_test(NAME continuo_echo_example
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tools/ci/check_echo_example.py
+                    $<TARGET_FILE:continuo_echo_server>
+            )
+            set_tests_properties(continuo_echo_example PROPERTIES TIMEOUT 90)
+        endif()
+    endif()
+endif()
 
 # ── Package config ──────────────────────────────────────────────────────────
 #
@@ -118,6 +162,23 @@ if(CONTINUO_INSTALL)
         NAMESPACE continuo::
         DESTINATION ${CONTINUO_CMAKE_DESTINATION}
     )
+
+    foreach(optional_module IN ITEMS Tls Http2 Http3)
+        if((optional_module STREQUAL "Tls" AND CONTINUO_ENABLE_TLS)
+           OR (optional_module STREQUAL "Http2" AND CONTINUO_ENABLE_HTTP2)
+           OR (optional_module STREQUAL "Http3" AND CONTINUO_ENABLE_HTTP3))
+            install(EXPORT continuo${optional_module}Targets
+                FILE continuo${optional_module}Targets.cmake
+                NAMESPACE continuo::
+                DESTINATION ${CONTINUO_CMAKE_DESTINATION}
+            )
+        endif()
+    endforeach()
+
+    if(CONTINUO_ENABLE_HTTP3)
+        install(FILES cmake/continuo-http3-dependencies.cmake
+            DESTINATION ${CONTINUO_CMAKE_DESTINATION})
+    endif()
 
     configure_package_config_file(
         cmake/continuo-config.cmake.in

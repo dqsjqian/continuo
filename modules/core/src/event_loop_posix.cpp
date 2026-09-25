@@ -164,10 +164,30 @@ public:
     }
 
     void detach(int fd) noexcept {
+        if (auto it = datagrams_.find(fd); it != datagrams_.end()) {
+            for (const auto& closed : it->second) if (closed) *closed = true;
+            datagrams_.erase(it);
+        }
         // Remove kernel interest before cancellation resumes user code, which
         // can register another operation. Never disarm that new registration.
         (void)poller_.disarm(fd);
         fail_waiters(fd, make_error_code(Errc::cancelled));
+    }
+
+    // 占位覆盖整个重试循环，不随 readiness 通知提前释放。
+    std::shared_ptr<bool> acquire_datagram(int fd, bool writing) {
+        auto& slot = datagrams_[fd][writing ? 1U : 0U];
+        if (slot) return {};
+        slot = std::make_shared<bool>(false);
+        return slot;
+    }
+
+    void release_datagram(int fd, bool writing, const std::shared_ptr<bool>& token) {
+        auto it = datagrams_.find(fd);
+        if (it == datagrams_.end()) return;
+        auto& slot = it->second[writing ? 1U : 0U];
+        if (slot == token) slot.reset();
+        if (!it->second[0] && !it->second[1]) datagrams_.erase(it);
     }
 
     // ── suspension ──────────────────────────────────────────────────────────
@@ -581,6 +601,8 @@ private:
         if (unlinked.result) {
             *unlinked.result = outcome;
         }
+        // detach 也会同步恢复续体；不能只依赖 run_once 的批次保护。
+        const detail::DispatchScope dispatching{dispatch_depth_};
         unlinked.handle.resume();
     }
 
@@ -619,6 +641,7 @@ private:
     mutable std::mutex mutex_;
     std::unordered_map<detail::OperationId, Operation> operations_{};
     std::unordered_map<int, FdWaiters> fd_waiters_{};
+    std::unordered_map<int, std::array<std::shared_ptr<bool>, 2>> datagrams_{};
     detail::TimerQueue timers_{};
     detail::PostQueue posted_{};
     std::vector<detail::OperationId> pending_cancels_{};
@@ -868,6 +891,83 @@ Task<Result<void>> EventLoop::connect(NativeHandle handle,
             co_return fail(std::error_code{pending, std::system_category()});
         }
         co_return Result<void>{};
+    }
+}
+
+Task<Result<EventLoop::DatagramResult>> EventLoop::receive_from(
+    NativeHandle handle, std::span<std::byte> destination, OperationOptions options) {
+    Impl* impl = impl_.get();
+    if (!impl || impl->shutting_down()) co_return fail(Errc::cancelled);
+    if (const auto rejected = detail::rejected_before_submit(options)) co_return fail(*rejected);
+    if (handle < 0) co_return fail(Errc::invalid_argument);
+    auto token = impl->acquire_datagram(handle, false);
+    if (!token) co_return fail(Errc::invalid_argument);
+    struct Guard {
+        Impl* impl;
+        int fd;
+        std::shared_ptr<bool> token;
+        ~Guard() { impl->release_datagram(fd, false, token); }
+    } guard{impl, handle, token};
+    for (;;) {
+        if (*token) co_return fail(Errc::cancelled);
+        DatagramResult result;
+        // Darwin 的零长度 iovec 不保证执行数据报接收；用一字节 scratch
+        // 强制消费，非空包随后按用户容量报告截断。
+        std::byte scratch{};
+        iovec buffer{destination.empty() ? &scratch : destination.data(),
+                     destination.empty() ? 1U : destination.size()};
+        msghdr message{};
+        message.msg_name = result.address.data();
+        message.msg_namelen = static_cast<socklen_t>(result.address.size());
+        message.msg_iov = &buffer;
+        message.msg_iovlen = 1;
+        const ssize_t count = ::recvmsg(handle, &message, 0);
+        if (count >= 0) {
+            if ((message.msg_flags & MSG_TRUNC) != 0 ||
+                static_cast<std::size_t>(count) > destination.size())
+                co_return fail(std::make_error_code(std::errc::message_size));
+            result.size = static_cast<std::size_t>(count);
+            result.address_size = message.msg_namelen;
+            co_return result;
+        }
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) co_return fail(last_os_error());
+        const auto ready = co_await wait_for(handle, false, options);
+        if (!ready) co_return fail(ready.error());
+    }
+}
+
+Task<Result<std::size_t>> EventLoop::send_to(
+    NativeHandle handle, std::span<const std::byte> source,
+    std::span<const std::byte> address, OperationOptions options) {
+    Impl* impl = impl_.get();
+    if (!impl || impl->shutting_down()) co_return fail(Errc::cancelled);
+    if (const auto rejected = detail::rejected_before_submit(options)) co_return fail(*rejected);
+    if (handle < 0 || address.size() < sizeof(sockaddr) ||
+        address.size() > sizeof(sockaddr_storage))
+        co_return fail(Errc::invalid_argument);
+    auto token = impl->acquire_datagram(handle, true);
+    if (!token) co_return fail(Errc::invalid_argument);
+    struct Guard {
+        Impl* impl;
+        int fd;
+        std::shared_ptr<bool> token;
+        ~Guard() { impl->release_datagram(fd, true, token); }
+    } guard{impl, handle, token};
+    for (;;) {
+        if (*token) co_return fail(Errc::cancelled);
+        const ssize_t count = ::sendto(handle, source.data(), source.size(), 0,
+            reinterpret_cast<const sockaddr*>(address.data()),
+            static_cast<socklen_t>(address.size()));
+        if (count >= 0) {
+            if (static_cast<std::size_t>(count) != source.size())
+                co_return fail(std::make_error_code(std::errc::message_size));
+            co_return static_cast<std::size_t>(count);
+        }
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) co_return fail(last_os_error());
+        const auto ready = co_await wait_for(handle, true, options);
+        if (!ready) co_return fail(ready.error());
     }
 }
 

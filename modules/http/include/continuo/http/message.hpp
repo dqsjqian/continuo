@@ -101,6 +101,8 @@ enum class BodyKind {
     length,
     /// `Transfer-Encoding: chunked`
     chunked,
+    /// 响应体持续到传输层 EOF；该连接不能复用。
+    close_delimited,
 };
 
 /// A parsed request head.

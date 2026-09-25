@@ -195,7 +195,7 @@ struct ConnectOptions {
 /// so the returned failure leaves nothing for the caller to reuse — the socket
 /// this function created is closed on the way out.
 [[nodiscard]] Task<Result<Socket>> connect(EventLoop& loop,
-                                           const Endpoint& endpoint,
+                                           Endpoint endpoint,
                                            ConnectOptions options = {},
                                            OperationOptions io = {});
 

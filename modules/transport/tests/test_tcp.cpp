@@ -107,6 +107,19 @@ void test_endpoint() {
     CHECK(!Endpoint::parse("", 80).has_value());
     CHECK(!Endpoint::parse("999.1.1.1", 80).has_value());
     CHECK(!Endpoint::parse("127.0.0.1 ", 80).has_value());
+    CHECK(!Endpoint::parse(std::string_view{"127.0.0.1\0bad", 13}, 80));
+    CHECK(!Endpoint::parse(std::string_view{"::1\0bad", 7}, 80));
+    CHECK(!Endpoint::parse("fe80::1%", 80));
+    CHECK(!Endpoint::parse("fe80::1%4294967296", 80));
+    CHECK(!Endpoint::parse("fe80::1%invalid%scope", 80));
+    const auto scoped = Endpoint::parse("fe80::1%42", 443);
+    CHECK(scoped.has_value());
+    if (scoped) {
+        CHECK(scoped->address() == "fe80::1%42");
+        CHECK(scoped->to_string() == "[fe80::1%42]:443");
+        const auto scoped_restored = Endpoint::from_bytes(scoped->address_bytes());
+        CHECK(scoped_restored && scoped_restored->address() == "fe80::1%42");
+    }
 
     // Round-trip through the raw bytes the OS would hand back.
     const Result<Endpoint> restored = Endpoint::from_bytes(v4->address_bytes());
@@ -657,6 +670,30 @@ void test_loop_destruction_pending_read() {
     CHECK(failure == Errc::cancelled);
 }
 
+void test_lazy_connect_owns_endpoint() {
+    test::section("lazy connect owns its endpoint before execution");
+    auto created = EventLoop::create();
+    CHECK(created.has_value());
+    if (!created) return;
+    auto& loop = *created;
+    auto listener = tcp::Listener::bind(loop, Endpoint::loopback(0));
+    CHECK(listener.has_value());
+    if (!listener) return;
+    auto endpoint = listener->local_endpoint();
+    auto pending = tcp::connect(loop, endpoint, {}, {.deadline = Clock::now() + 2s});
+    // Mutation is deterministic: a reference-taking lazy coroutine would now
+    // see this invalid endpoint instead of the address present at invocation.
+    endpoint = Endpoint{};
+    struct Driver {
+        static Task<void> run(Task<Result<tcp::Socket>> task) {
+            const auto socket = co_await std::move(task);
+            CHECK(socket.has_value());
+        }
+    };
+    CHECK(loop.run_until_complete(Driver::run(std::move(pending))).has_value());
+    CHECK(loop.outstanding() == 0);
+}
+
 // ── options travel from the socket down to the loop ──────────────────────────
 
 void test_socket_forwards_options() {
@@ -808,6 +845,7 @@ int main() {
     std::printf("backend: %s\n", io_backend_name());
 
     test_endpoint();
+    test_lazy_connect_owns_endpoint();
     test_exclusive_bind_is_uniform();
     test_accept_connect_round_trip();
     test_larger_transfer();

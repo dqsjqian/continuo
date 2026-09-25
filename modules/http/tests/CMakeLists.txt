@@ -1,5 +1,8 @@
 add_executable(continuo_http_tests test_parser.cpp)
 add_executable(continuo_http_server_tests test_server.cpp)
+add_executable(continuo_http_response_tests test_response_parser.cpp)
+add_executable(continuo_http_client_tests test_client.cpp)
+target_link_libraries(continuo_http_client_tests PRIVATE continuo::transport)
 
 # The only binary that links both http and transport. The *library* keeps its
 # boundary (continuo::http depends on core alone); a test that runs the whole
@@ -8,7 +11,8 @@ add_executable(continuo_http_server_tests test_server.cpp)
 add_executable(continuo_http_e2e_tests test_end_to_end.cpp)
 target_link_libraries(continuo_http_e2e_tests PRIVATE continuo::transport)
 
-foreach(target continuo_http_tests continuo_http_server_tests continuo_http_e2e_tests)
+foreach(target continuo_http_tests continuo_http_server_tests continuo_http_e2e_tests
+               continuo_http_response_tests continuo_http_client_tests)
     target_link_libraries(${target} PRIVATE
         continuo::http
         continuo::warnings
@@ -25,4 +29,6 @@ add_test(NAME http_server COMMAND continuo_http_server_tests)
 add_test(NAME http_end_to_end COMMAND continuo_http_e2e_tests)
 
 # A connection-loop bug hangs rather than fails; a timeout makes it red.
-set_tests_properties(http_server http_end_to_end PROPERTIES TIMEOUT 60)
+add_test(NAME http_response_parser COMMAND continuo_http_response_tests)
+add_test(NAME http_client COMMAND continuo_http_client_tests)
+set_tests_properties(http_server http_end_to_end http_response_parser http_client PROPERTIES TIMEOUT 60)

@@ -55,17 +55,22 @@ LAYERS: dict[str, tuple[str, ...]] = {
     "core": ("core",),
     "transport": ("transport",),
     "tls": ("tls",),
-    "protocol": ("http", "ws", "h2", "h3", "dns"),
+    "quic": ("quic",),
+    "protocol": ("http", "http2", "http3", "ws", "h2", "h3", "dns"),
 }
 
 # Layer -> include path prefixes it is not allowed to reach for.
 FORBIDDEN_INCLUDES: dict[str, tuple[str, ...]] = {
     "core": ("continuo/tls/", "openssl/", "continuo/transport/", "continuo/http/", "continuo/ws/",
-             "continuo/h2/", "continuo/h3/", "continuo/dns/"),
+             "continuo/h2/", "continuo/h3/", "continuo/dns/", "continuo/http2/", "continuo/http3/",
+             "continuo/quic/", "nghttp2/", "nghttp3/", "ngtcp2/"),
     "transport": ("continuo/tls/", "openssl/", "continuo/http/", "continuo/ws/", "continuo/h2/",
-                  "continuo/h3/", "continuo/dns/"),
+                  "continuo/h3/", "continuo/dns/", "continuo/http2/", "continuo/http3/",
+                  "continuo/quic/", "nghttp2/", "nghttp3/", "ngtcp2/"),
     "tls": ("continuo/transport/", "continuo/http/", "continuo/ws/", "continuo/h2/",
-            "continuo/h3/", "continuo/dns/"),
+            "continuo/h3/", "continuo/dns/", "continuo/http2/", "continuo/http3/", "continuo/quic/"),
+    "quic": ("continuo/http/", "continuo/http2/", "continuo/http3/", "continuo/h2/",
+             "continuo/h3/", "nghttp2/", "nghttp3/"),
     "protocol": ("openssl/", "continuo/tls/", "continuo/transport/"),
 }
 

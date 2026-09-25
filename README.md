@@ -6,7 +6,7 @@
 
 用一套完成式 I/O 接口连接 kqueue、epoll 与 IOCP，让协议不必认识套接字。
 
-C++23 · TCP · 可选 OpenSSL 3 · HTTP/1.1
+C++23 · TCP / UDP · 异步名称解析 · TLS · HTTP/1.1 / HTTP/2 · 实验性 QUIC / HTTP/3
 
 **简体中文** | [English](README.en.md)
 
@@ -17,7 +17,7 @@ C++23 · TCP · 可选 OpenSSL 3 · HTTP/1.1
 > *Basso continuo*，通奏低音：持续演奏的低音声部，为音乐提供基础。
 > Continuo 希望成为网络软件的这层基础，而不是另一个包办一切的 HTTP 框架。
 
-**当前阶段：实验性基础库，不是生产就绪的网络栈。** TCP、可选 TLS 与 HTTP/1.1 已有实现和测试；单线程 `TaskScope` 已提供显式子任务所有权与 join，但完整 I/O 取消、截止时间及端到端背压仍未完成。API 可以随契约完善而调整，暂不承诺稳定 ABI。
+**当前阶段：一期协议实现进行中，不是生产就绪的网络栈。** 已增加 UDP、有界异步系统解析器、HTTP/1 客户端、多协议 ALPN、可选 nghttp2 引擎，以及基于 ngtcp2 / nghttp3 的实验性 QUIC / HTTP/3 引擎。逐操作取消与截止时间已存在，不代表跨层停服、端到端背压和全部平台已验收。H2/H3 属于一期目标，不能把引擎互通测试等同于一期完成。API 可以随契约完善而调整，暂不承诺稳定 ABI。
 
 ## 为什么是 Continuo
 
@@ -35,8 +35,13 @@ flowchart TB
     App[应用：组合模块与管理生命周期]
     App -.-> HTTP[http · HTTP/1.1]
     App -.-> TLS[tls · 可选 OpenSSL 3]
-    App -.-> TCP[transport · TCP]
+    App -.-> TCP[transport · TCP / UDP / Resolver]
+    App -.-> H2[http2 · 可选 nghttp2]
+    App -.-> H3[http3 · 实验性 nghttp3]
     HTTP --> Core[core · Task / TaskScope / Result / AsyncStream / Executor / Buffer / EventLoop]
+    H2 --> Core
+    H3 --> QUIC[quic · ngtcp2 / QUIC TLS]
+    QUIC --> TCP
     TLS --> Core
     TCP --> Core
     Core --> Backends[kqueue · epoll · IOCP]
@@ -47,9 +52,12 @@ flowchart TB
 | 目录 / 构建目标 | 职责 |
 |---|---|
 | `modules/core` · `continuo::core` | 协程与任务作用域、错误、流与执行器接口、缓冲、事件循环和定时器 |
-| `modules/transport` · `continuo::transport` | 数值 IP 地址、TCP 监听 / 连接 / 读写 |
-| `modules/tls` · `continuo::tls` | 可选 TLS 流、证书与主机名验证、ALPN |
-| `modules/http` · `continuo::http` | HTTP/1.1 解析、序列化、单连接请求处理 |
+| `modules/transport` · `continuo::transport` | IP 端点、TCP、保持消息边界的 UDP、有界后台系统解析器 |
+| `modules/tls` · `continuo::tls` | 可选 TLS 流、证书与主机名验证、多协议 ALPN |
+| `modules/http` · `continuo::http` | HTTP/1 请求 / 响应解析、序列化、单连接服务与客户端 |
+| `modules/http2` · `continuo::http2` | 可选 nghttp2 Session、多流状态与泛型流适配 |
+| `modules/quic` · `continuo::quic` | 实验性 QUIC v1 数据报引擎、专用 TLS 1.3、重传与流控 |
+| `modules/http3` · `continuo::http3` | 实验性 nghttp3 / QPACK 引擎；应用负责数据报收发与定时驱动 |
 
 分层由 `tools/ci/check_layering.py` 检查：禁止反向依赖与宿主框架头文件，平台识别集中在 `platform.hpp`，协议模块不包含 OS 头文件。静态分层检查不能替代运行时安全验证。
 
@@ -60,10 +68,13 @@ flowchart TB
 | 执行与生命周期 | 惰性、仅可移动的 `Task`（销毁已启动未完成的帧会终止）；单线程 `TaskScope` 的 spawn / join 与协作 stop token；单线程 `EventLoop`、定时器与投递 | 跨层 join / drain 契约与持续生命周期验证；派发中销毁事件循环是明确拒绝，而非支持 |
 | 取消与截止时间 | `OperationOptions` 贯穿 `EventLoop` → TCP → TLS → HTTP 连接循环；`BoundedStream` 区分「能承载预算」的流；HTTP 把 `idle_timeout` / `request_timeout` 逐请求换算成新的绝对截止时间 | Windows 侧只有 CI 证据，本机零运行覆盖；IOCP 上被取消的读可能丢弃内核已搬运的字节，该连接必须关闭而非复用 |
 | TCP | IPv4 / IPv6、监听、连接、短读写、默认独占绑定 | 关闭与完成竞争的持续验证；全链路操作与队列上限 |
-| TLS（可选） | OpenSSL 3、证书链和 DNS 名 / IP 验证、单 ALPN 标识、关闭通知；handshake / 读 / 写 / shutdown 均接受并向下透传 `OperationOptions` | 移动端 TLS；更广泛互操作验证 |
-| HTTP/1.1 | 增量解析、序列化、keep-alive、流水线请求处理、HEAD、分块响应 | 请求体目前有界缓冲；流式请求体、路由、完整客户端仍待实现 |
-| 安全与资源 | 解析限制、畸形输入负测、有界 TLS BIO | 端到端背压、总内存上限、广泛模糊测试与故障注入 |
-| 后续传输与协议 | TCP 流契约作为起点 | UDP / 数据报、DNS、更多协议与后端；HTTP/2、HTTP/3 尚未实现 |
+| UDP | IPv4 / IPv6、peer 端点、零长数据报、截断报错并消费整包、同方向互斥、取消与 deadline | 新代码尚缺 Linux / Windows 实际运行；无批量 I/O、辅助消息或 ECN |
+| DNS / 名称解析 | 有界工作线程与队列、系统 getaddrinfo、结果去重、取消等待和总 deadline；后台不持有 loop | 不是自研 DNS wire 协议；不能中断系统调用，析构 join 可能等待；无 Happy Eyeballs |
+| TLS（可选） | OpenSSL 3、证书链与 DNS 名 / IP 验证、多协议 ALPN（服务端优先）、关闭通知、预算透传 | ALPN 不会自动切换 HTTP 实现；移动 TLS、更多互操作仍待验 |
+| HTTP/1 | 增量请求 / 响应解析、keep-alive、HEAD、chunked、1xx / EOF 定界；客户端响应 body 按需分片；外部服务取消 | 服务端请求体仍有界收集，客户端请求 body 仍为已知长度 span；无连接池、重定向、代理、100-continue 或隧道 |
+| HTTP/2（可选） | nghttp2 客户端 / 服务端、HPACK、多流、有界缓冲、消费驱动窗口、RST_STREAM / GOAWAY；真实 TCP / TLS 测试 | 无 h2c Upgrade、server push、CONNECT、发送 1xx / trailer；输出 body 非异步 source；独立实现互操作及全平台待验 |
+| QUIC / HTTP/3（实验性） | ngtcp2 + nghttp3 + OpenSSL ossl 专用 QUIC TLS；加密数据报 client/server、QPACK、流式接收、取消和两阶段 GOAWAY | ossl 后端上游仍标 experimental；固定路径，无迁移 / 0-RTT / Retry 策略；UDP 调度入口、独立互操作及全平台验收待补 |
+| 安全与资源 | 协议级限额、畸形输入负测、有界 TLS BIO、关键修复隔离变异 | 端到端背压、全连接总内存上限、广泛 fuzz / 过载 / 性能实测；不能宣称一期完整或生产就绪 |
 
 表中的“已实现”不代表相应领域已经完整验收。`stop()` 仍然 **不是取消**：它只请求 `run()` 返回。逐操作取消是 `OperationOptions` 的职责，它现在贯穿整栈——但「机制到位」不等于「证据到位」，Windows 的那一半只有 CI 跑过。
 
@@ -77,11 +88,11 @@ flowchart TB
 | iOS / Android | kqueue / epoll | 仅非 TLS 模块交叉编译；没有真机运行证据。Android 需 **NDK 29+**，见下文构建要求 |
 | BSD | kqueue | 后端可移植方向；没有专门 CI 证据 |
 
-最近已确认的三桌面 CI 通过基线是 `a123370`。IOCP 的取消语义在开发机上**没有任何运行证据**：本地只通过 mingw-w64 交叉编译做类型与生命周期检查，而 mingw 不是 MSVC，能编译也不等于能运行。CI 配置存在，不等于当前代码已通过。
+最近记录的三桌面 CI 基线是 `a123370`，不是本轮新增协议的证据。本轮开发机只提供 macOS 运行、部分 MinGW 编译与 NDK29 非 TLS 交叉编译证据，**没有新 UDP / DNS / H2 / H3 的 Windows 或 Linux 运行证据**。MinGW 不能替代 MSVC / IOCP 运行，现有 CI 配置也不能证明当前未提交代码已通过。具体命令、结果与未完成项见 [一期交接](docs/HANDOFF.md)。
 
 ## 看看 API
 
-下面是可编译的协程函数，不是可直接启动的完整服务器。宿主需要启动并等待任务，同时驱动关联的 `EventLoop`；当前尚无完整的结构化服务器启动 API。
+下面是可组合的协程函数。从 `main` 可用 `EventLoop::run_until_complete(Task<void>)` 启动根任务并驱动循环直到它完成；可运行的 TCP 示例见 `examples/echo_server.cpp`。顶层本机构建默认启用 `CONTINUO_BUILD_EXAMPLES`，运行 `./build/continuo_echo_server 0 1` 会打印临时端口、接收一个连接并等待对端 EOF 后退出。连接数参数是总接入量，不是并发上限；默认无限服务时，进程中断尚不是优雅停服。
 
 ### TCP：一次读到多少，就回写多少
 
@@ -302,6 +313,10 @@ ctest --test-dir build/tls -C Debug --output-on-failure
 
 如找不到 OpenSSL 3，可配置 `OPENSSL_ROOT_DIR`。C++20 已不再支持。
 
+可选高版本协议用 `CONTINUO_ENABLE_HTTP2=ON` / `CONTINUO_ENABLE_HTTP3=ON` 显式启用，默认关闭，不自动联网下载。H2 实测 nghttp2 1.70.0；QUIC/H3 实测 ngtcp2 1.22.1、nghttp3 1.15.0 和 OpenSSL 3.6.2（ossl 适配要求 OpenSSL 3.5+，仍属实验性）。第三方许可证须随分发遵守，不因 Continuo 使用 MIT 而省略。
+
+安装消费时，`find_package(continuo REQUIRED COMPONENTS core transport http)` 不会查找 TLS / H2 / H3 依赖，即使安装包包含这些模块。需要时显式请求 `tls`、`http2`、`quic` 或 `http3` 并提供依赖前缀；不写 COMPONENTS 则加载全部已安装模块。
+
 在现有 CMake 工程中接入（假定源码位于 `vendor/continuo`，且已有 `my_app` 目标）：
 
 ```cmake
@@ -316,11 +331,13 @@ target_link_libraries(my_app PRIVATE continuo::transport continuo::http)
 - `tls::Context::client(ca_file)` 验证证书链；`tls::Stream<T>::create` 接收待验证的 DNS 名或 IP。省略 CA 文件使用 OpenSSL 默认信任路径，不一定是系统原生证书库；没有不安全的验证绕过开关。
 - 创建流后先 `co_await stream.handshake()`，再读写。正常收尾时先 `co_await stream.shutdown()`，再关闭 TCP。
 - `shutdown()` 发送并刷新本端 `close_notify`，不等待对端回复；读取时遇到没有关闭通知的 TCP EOF 会报告截断。
-- 同一 TLS 流的操作串行执行，重叠操作会被拒绝。上下文工厂的末尾可选 `protocol` 参数接受单个 ALPN 标识；默认不协商，HTTPS 可显式选择 `"http/1.1"` 并检查 `negotiated_protocol()`。这不代表支持 HTTP/2。
+- 同一 TLS 流的操作串行执行，重叠操作会被拒绝。原工厂保留单协议参数；`client_alpn` / `server_alpn` 接受协议列表，服务端按自己的优先顺序选择。无共同协议时失败，无 ALPN 时允许上层按策略回退。必须检查 `negotiated_protocol()` 再选择 H1 或 H2；协商本身不执行协议切换。
 
 ## 测试与路线
 
-启用 TLS 时有 **8 个常规测试套件**：`core`、`event_loop`、`task_scope`、`transport`、`http_parser`、`http_server`、`http_end_to_end`、`tls_https`，非 TLS 构建为 7 个。另有 **8 个 fail-fast CTest**，每个在独立子进程里只做一次契约违约，并要求终止处理器安装的**精确**退出码——否则任意崩溃都会被当成“刻意快速失败”通过。**CTest 总计为 TLS 16 项、非 TLS 15 项**。常规套件覆盖基础类型、事件循环（含逐操作取消与截止时间的判定顺序、同批优先级、双方向注册）、scope 的帧释放 / join / 异常与协作 stop、TCP loopback、HTTP 解析与连接处理、TLS / HTTPS 组合及相关负测；数量不是完整性证明。
+测试按构建选项注册：基础、事件循环、scope、TCP、UDP、resolver、H1 请求 / 响应解析与客户端、TLS、多流 H2 及 QUIC/H3。fail-fast 契约测试在独立进程检查**精确退出码**，不能把普通崩溃或未捕获异常误算成契约保护。关键修复还在隔离副本中反向变异，确认测试会变红。
+
+用 `ctest --test-dir <build> -N` 查看当前配置项目数；本轮运行结果以 [HANDOFF](docs/HANDOFF.md) 为准，不沿用旧基线计数。QUIC/H3 的加密数据报内存测试与丢包重排测试，不等于真实 UDP 网络或独立客户端互操作。
 
 ```sh
 python3 tools/ci/check_layering.py

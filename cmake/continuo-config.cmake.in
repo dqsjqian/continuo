@@ -1,44 +1,66 @@
 @PACKAGE_INIT@
 
-# Package config for Continuo.
-#
-#   find_package(continuo REQUIRED)
-#   target_link_libraries(my_app PRIVATE continuo::http continuo::transport)
-#
-# Available targets: continuo::core, continuo::transport, continuo::http, and
-# continuo::tls when the installation was built with TLS enabled.
-
+# Explicit components load only their dependency closure. With no components,
+# retain the original convenience behaviour: expose every installed module.
 set(CONTINUO_WITH_TLS @CONTINUO_ENABLE_TLS@)
-
-# TLS is optional, so an installation built without it genuinely has no
-# `continuo::tls`. Checked before anything else, and reported by hand: CMake's
-# own wording for a missing component names neither the component nor the
-# cause, and a consumer who links the target without asking for the component
-# only finds out at build time, with a message about a target that "does not
-# exist" and no hint as to why.
-if(NOT CONTINUO_WITH_TLS AND "tls" IN_LIST continuo_FIND_COMPONENTS)
-    set(continuo_FOUND FALSE)
-    set(continuo_NOT_FOUND_MESSAGE
-        "this Continuo installation was built with CONTINUO_ENABLE_TLS=OFF, so continuo::tls \
-does not exist in it. Rebuild and reinstall Continuo with -DCONTINUO_ENABLE_TLS=ON, or drop \
-the tls component from find_package().")
-    return()
-endif()
-
+set(CONTINUO_WITH_HTTP2 @CONTINUO_ENABLE_HTTP2@)
+set(CONTINUO_WITH_HTTP3 @CONTINUO_ENABLE_HTTP3@)
 include(CMakeFindDependencyMacro)
-
-# continuo::core links Threads publicly, so every consumer needs it resolved.
 find_dependency(Threads)
-
-if(CONTINUO_WITH_TLS)
-    find_dependency(OpenSSL 3.0 COMPONENTS SSL Crypto)
-endif()
-
 include("${CMAKE_CURRENT_LIST_DIR}/continuoTargets.cmake")
-
 set(continuo_core_FOUND TRUE)
 set(continuo_transport_FOUND TRUE)
 set(continuo_http_FOUND TRUE)
-set(continuo_tls_FOUND ${CONTINUO_WITH_TLS})
+set(continuo_tls_FOUND FALSE)
+set(continuo_http2_FOUND FALSE)
+set(continuo_quic_FOUND FALSE)
+set(continuo_http3_FOUND FALSE)
 
+set(_continuo_load_tls FALSE)
+set(_continuo_load_http2 FALSE)
+set(_continuo_load_http3 FALSE)
+if(NOT continuo_FIND_COMPONENTS)
+    set(_continuo_load_tls ${CONTINUO_WITH_TLS})
+    set(_continuo_load_http2 ${CONTINUO_WITH_HTTP2})
+    set(_continuo_load_http3 ${CONTINUO_WITH_HTTP3})
+else()
+    foreach(_component IN LISTS continuo_FIND_COMPONENTS)
+        if(_component STREQUAL "tls" AND CONTINUO_WITH_TLS)
+            set(_continuo_load_tls TRUE)
+        elseif(_component STREQUAL "http2" AND CONTINUO_WITH_HTTP2)
+            set(_continuo_load_http2 TRUE)
+        elseif((_component STREQUAL "quic" OR _component STREQUAL "http3") AND CONTINUO_WITH_HTTP3)
+            set(_continuo_load_http3 TRUE)
+        endif()
+    endforeach()
+endif()
+
+if(_continuo_load_tls)
+    find_dependency(OpenSSL 3.0 COMPONENTS SSL Crypto)
+    include("${CMAKE_CURRENT_LIST_DIR}/continuoTlsTargets.cmake")
+    set(continuo_tls_FOUND TRUE)
+endif()
+# Dependency discovery for optional protocol targets is installed alongside
+# this file by the protocol modules.
+if(_continuo_load_http2)
+    include("${CMAKE_CURRENT_LIST_DIR}/continuo-http2-dependencies.cmake")
+    include("${CMAKE_CURRENT_LIST_DIR}/continuoHttp2Targets.cmake")
+    set(continuo_http2_FOUND TRUE)
+endif()
+if(_continuo_load_http3)
+    include("${CMAKE_CURRENT_LIST_DIR}/continuo-http3-dependencies.cmake")
+    include("${CMAKE_CURRENT_LIST_DIR}/continuoHttp3Targets.cmake")
+    set(continuo_quic_FOUND TRUE)
+    set(continuo_http3_FOUND TRUE)
+endif()
+foreach(_component IN LISTS continuo_FIND_COMPONENTS)
+    if(NOT continuo_${_component}_FOUND)
+        set(continuo_NOT_FOUND_MESSAGE
+            "Continuo component '${_component}' is unavailable; rebuild with its CONTINUO_ENABLE_* option enabled, or omit that component.")
+    endif()
+endforeach()
 check_required_components(continuo)
+unset(_component)
+unset(_continuo_load_tls)
+unset(_continuo_load_http2)
+unset(_continuo_load_http3)

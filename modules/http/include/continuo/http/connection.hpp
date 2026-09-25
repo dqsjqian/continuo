@@ -54,6 +54,9 @@ struct ServerOptions {
     /// Parser bounds; see `limits.hpp`. Closed by default.
     Limits limits{};
 
+    /// 外部取消透传到每次读取、响应写入及错误响应。
+    std::stop_token stop{};
+
     /// Maximum requests served on one connection before closing it.
     ///
     /// Bounded because an unbounded keep-alive connection is a resource a
@@ -283,7 +286,8 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
         // Whichever window applies right now. Recomputed when the first byte
         // arrives, so that a connection's hundredth request gets the same
         // budget as its first.
-        OperationOptions io{.deadline = deadline_in(request_started ? options.request_timeout
+        OperationOptions io{.stop = options.stop,
+                            .deadline = deadline_in(request_started ? options.request_timeout
                                                                     : options.idle_timeout)};
 
         // ── read and parse one request ──────────────────────────────────────

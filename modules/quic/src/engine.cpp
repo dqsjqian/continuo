@@ -1,0 +1,563 @@
+#include "continuo/quic/engine.hpp"
+
+#include <ngtcp2/ngtcp2.h>
+#if NGTCP2_VERSION_NUM < 0x011601
+    #error "continuo::quic requires ngtcp2 >= 1.22.1"
+#endif
+#include <algorithm>
+#include <array>
+#include <deque>
+#include <exception>
+#include <limits>
+#include <map>
+#include <ngtcp2/ngtcp2_crypto.h>
+#include <ngtcp2/ngtcp2_crypto_ossl.h>
+#include <openssl/err.h>
+#include <openssl/rand.h>
+#include <openssl/ssl.h>
+
+namespace continuo::quic {
+namespace {
+// 引擎自有错误码，取远离 ngtcp2 原生负码的区间。
+constexpr int invalid = -100000;
+constexpr int budget = -100001;
+
+class QuicCategory final : public std::error_category {
+public:
+    const char* name() const noexcept override { return "continuo.quic"; }
+    std::string message(int code) const override {
+        if (code == invalid) return "invalid QUIC argument or state";
+        if (code == budget) return "QUIC resource budget exceeded";
+        return ngtcp2_strerror(code);
+    }
+};
+}  // namespace
+
+Error quic_error(int code) noexcept {
+    // category 必须以存储期常量返回：std::error_code 只持有其引用，
+    // 临时对象会在返回后销毁并留下悬空指针。
+    static const QuicCategory category{};
+    return {code, category};
+}
+
+bool fill_random(std::uint8_t* destination, std::size_t length) noexcept {
+    if (length > static_cast<std::size_t>(std::numeric_limits<int>::max())) return false;
+    return RAND_bytes(destination, static_cast<int>(length)) == 1;
+}
+struct Engine::Impl {
+    Options options;
+    ngtcp2_conn* conn = nullptr;
+    SSL_CTX* ctx = nullptr;
+    SSL* ssl = nullptr;
+    ngtcp2_crypto_ossl_ctx* crypto = nullptr;
+    ngtcp2_crypto_conn_ref ref{};
+    ngtcp2_path path{};
+    bool failed = false;
+    bool ended = false;
+    std::uint64_t clock = 0;
+    std::size_t buffered = 0;
+    std::size_t received = 0;
+    std::uint64_t remote_bidi_limit = 0;
+    std::vector<Event> events;
+    struct Chunk {
+        Bytes bytes;
+        std::uint64_t start;
+        std::size_t sent = 0;
+        bool fin;
+        bool submitted = false;
+    };
+    struct Stream {
+        std::deque<Chunk> chunks;
+        std::uint64_t end = 0;
+        std::uint64_t unread = 0;
+        bool fin = false;
+        bool cancelled = false;
+        bool closed = false;
+    };
+    std::map<std::int64_t, Stream> streams;
+    ~Impl() {
+        if (ssl) {
+            SSL_set_app_data(ssl, nullptr);
+            SSL_free(ssl);
+        }
+        if (conn) ngtcp2_conn_del(conn);
+        if (crypto) ngtcp2_crypto_ossl_ctx_del(crypto);
+        if (ctx) SSL_CTX_free(ctx);
+    }
+    bool time(std::uint64_t now) {
+        if (now < clock) return false;
+        clock = now;
+        return true;
+    }
+    static Impl& self(void* p) { return *static_cast<Impl*>(p); }
+    template<class F>
+    static int guarded(F&& f) noexcept {
+        try {
+            return f();
+        } catch (...) {
+            return NGTCP2_ERR_CALLBACK_FAILURE;
+        }
+    }
+    bool capacity() const { return streams.size() < options.max_streams * 2 + 8; }
+    static int receive_data(ngtcp2_conn*,
+                            std::uint32_t flags,
+                            std::int64_t id,
+                            std::uint64_t,
+                            const std::uint8_t* data,
+                            std::size_t size,
+                            void* p,
+                            void*) {
+        return guarded([&] {
+            auto& s = self(p);
+            if (size > s.options.max_buffered_bytes - s.received ||
+                (!s.streams.contains(id) && !s.capacity()) || s.events.size() >= 4096)
+                return NGTCP2_ERR_CALLBACK_FAILURE;
+            auto& stream = s.streams[id];
+            stream.unread += size;
+            s.received += size;
+            Bytes bytes;
+            if (size) bytes.assign(data, data + size);
+            s.events.push_back({Event::Kind::data,
+                                id,
+                                std::move(bytes),
+                                0,
+                                bool(flags & NGTCP2_STREAM_DATA_FLAG_FIN)});
+            return 0;
+        });
+    }
+    static int acknowledged(
+        ngtcp2_conn*, std::int64_t id, std::uint64_t offset, std::uint64_t size, void* p, void*) {
+        return guarded([&] {
+            auto& s = self(p);
+            if (auto it = s.streams.find(id); it != s.streams.end()) {
+                auto& q = it->second.chunks;
+                while (!q.empty() && q.front().submitted &&
+                       q.front().start + q.front().bytes.size() <= offset + size) {
+                    s.buffered -= q.front().bytes.size();
+                    q.pop_front();
+                }
+            }
+            if (s.events.size() >= 4096) return NGTCP2_ERR_CALLBACK_FAILURE;
+            s.events.push_back({Event::Kind::acknowledged, id, {}, size, false});
+            return 0;
+        });
+    }
+    static int stream_close(
+        ngtcp2_conn* conn, std::uint32_t, std::int64_t id, std::uint64_t code, void* p, void*) {
+        return guarded([&] {
+            auto& s = self(p);
+            bool released = true;
+            if (auto it = s.streams.find(id); it != s.streams.end()) {
+                for (auto& c : it->second.chunks)
+                    s.buffered -= c.bytes.size();
+                // 已交付但尚未消费的数据仍在总窗口内，允许应用稍后消费。
+                it->second.chunks.clear();
+                it->second.closed = true;
+                if (!it->second.unread) s.streams.erase(it);
+                else released = false;
+            }
+            // 对端发起的流关闭后归还其开新流的额度。记录因未消费数据保留时
+            // 延迟归还，由 consume() 清空记录后补发，保证本地记录容量始终
+            // 覆盖已放行的对端流数量。
+            if (released && !ngtcp2_conn_is_local_stream(conn, id)) {
+                if (ngtcp2_is_bidi_stream(id))
+                    ngtcp2_conn_extend_max_streams_bidi(conn, 1);
+                else
+                    ngtcp2_conn_extend_max_streams_uni(conn, 1);
+            }
+            if (s.events.size() >= 4096) return NGTCP2_ERR_CALLBACK_FAILURE;
+            s.events.push_back({Event::Kind::closed, id, {}, code, false});
+            return 0;
+        });
+    }
+    static int
+    reset(ngtcp2_conn*, std::int64_t id, std::uint64_t, std::uint64_t code, void* p, void*) {
+        return guarded([&] {
+            auto& s = self(p);
+            if (s.events.size() >= 4096) return NGTCP2_ERR_CALLBACK_FAILURE;
+            s.events.push_back({Event::Kind::reset, id, {}, code, false});
+            return 0;
+        });
+    }
+    static void random(std::uint8_t* dest, std::size_t len, const ngtcp2_rand_ctx*) {
+        // 此无返回值回调仅用于非安全协议随机；安全 CID 在下方单独检查 RNG 返回值。
+        if (RAND_bytes(dest, static_cast<int>(len)) != 1) std::terminate();
+    }
+    static int cid(ngtcp2_conn*,
+                   ngtcp2_cid* id,
+                   ngtcp2_stateless_reset_token* token,
+                   std::size_t length,
+                   void*) {
+        id->datalen = length;
+        return RAND_bytes(id->data, static_cast<int>(length)) == 1 &&
+                       RAND_bytes(token->data, sizeof(token->data)) == 1
+                   ? 0
+                   : NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+    static int select_alpn(SSL*,
+                           const unsigned char** out,
+                           unsigned char* outlen,
+                           const unsigned char* in,
+                           unsigned int inlen,
+                           void* p) {
+        auto& protocol = self(p).options.alpn;
+        for (unsigned int i = 0; i < inlen;) {
+            unsigned int len = in[i++];
+            if (len > inlen - i) return SSL_TLSEXT_ERR_ALERT_FATAL;
+            if (len == protocol.size() && std::equal(in + i, in + i + len, protocol.begin())) {
+                *out = in + i;
+                *outlen = static_cast<unsigned char>(len);
+                return SSL_TLSEXT_ERR_OK;
+            }
+            i += len;
+        }
+        return SSL_TLSEXT_ERR_ALERT_FATAL;
+    }
+};
+Engine::Engine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+Engine::Engine(Engine&&) noexcept = default;
+Engine& Engine::operator=(Engine&&) noexcept = default;
+Engine::~Engine() = default;
+Result<Engine> Engine::client(Options o, std::uint64_t now) {
+    o.server = false;
+    return create(std::move(o), {}, now);
+}
+Result<Engine> Engine::accept(Options o, std::span<const std::uint8_t> initial, std::uint64_t now) {
+    o.server = true;
+    return create(std::move(o), initial, now);
+}
+Result<Engine>
+Engine::create(Options options, std::span<const std::uint8_t> initial, std::uint64_t now) {
+    if (options.local.address_bytes().empty() || options.remote.address_bytes().empty() ||
+        options.alpn.empty() || options.alpn.size() > 255 ||
+        options.alpn.find('\0') != std::string::npos || options.max_streams == 0 ||
+        options.max_streams > 4096 || options.max_buffered_bytes < 4096 ||
+        options.max_buffered_bytes > 64 * 1024 * 1024 ||
+        (!options.server &&
+         (options.peer_name.empty() || options.peer_name.find('\0') != std::string::npos)))
+        return std::unexpected(quic_error(invalid));
+    auto s = std::make_unique<Impl>();
+    s->options = std::move(options);
+    s->remote_bidi_limit = s->options.max_streams;
+    s->clock = now;
+    auto local = s->options.local.address_bytes(), remote = s->options.remote.address_bytes();
+    s->path.local = {reinterpret_cast<ngtcp2_sockaddr*>(const_cast<std::byte*>(local.data())),
+                     static_cast<ngtcp2_socklen>(local.size())};
+    s->path.remote = {reinterpret_cast<ngtcp2_sockaddr*>(const_cast<std::byte*>(remote.data())),
+                      static_cast<ngtcp2_socklen>(remote.size())};
+    ngtcp2_callbacks cb{};
+    cb.client_initial = ngtcp2_crypto_client_initial_cb;
+    cb.recv_client_initial = ngtcp2_crypto_recv_client_initial_cb;
+    cb.recv_crypto_data = ngtcp2_crypto_recv_crypto_data_cb;
+    cb.encrypt = ngtcp2_crypto_encrypt_cb;
+    cb.decrypt = ngtcp2_crypto_decrypt_cb;
+    cb.hp_mask = ngtcp2_crypto_hp_mask_cb;
+    cb.recv_retry = ngtcp2_crypto_recv_retry_cb;
+    cb.update_key = ngtcp2_crypto_update_key_cb;
+    cb.delete_crypto_aead_ctx = ngtcp2_crypto_delete_crypto_aead_ctx_cb;
+    cb.delete_crypto_cipher_ctx = ngtcp2_crypto_delete_crypto_cipher_ctx_cb;
+    cb.version_negotiation = ngtcp2_crypto_version_negotiation_cb;
+    cb.get_path_challenge_data2 = ngtcp2_crypto_get_path_challenge_data2_cb;
+    cb.rand = Impl::random;
+    cb.get_new_connection_id2 = Impl::cid;
+    cb.recv_stream_data = Impl::receive_data;
+    cb.acked_stream_data_offset = Impl::acknowledged;
+    cb.stream_close = Impl::stream_close;
+    cb.stream_reset = Impl::reset;
+    cb.extend_max_remote_streams_bidi = [](ngtcp2_conn*, std::uint64_t limit, void* p) {
+        Impl::self(p).remote_bidi_limit = limit;
+        return 0;
+    };
+    ngtcp2_settings settings;
+    ngtcp2_settings_default(&settings);
+    settings.initial_ts = now;
+    settings.no_pmtud = 1;
+    settings.max_tx_udp_payload_size = 1200;
+    settings.handshake_timeout = 10 * NGTCP2_SECONDS;
+    ngtcp2_transport_params params;
+    ngtcp2_transport_params_default(&params);
+    params.initial_max_data = s->options.max_buffered_bytes;
+    params.initial_max_stream_data_bidi_local = s->options.max_buffered_bytes;
+    params.initial_max_stream_data_bidi_remote = s->options.max_buffered_bytes;
+    params.initial_max_stream_data_uni = s->options.max_buffered_bytes;
+    params.initial_max_streams_bidi = s->options.max_streams;
+    params.initial_max_streams_uni = 3;
+    params.max_idle_timeout = s->options.idle_timeout_ns;
+    params.active_connection_id_limit = 2;
+    params.disable_active_migration = 1;
+    ngtcp2_cid scid{}, dcid{};
+    scid.datalen = 16;
+    dcid.datalen = 16;
+    if (RAND_bytes(scid.data, 16) != 1 || RAND_bytes(dcid.data, 16) != 1)
+        return std::unexpected(quic_error(invalid));
+    int rv;
+    if (s->options.server) {
+        ngtcp2_pkt_hd hd{};
+        rv = ngtcp2_accept(&hd, initial.data(), initial.size());
+        if (rv != 0) return std::unexpected(quic_error(rv));
+        dcid = hd.scid;
+        params.original_dcid = hd.dcid;
+        params.original_dcid_present = 1;
+        rv = ngtcp2_conn_server_new(&s->conn,
+                                    &dcid,
+                                    &scid,
+                                    &s->path,
+                                    hd.version,
+                                    &cb,
+                                    &settings,
+                                    &params,
+                                    nullptr,
+                                    s.get());
+    } else {
+        rv = ngtcp2_conn_client_new(&s->conn,
+                                    &dcid,
+                                    &scid,
+                                    &s->path,
+                                    NGTCP2_PROTO_VER_V1,
+                                    &cb,
+                                    &settings,
+                                    &params,
+                                    nullptr,
+                                    s.get());
+    }
+    if (rv) return std::unexpected(quic_error(rv));
+    s->ctx = SSL_CTX_new(TLS_method());
+    if (!s->ctx || SSL_CTX_set_min_proto_version(s->ctx, TLS1_3_VERSION) != 1 ||
+        SSL_CTX_set_max_proto_version(s->ctx, TLS1_3_VERSION) != 1)
+        return std::unexpected(quic_error(invalid));
+    if (s->options.server) {
+        if (SSL_CTX_use_certificate_chain_file(s->ctx, s->options.certificate_file.c_str()) != 1 ||
+            SSL_CTX_use_PrivateKey_file(
+                s->ctx, s->options.private_key_file.c_str(), SSL_FILETYPE_PEM) != 1 ||
+            SSL_CTX_check_private_key(s->ctx) != 1)
+            return std::unexpected(quic_error(invalid));
+        SSL_CTX_set_alpn_select_cb(s->ctx, Impl::select_alpn, s.get());
+    } else {
+        SSL_CTX_set_verify(s->ctx, SSL_VERIFY_PEER, nullptr);
+        int trust =
+            s->options.ca_file.empty()
+                ? SSL_CTX_set_default_verify_paths(s->ctx)
+                : SSL_CTX_load_verify_locations(s->ctx, s->options.ca_file.c_str(), nullptr);
+        if (trust != 1) return std::unexpected(quic_error(invalid));
+    }
+    s->ssl = SSL_new(s->ctx);
+    if (!s->ssl || ngtcp2_crypto_ossl_ctx_new(&s->crypto, s->ssl) != 0)
+        return std::unexpected(quic_error(invalid));
+    s->ref.get_conn = [](ngtcp2_crypto_conn_ref* ref) {
+        return static_cast<Impl*>(ref->user_data)->conn;
+    };
+    s->ref.user_data = s.get();
+    SSL_set_app_data(s->ssl, &s->ref);
+    if (s->options.server) {
+        rv = ngtcp2_crypto_ossl_configure_server_session(s->ssl);
+        SSL_set_accept_state(s->ssl);
+    } else {
+        rv = ngtcp2_crypto_ossl_configure_client_session(s->ssl);
+        SSL_set_connect_state(s->ssl);
+        auto name = s->options.peer_name.c_str();
+        if (transport::Endpoint::parse(s->options.peer_name, 0)) {
+            if (X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(s->ssl), name) != 1) rv = -1;
+        } else if (SSL_set1_host(s->ssl, name) != 1 || SSL_set_tlsext_host_name(s->ssl, name) != 1)
+            rv = -1;
+        Bytes protocol{static_cast<std::uint8_t>(s->options.alpn.size())};
+        protocol.insert(protocol.end(), s->options.alpn.begin(), s->options.alpn.end());
+        if (SSL_set_alpn_protos(
+                s->ssl, protocol.data(), static_cast<unsigned int>(protocol.size())) != 0)
+            rv = -1;
+    }
+    if (rv) return std::unexpected(quic_error(invalid));
+    ngtcp2_conn_set_tls_native_handle(s->conn, s->crypto);
+    Engine engine(std::move(s));
+    if (engine.impl_->options.server) {
+        if (auto r = engine.receive(initial, now); !r) return std::unexpected(r.error());
+    }
+    return engine;
+}
+Result<void> Engine::receive(std::span<const std::uint8_t> packet, std::uint64_t now) {
+    auto& s = *impl_;
+    if (s.failed || s.ended || !s.time(now))
+        return std::unexpected(quic_error(invalid));
+    ngtcp2_pkt_info info{};
+    int rv = ngtcp2_conn_read_pkt(s.conn, &s.path, &info, packet.data(), packet.size(), now);
+    if (rv == NGTCP2_ERR_DRAINING) {
+        s.ended = true;
+        return {};
+    }
+    if (rv) {
+        s.failed = true;
+        return std::unexpected(quic_error(rv));
+    }
+    return {};
+}
+Result<Bytes> Engine::poll(std::uint64_t now) {
+    auto& s = *impl_;
+    if (s.failed || s.ended || !s.time(now))
+        return std::unexpected(quic_error(invalid));
+    std::array<std::uint8_t, 1200> out{};
+    ngtcp2_pkt_info info{};
+    ngtcp2_path_storage path;
+    ngtcp2_path_storage_zero(&path);
+    // 单向控制流先于双向业务流，防止业务窗口耗尽阻塞控制/QPACK 进展。
+    for (bool unidirectional : {true, false}) {
+    for (auto& [id, stream] : s.streams) {
+        if (stream.cancelled || bool(id & 2) != unidirectional) continue;
+        for (auto& chunk : stream.chunks) {
+            if (chunk.submitted) continue;
+            ngtcp2_vec vec{chunk.bytes.empty() ? nullptr : chunk.bytes.data() + chunk.sent,
+                           chunk.bytes.size() - chunk.sent};
+            ngtcp2_ssize used = -1;
+            auto n = ngtcp2_conn_writev_stream(s.conn,
+                                               &path.path,
+                                               &info,
+                                               out.data(),
+                                               out.size(),
+                                               &used,
+                                               chunk.fin ? NGTCP2_WRITE_STREAM_FLAG_FIN
+                                                         : NGTCP2_WRITE_STREAM_FLAG_NONE,
+                                               id,
+                                               &vec,
+                                               1,
+                                               now);
+            if (n == NGTCP2_ERR_STREAM_DATA_BLOCKED || n == NGTCP2_ERR_STREAM_SHUT_WR ||
+                n == NGTCP2_ERR_STREAM_NOT_FOUND)
+                break;
+            if (n < 0) {
+                s.failed = true;
+                return std::unexpected(quic_error(static_cast<int>(n)));
+            }
+            if (used >= 0) {
+                chunk.sent += static_cast<std::size_t>(used);
+                chunk.submitted = chunk.sent == chunk.bytes.size();
+            }
+            if (n > 0) {
+                ngtcp2_conn_update_pkt_tx_time(s.conn, now);
+                return Bytes(out.begin(), out.begin() + n);
+            }
+            break;
+        }
+    }
+    }
+    auto n = ngtcp2_conn_write_pkt(s.conn, &path.path, &info, out.data(), out.size(), now);
+    if (n < 0) {
+        s.failed = true;
+        return std::unexpected(quic_error(static_cast<int>(n)));
+    }
+    if (n) ngtcp2_conn_update_pkt_tx_time(s.conn, now);
+    return Bytes(out.begin(), out.begin() + n);
+}
+Result<void> Engine::handle_expiry(std::uint64_t now) {
+    auto& s = *impl_;
+    if (s.failed || s.ended || !s.time(now))
+        return std::unexpected(quic_error(invalid));
+    int rv = ngtcp2_conn_handle_expiry(s.conn, now);
+    if (rv) {
+        s.failed = true;
+        return std::unexpected(quic_error(rv));
+    }
+    return {};
+}
+std::uint64_t Engine::expiry() const noexcept {
+    return ngtcp2_conn_get_expiry(impl_->conn);
+}
+bool Engine::handshake_complete() const noexcept {
+    return !impl_->failed && ngtcp2_conn_get_handshake_completed(impl_->conn);
+}
+bool Engine::is_server() const noexcept {
+    return impl_->options.server;
+}
+std::size_t Engine::write_capacity() const noexcept {
+    return impl_->failed || impl_->ended ? 0 : impl_->options.max_buffered_bytes - impl_->buffered;
+}
+std::uint64_t Engine::remote_bidi_stream_limit() const noexcept {
+    return impl_->remote_bidi_limit;
+}
+bool Engine::closed() const noexcept {
+    return impl_->ended || impl_->failed;
+}
+std::string Engine::negotiated_protocol() const {
+    const unsigned char* data = nullptr;
+    unsigned int size = 0;
+    SSL_get0_alpn_selected(impl_->ssl, &data, &size);
+    return size ? std::string(reinterpret_cast<const char*>(data), size) : std::string{};
+}
+Result<std::int64_t> Engine::open_stream(bool uni) {
+    auto& s = *impl_;
+    if (s.failed || s.ended || !handshake_complete())
+        return std::unexpected(quic_error(invalid));
+    if (!s.capacity()) return std::unexpected(quic_error(budget));
+    std::int64_t id;
+    int rv = uni ? ngtcp2_conn_open_uni_stream(s.conn, &id, nullptr)
+                 : ngtcp2_conn_open_bidi_stream(s.conn, &id, nullptr);
+    if (rv) return std::unexpected(quic_error(rv));
+    s.streams.try_emplace(id);
+    return id;
+}
+Result<void> Engine::write(std::int64_t id, std::span<const std::uint8_t> bytes, bool fin) {
+    auto& s = *impl_;
+    auto it = s.streams.find(id);
+    if (s.failed || s.ended || it == s.streams.end() || it->second.fin || it->second.cancelled)
+        return std::unexpected(quic_error(invalid));
+    if (bytes.size() > s.options.max_buffered_bytes - s.buffered ||
+        it->second.chunks.size() >= 4096)
+        return std::unexpected(quic_error(budget));
+    if (bytes.empty() && !fin) return {};
+    auto& stream = it->second;
+    stream.chunks.push_back({Bytes(bytes.begin(), bytes.end()), stream.end, 0, fin, false});
+    stream.end += bytes.size();
+    stream.fin = fin;
+    s.buffered += bytes.size();
+    return {};
+}
+std::vector<Event> Engine::take_events() {
+    std::vector<Event> result;
+    result.swap(impl_->events);
+    return result;
+}
+Result<void> Engine::consume(std::int64_t id, std::size_t bytes) {
+    auto& s = *impl_;
+    auto it = s.streams.find(id);
+    if (it == s.streams.end() || bytes > it->second.unread)
+        return std::unexpected(quic_error(invalid));
+    int rv = ngtcp2_conn_extend_max_stream_offset(s.conn, id, bytes);
+    if (rv && rv != NGTCP2_ERR_STREAM_NOT_FOUND) return std::unexpected(quic_error(rv));
+    ngtcp2_conn_extend_max_offset(s.conn, bytes);
+    it->second.unread -= bytes;
+    s.received -= bytes;
+    if (it->second.closed && !it->second.unread) {
+        // 关闭时因未消费数据而延迟归还的对端流额度，在这里补发。
+        if (!ngtcp2_conn_is_local_stream(s.conn, id)) {
+            if (ngtcp2_is_bidi_stream(id)) ngtcp2_conn_extend_max_streams_bidi(s.conn, 1);
+            else ngtcp2_conn_extend_max_streams_uni(s.conn, 1);
+        }
+        s.streams.erase(it);
+    }
+    return {};
+}
+Result<void> Engine::cancel(std::int64_t id, std::uint64_t code) {
+    if (id < 0 || code >= (std::uint64_t{1} << 62))
+        return std::unexpected(quic_error(invalid));
+    auto& s = *impl_;
+    if (s.failed || s.ended) return std::unexpected(quic_error(invalid));
+    int rv = ngtcp2_conn_shutdown_stream(s.conn, 0, id, code);
+    if (rv) return std::unexpected(quic_error(rv));
+    if (auto it = s.streams.find(id); it != s.streams.end()) it->second.cancelled = true;
+    return {};
+}
+Result<Bytes> Engine::close(std::uint64_t code, std::uint64_t now) {
+    if (code >= (std::uint64_t{1} << 62))
+        return std::unexpected(quic_error(invalid));
+    auto& s = *impl_;
+    if (s.ended || !s.time(now)) return std::unexpected(quic_error(invalid));
+    ngtcp2_ccerr err;
+    ngtcp2_ccerr_default(&err);
+    ngtcp2_ccerr_set_application_error(&err, code, nullptr, 0);
+    Bytes packet(1200);
+    ngtcp2_pkt_info info{};
+    auto n = ngtcp2_conn_write_connection_close(
+        s.conn, nullptr, &info, packet.data(), packet.size(), &err, now);
+    if (n < 0) return std::unexpected(quic_error(static_cast<int>(n)));
+    packet.resize(static_cast<std::size_t>(n));
+    s.ended = true;
+    return packet;
+}
+}  // namespace continuo::quic

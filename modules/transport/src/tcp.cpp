@@ -192,7 +192,7 @@ void Listener::close() noexcept {
 // ── connect ──────────────────────────────────────────────────────────────────
 
 Task<Result<Socket>> connect(EventLoop& loop,
-                             const Endpoint& endpoint,
+                             Endpoint endpoint,
                              ConnectOptions options,
                              OperationOptions io) {
     Result<detail::socket_t> created = detail::create_tcp_socket(endpoint.native_family());

@@ -32,6 +32,8 @@
     #include <array>
     #include <atomic>
     #include <exception>
+    #include <cstring>
+    #include <limits>
     #include <memory>
     #include <mswsock.h>
     #include <mutex>
@@ -108,7 +110,7 @@ public:
     /// no completion packet, so it resolves the moment it fires, while every
     /// kernel-backed operation must wait for its packet even after being
     /// cancelled.
-    enum class Kind { timer, read, write, accept, connect };
+    enum class Kind { timer, read, write, accept, connect, receive_from, send_to };
 
     /// One in-flight operation.
     ///
@@ -126,6 +128,13 @@ public:
         Result<void>* void_result{nullptr};
         Result<std::size_t>* size_result{nullptr};
         WSABUF buffer{};
+        // Winsock 在异步完成之前仍可写地址长度和 flags。
+        SOCKADDR_STORAGE datagram_address{};
+        int datagram_address_size{sizeof(SOCKADDR_STORAGE)};
+        DWORD datagram_flags{0};
+        DatagramResult* datagram_result{nullptr};
+        char empty_buffer{0};
+        std::size_t datagram_capacity{0};
 
         /// Accept-only state. AcceptEx requires the socket to exist *before*
         /// the operation is submitted, and writes both endpoint addresses into
@@ -368,6 +377,57 @@ public:
         const Error error = last_socket_error();
         discard(acquired.id);
         return fail(error);
+    }
+
+    [[nodiscard]] Result<detail::OperationId> submit_datagram(
+        NativeHandle handle, std::span<std::byte> destination,
+        std::span<const std::byte> source, std::span<const std::byte> address,
+        DatagramResult* datagram, const OperationOptions& options,
+        std::coroutine_handle<> coroutine, Result<std::size_t>* result) {
+        if (shutting_down()) return fail(Errc::cancelled);
+        if (const auto rejected = detail::rejected_before_submit(options)) return fail(*rejected);
+        const bool receiving = datagram != nullptr;
+        const Kind kind = receiving ? Kind::receive_from : Kind::send_to;
+        const std::size_t size = receiving ? destination.size() : source.size();
+        if (size > (std::numeric_limits<ULONG>::max)())
+            return fail(std::make_error_code(std::errc::message_size));
+        if (handle == invalid_handle || (!receiving &&
+            (address.size() < sizeof(sockaddr) || address.size() > sizeof(SOCKADDR_STORAGE))))
+            return fail(Errc::invalid_argument);
+        {
+            const std::lock_guard lock{mutex_};
+            for (const auto& [id, op] : operations_) {
+                if (op->socket == static_cast<SOCKET>(handle) && op->kind == kind &&
+                    !op->handle_closed) return fail(Errc::invalid_argument);
+            }
+        }
+        const Acquired acquired = acquire_operation(kind, coroutine, std::nullopt, options);
+        Operation* op = acquired.operation;
+        op->size_result = result;
+        op->socket = static_cast<SOCKET>(handle);
+        op->buffer.buf = receiving ? reinterpret_cast<char*>(destination.data())
+            : const_cast<char*>(reinterpret_cast<const char*>(source.data()));
+        if (size == 0) op->buffer.buf = &op->empty_buffer;
+        op->buffer.len = static_cast<ULONG>(receiving && size == 0 ? 1 : size);
+        op->datagram_capacity = size;
+        op->datagram_result = datagram;
+        int status = 0;
+        if (receiving) {
+            status = ::WSARecvFrom(op->socket, &op->buffer, 1, nullptr,
+                &op->datagram_flags, reinterpret_cast<sockaddr*>(&op->datagram_address),
+                &op->datagram_address_size, &op->overlapped, nullptr);
+        } else {
+            std::memcpy(&op->datagram_address, address.data(), address.size());
+            op->datagram_address_size = static_cast<int>(address.size());
+            status = ::WSASendTo(op->socket, &op->buffer, 1, nullptr, 0,
+                reinterpret_cast<const sockaddr*>(&op->datagram_address),
+                op->datagram_address_size, &op->overlapped, nullptr);
+        }
+        if (status == 0 || ::WSAGetLastError() == WSA_IO_PENDING) return acquired.id;
+        const int error = ::WSAGetLastError();
+        discard(acquired.id);
+        if (error == WSAEMSGSIZE) return fail(std::make_error_code(std::errc::message_size));
+        return fail(socket_error(error));
     }
 
     [[nodiscard]] Result<detail::OperationId> submit_accept(NativeHandle listener,
@@ -706,7 +766,11 @@ private:
                                          &ignored_bytes,
                                          FALSE,
                                          &ignored_flags) == FALSE) {
-                return fail(socket_error(::WSAGetLastError()));
+                const int error = ::WSAGetLastError();
+                if (error == WSAEMSGSIZE && (operation.kind == Kind::receive_from ||
+                                             operation.kind == Kind::send_to))
+                    return fail(std::make_error_code(std::errc::message_size));
+                return fail(socket_error(error));
             }
             return fail(std::error_code{static_cast<int>(status), std::system_category()});
         }
@@ -731,6 +795,20 @@ private:
                 // Zero bytes on a completed recv means the peer closed.
                 return fail(Errc::eof);
             }
+            return static_cast<std::size_t>(transferred);
+        case Kind::receive_from:
+            if ((operation.datagram_flags & (MSG_PARTIAL | MSG_TRUNC)) != 0 ||
+                transferred > operation.datagram_capacity)
+                return fail(std::make_error_code(std::errc::message_size));
+            operation.datagram_result->size = transferred;
+            operation.datagram_result->address_size =
+                static_cast<std::size_t>(operation.datagram_address_size);
+            std::memcpy(operation.datagram_result->address.data(), &operation.datagram_address,
+                        operation.datagram_result->address_size);
+            return static_cast<std::size_t>(transferred);
+        case Kind::send_to:
+            if (transferred != operation.buffer.len)
+                return fail(std::make_error_code(std::errc::message_size));
             return static_cast<std::size_t>(transferred);
         case Kind::write:
             return static_cast<std::size_t>(transferred);
@@ -1086,6 +1164,36 @@ Task<Result<void>> EventLoop::connect(NativeHandle handle,
     // ConnectEx leaves the socket in a half-initialised state until told.
     ::setsockopt(static_cast<SOCKET>(handle), SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, nullptr, 0);
     co_return Result<void>{};
+}
+
+Task<Result<EventLoop::DatagramResult>> EventLoop::receive_from(
+    NativeHandle handle, std::span<std::byte> destination, OperationOptions options) {
+    Impl* impl = impl_.get();
+    if (!impl) co_return fail(Errc::cancelled);
+    DatagramResult datagram;
+    auto submit = [impl, handle, destination, &options, &datagram](
+        std::coroutine_handle<> coroutine, Result<std::size_t>* result) {
+        return impl->submit_datagram(handle, destination, {}, {}, &datagram,
+                                     options, coroutine, result);
+    };
+    const auto received = co_await detail::await_operation<Result<std::size_t>>(
+        std::move(submit), detail::cancel_through(impl), options.stop);
+    if (!received) co_return fail(received.error());
+    co_return datagram;
+}
+
+Task<Result<std::size_t>> EventLoop::send_to(
+    NativeHandle handle, std::span<const std::byte> source,
+    std::span<const std::byte> address, OperationOptions options) {
+    Impl* impl = impl_.get();
+    if (!impl) co_return fail(Errc::cancelled);
+    auto submit = [impl, handle, source, address, &options](
+        std::coroutine_handle<> coroutine, Result<std::size_t>* result) {
+        return impl->submit_datagram(handle, {}, source, address, nullptr,
+                                     options, coroutine, result);
+    };
+    co_return co_await detail::await_operation<Result<std::size_t>>(
+        std::move(submit), detail::cancel_through(impl), options.stop);
 }
 
 // ── timers and scheduling ────────────────────────────────────────────────────

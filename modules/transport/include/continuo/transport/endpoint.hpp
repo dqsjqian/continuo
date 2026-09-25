@@ -33,8 +33,9 @@ class Endpoint {
 public:
     /// Parse a numeric address. Rejects host names — see the header comment.
     ///
-    /// Accepts "127.0.0.1", "::1", and scoped forms like "fe80::1%eth0" where
-    /// the platform supports them.
+    /// Accepts "127.0.0.1", "::1", and numeric IPv6 scopes such as "fe80::1%3".
+    /// POSIX also accepts existing interface names ("fe80::1%eth0"). Windows
+    /// requires numeric scopes. Empty/unknown scopes and embedded NUL are rejected.
     [[nodiscard]] static Result<Endpoint> parse(std::string_view address, std::uint16_t port);
 
     /// Loopback: 127.0.0.1 or ::1.

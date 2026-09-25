@@ -21,6 +21,7 @@
 #include "continuo/core/buffer.hpp"
 #include "continuo/core/error.hpp"
 #include "continuo/http/message.hpp"
+#include "continuo/http/limits.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -64,6 +65,12 @@ enum class SerializeError {
                                                const Response& response,
                                                Framing framing,
                                                std::uint64_t body_size = 0);
+
+/// 请求仅支持 origin-form 和 OPTIONS *；不支持代理 absolute-form、CONNECT、Upgrade、Expect。
+/// HTTP/1.1 必须恰好一个有效 Host；framing 完全由序列化器拥有。
+[[nodiscard]] Result<void> write_request_head(Buffer& out, const Request& request,
+                                              std::uint64_t body_size = 0,
+                                              Limits limits = {});
 
 /// Write one chunk of a chunked body, including its size line and trailing CRLF.
 ///

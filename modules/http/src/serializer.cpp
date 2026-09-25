@@ -87,16 +87,11 @@ bool status_forbids_body(unsigned status) noexcept {
 }
 
 bool should_keep_alive(const Request& request) noexcept {
-    const std::optional<std::string_view> connection = request.headers.get("Connection");
-
-    // The token list is case-insensitive and may contain several values.
     const auto mentions = [&](std::string_view token) {
-        if (!connection) {
-            return false;
-        }
-        for (const std::string_view item : grammar::split_list(*connection)) {
-            if (HeaderMap::names_equal(item, token)) {
-                return true;
+        for (const auto& [name, value] : request.headers) {
+            if (!HeaderMap::names_equal(name, "Connection")) continue;
+            for (const std::string_view item : grammar::split_list(value)) {
+                if (HeaderMap::names_equal(item, token)) return true;
             }
         }
         return false;
@@ -106,13 +101,16 @@ bool should_keep_alive(const Request& request) noexcept {
         return !mentions("close");
     }
     // HTTP/1.0 is close-by-default; persistence is opt-in.
-    return mentions("keep-alive");
+    return mentions("keep-alive") && !mentions("close");
 }
 
 Result<void> write_response_head(Buffer& out,
                                  const Response& response,
                                  Framing framing,
                                  std::uint64_t body_size) {
+    if (response.version == Version::http_1_0 && framing == Framing::chunked) {
+        return fail(Errc::not_supported);
+    }
     if (response.status < 100 || response.status > 999) {
         return fail(SerializeError::invalid_status);
     }
@@ -174,6 +172,119 @@ Result<void> write_response_head(Buffer& out,
 
     append(out, "\r\n");
     return Result<void>{};
+}
+
+Result<void> write_request_head(Buffer& out, const Request& request,
+                                std::uint64_t body_size, Limits limits) {
+    if (request.method == Method::connect || request.method == Method::other ||
+        request.headers.contains("Upgrade") || request.headers.contains("Expect")) {
+        return fail(Errc::not_supported);
+    }
+    const auto method = to_string(request.method);
+    if (method.empty() || (request.version != Version::http_1_0 && request.version != Version::http_1_1)) {
+        return fail(Errc::invalid_argument);
+    }
+    if (request.target.empty() ||
+        (request.target.front() != '/' && !(request.method == Method::options && request.target == "*"))) {
+        return fail(Errc::invalid_argument);
+    }
+    for (char c : request.target) {
+        const auto byte = static_cast<unsigned char>(c);
+        if (byte <= 0x20 || byte >= 0x7f || c == '#') return fail(Errc::invalid_argument);
+    }
+    if (request.headers.contains("Content-Length") || request.headers.contains("Transfer-Encoding")) {
+        return fail(SerializeError::framing_conflict);
+    }
+    if (request.headers.count("Host") > 1 ||
+        (request.version == Version::http_1_1 && request.headers.count("Host") != 1)) {
+        return fail(SerializeError::invalid_header);
+    }
+    if (const auto host = request.headers.get("Host")) {
+        // 保守 authority 子集：ASCII reg-name / 方括号 IPv6，以及可选十进制端口。
+        auto authority = *host;
+        if (authority.empty()) return fail(SerializeError::invalid_header);
+        std::string_view port;
+        if (authority.front() == '[') {
+            const auto end = authority.find(']');
+            if (end == std::string_view::npos) return fail(SerializeError::invalid_header);
+            const auto ip = authority.substr(1, end - 1);
+            const auto compression = ip.find("::");
+            if (ip.empty() || (ip.front() == ':' && !ip.starts_with("::")) ||
+                (ip.back() == ':' && !ip.ends_with("::")) || ip.find(":::") != std::string_view::npos ||
+                (compression != std::string_view::npos && ip.find("::", compression + 2) != std::string_view::npos)) {
+                return fail(SerializeError::invalid_header);
+            }
+            std::size_t groups = 0;
+            std::size_t digits = 0;
+            for (char c : ip) {
+                if (c == ':') { if (digits) ++groups; digits = 0; }
+                else {
+                    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) ||
+                        ++digits > 4) return fail(SerializeError::invalid_header);
+                }
+            }
+            if (digits) ++groups;
+            if ((compression == std::string_view::npos &&
+                 (groups != 8 || ip.front() == ':' || ip.back() == ':')) ||
+                (compression != std::string_view::npos && groups >= 8)) return fail(SerializeError::invalid_header);
+            authority.remove_prefix(end + 1);
+            if (!authority.empty()) {
+                if (authority.front() != ':') return fail(SerializeError::invalid_header);
+                port = authority.substr(1);
+                if (port.empty()) return fail(SerializeError::invalid_header);
+            }
+        } else {
+            const auto colon = authority.find(':');
+            const auto name = authority.substr(0, colon);
+            if (name.empty()) return fail(SerializeError::invalid_header);
+            for (char c : name) {
+                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                      (c >= '0' && c <= '9') || c == '.' || c == '-')) return fail(SerializeError::invalid_header);
+            }
+            if (colon != std::string_view::npos) {
+                port = authority.substr(colon + 1);
+                if (port.empty()) return fail(SerializeError::invalid_header);
+            }
+        }
+        unsigned port_number = 0;
+        for (char c : port) {
+            if (c < '0' || c > '9' || port_number > 6553) return fail(SerializeError::invalid_header);
+            port_number = port_number * 10 + static_cast<unsigned>(c - '0');
+        }
+        if (port_number > 65535) return fail(SerializeError::invalid_header);
+    }
+    if (request.target.size() > limits.max_start_line ||
+        method.size() + 10 > limits.max_start_line - request.target.size() ||
+        body_size > limits.max_body_size || request.headers.size() >= limits.max_header_count) {
+        return fail(Errc::limit_exceeded);
+    }
+    std::size_t total = 0;
+    for (const auto& [name, value] : request.headers) {
+        if (!valid_header_name(name) || !valid_header_value(value)) return fail(SerializeError::invalid_header);
+        if (HeaderMap::names_equal(name, "Connection")) {
+            for (const auto token : grammar::split_list(value)) {
+                if (!HeaderMap::names_equal(token, "close") && !HeaderMap::names_equal(token, "keep-alive")) {
+                    return fail(Errc::not_supported);
+                }
+            }
+        }
+        if (name.size() > limits.max_header_line || value.size() > limits.max_header_line - name.size() ||
+            limits.max_header_line - name.size() - value.size() < 2) return fail(Errc::limit_exceeded);
+        const auto size = name.size() + value.size() + 2;
+        if (size > limits.max_headers_total - total) return fail(Errc::limit_exceeded);
+        total += size;
+    }
+    const auto framing = "Content-Length: " + std::to_string(body_size);
+    if (framing.size() > limits.max_header_line || framing.size() > limits.max_headers_total - total) {
+        return fail(Errc::limit_exceeded);
+    }
+    append(out, method); append(out, " "); append(out, request.target);
+    append(out, " "); append(out, to_string(request.version)); append(out, "\r\n");
+    for (const auto& [name, value] : request.headers) {
+        append(out, name); append(out, ": "); append(out, value); append(out, "\r\n");
+    }
+    append(out, framing); append(out, "\r\n\r\n");
+    return {};
 }
 
 Result<void> write_chunk(Buffer& out, std::span<const std::byte> chunk) {

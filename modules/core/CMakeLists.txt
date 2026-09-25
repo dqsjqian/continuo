@@ -7,6 +7,7 @@
 
 add_library(continuo_core
     src/error.cpp
+    src/event_loop_common.cpp
 )
 
 add_library(continuo::core ALIAS continuo_core)

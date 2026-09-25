@@ -7,6 +7,8 @@
 add_library(continuo_transport
     src/endpoint.cpp
     src/tcp.cpp
+    src/udp.cpp
+    src/resolver.cpp
 )
 
 add_library(continuo::transport ALIAS continuo_transport)

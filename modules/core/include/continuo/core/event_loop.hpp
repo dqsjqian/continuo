@@ -27,6 +27,7 @@
 #include "continuo/core/platform.hpp"
 #include "continuo/core/task.hpp"
 
+#include <array>
 #include <chrono>
 #include <coroutine>
 #include <cstddef>
@@ -80,6 +81,8 @@ public:
     [[nodiscard]] Result<void> attach(NativeHandle handle);
 
     /// Stop tracking `handle`. Call before closing it.
+    /// POSIX 上可能同步恢复等待协程；续体不得销毁或替换此 loop，
+    /// 也不得重入 run_once。与正常 dispatch 一样，违反时 terminate。
     void detach(NativeHandle handle);
 
     /// Read once into `destination`, resolving with the byte count.
@@ -129,6 +132,25 @@ public:
                                              std::span<const std::byte> address,
                                              OperationOptions options = {});
 
+    /// 数据报完成结果；地址是不透明的 sockaddr 字节，不依赖 transport。
+    struct DatagramResult {
+        std::size_t size{0};
+        alignas(std::max_align_t) std::array<std::byte, 128> address{};
+        std::size_t address_size{0};
+    };
+
+    /// 接收一整个数据报。零长包成功；零长 destination 仍消费一个包。
+    /// 缓冲不足返回 std::errc::message_size，整包已消费，尾部不会再次返回。
+    /// 同一 handle 每个方向只允许一个在途数据报操作，否则 invalid_argument。
+    /// buffer 借用到完成；取消不撤回已发生的 I/O，IOCP 排空完成包后才返回。
+    [[nodiscard]] Task<Result<DatagramResult>> receive_from(
+        NativeHandle handle, std::span<std::byte> destination, OperationOptions options = {});
+
+    /// 发送单个数据报（包括零长包）。地址字节与 buffer 均借用到完成。
+    [[nodiscard]] Task<Result<std::size_t>> send_to(
+        NativeHandle handle, std::span<const std::byte> source,
+        std::span<const std::byte> address, OperationOptions options = {});
+
     // ── timers and scheduling (portable) ────────────────────────────────────
 
     /// Suspend for at least `delay`.
@@ -164,6 +186,41 @@ public:
     /// host with its own main loop needs to interleave, and because tests
     /// should not depend on wall-clock races.
     Result<void> run_once(Duration timeout = Duration::min());
+
+    /// Start `task` on this loop and pump until it finishes.
+    ///
+    /// The bridge from `main`. A `Task` is lazy and its awaiter owns the frame,
+    /// so starting one needs a caller that outlives it — and `main` is not a
+    /// coroutine. Without this, every program has to declare its own detached
+    /// coroutine type, which is boilerplate no example should have to teach.
+    ///
+    /// `stop()` does **not** cut this short, for the same reason `stop()` is
+    /// not cancellation: the root frame is started and unfinished, and
+    /// abandoning it is exactly the use-after-free this library refuses to
+    /// perform. Ask a server to wind down with a stop token in
+    /// `OperationOptions`, which resolves its operations and lets the task
+    /// return; `stop()` only concerns the pumping. One consequence worth
+    /// knowing: pumping stops blocking once `stop()` has been observed, so a
+    /// `stop()` with the task still in flight polls rather than waits until it
+    /// unwinds.
+    ///
+    /// Rethrows exceptions from `task`. A pumping error is returned only if
+    /// that same iteration also finished the task; otherwise it terminates
+    /// rather than abandoning the root.
+    ///
+    /// Terminates, with a diagnostic, if the task can no longer finish: either
+    /// pumping failed, or nothing is outstanding while the task is still
+    /// suspended. The second case is a deadlock rather than a wait — usually a
+    /// task parked on a channel or semaphore nobody will signal. Reporting it
+    /// beats hanging, and the frame cannot be destroyed to recover.
+    ///
+    /// That diagnosis relies on the same invariant `run()` already does:
+    /// anything able to resume a coroutine counts as outstanding work, *even
+    /// when the resumption comes from another thread*. A facility that parks a
+    /// coroutine and arranges its resumption off-thread — a name resolver
+    /// handing work to a thread pool, say — has to keep the loop aware of it,
+    /// or `run()` will already return while that work is still pending.
+    Result<void> run_until_complete(Task<void> task);
 
     /// Ask the loop to return from `run()`. Safe from any thread.
     void stop();

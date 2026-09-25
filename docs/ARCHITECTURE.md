@@ -88,12 +88,13 @@ not the product boundary, and another library's HTTP feature list is not the
 acceptance plan.
 
 RFC 9110 supplies shared HTTP semantics; RFC 9112 defines HTTP/1.1 framing.
-Future HTTP/2 or HTTP/3 work may reuse semantic types where appropriate, but
-must define its own framing, multiplexing, flow-control and transport needs.
-In particular, HTTP/1.1 connection/body framing is not a generic HTTP contract.
-These protocols are possible extensions, not completed modules or release
-commitments. TLS integration tests are useful composition evidence, not a
-reason to postpone the core lifetime and backpressure work.
+HTTP/2 and HTTP/3 are phase-one requirements. Their optional nghttp2 and
+nghttp3/ngtcp2 engines define separate framing, multiplexing, flow-control and
+transport needs. HTTP/1.1 connection/body framing is not a generic HTTP contract.
+Engine round trips do not complete phase-one acceptance: transport scheduling,
+independent interoperability, platform execution and resource validation remain
+explicit gates. TLS tests are composition evidence, not a reason to postpone
+core lifetime and backpressure work.
 
 ## Layering
 
@@ -606,9 +607,12 @@ destroying or re-entering a dispatching loop, both became terminating refusals
 rather than undefined behaviour. Two bugs that were live before this work also
 went: `run_once` stranded already-extracted operations when re-arming its
 wake-up pipe failed, and the HTTP grammar existed as two independent copies.
-Options are not yet forwarded by transport, TLS or HTTP.
+Options are now forwarded by transport, TLS and HTTP. UDP and system resolver
+waits use the same cancellation/deadline foundation. Cancelling a system
+resolver wait does not interrupt getaddrinfo; worker-owned state outlives the
+wait without retaining the loop.
 
-The current test registration has eight regular suites with TLS (`core`,
+The earlier cancellation baseline registered eight regular suites with TLS (`core`,
 `event_loop`, `task_scope`, `transport`, `http_parser`, `http_server`,
 `http_end_to_end`, `tls_https`), or seven without TLS. Eight additional CTests
 run a single contract violation each in its own process and require the exact
@@ -634,6 +638,10 @@ connection is finished — a caller that reuses it reads a stream with a hole in
 it. This foundation is neither production-readiness nor a complete
 cancellation-safety claim.
 
-**Deliberately absent.** UDP, routing, HTTP/2, a full HTTP client, native OS trust
-store integration, mTLS policy, streamed request bodies, end-to-end resource
-bounds, and multi-threaded loops.
+**Remaining work, not a phase-one scope exemption.** UDP, asynchronous system
+resolution, HTTP/1 client and HTTP/2 engines now exist; QUIC/HTTP3 are experimental.
+The current implementation still lacks complete request-body streaming, a QUIC
+UDP scheduling entry point, independent H2/H3 interoperability and full platform
+acceptance. Routing, native OS trust-store integration, mTLS policy, end-to-end
+resource bounds and multi-threaded loops also remain incomplete. See HANDOFF.md
+for the current tested snapshot rather than the historical counts above.

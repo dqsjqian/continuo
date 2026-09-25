@@ -37,7 +37,13 @@ continuo_add_terminate_tests(task_contract continuo_core_tests
     sync-get-suspended abandoned-awaiter)
 
 continuo_add_terminate_tests(event_loop continuo_event_loop_tests
-    destroy-during-dispatch reentrant-run-once)
+    destroy-during-dispatch reentrant-run-once root-task-deadlock)
+
+# 仅 POSIX detach 同步恢复 readiness 等待者；IOCP 取消通过完成包排空。
+if(NOT WIN32)
+    continuo_add_terminate_tests(event_loop continuo_event_loop_tests
+        destroy-during-detach reentrant-run-once-during-detach)
+endif()
 
 # An event-loop bug tends to hang rather than fail. A timeout turns that into
 # a red test instead of a stuck CI job.

@@ -646,6 +646,176 @@ void test_concurrent_operations(const Certificates& certificates) {
     }
 }
 
+struct AlpnExchange {
+    std::array<tcp::Socket, 2> sockets;
+    std::array<Error, 2> errors;
+    std::array<std::string, 2> negotiated;
+    int done = 0;
+};
+
+DetachedTask run_alpn_peer(EventLoop& loop,
+                           tcp::Listener& listener,
+                           std::optional<tls::Context> context,
+                           AlpnExchange& exchange,
+                           std::size_t peer,
+                           bool destroy_context) {
+    Completion completion{exchange.done};
+    auto connected = peer == 0 ? co_await listener.accept()
+                               : co_await tcp::connect(loop, listener.local_endpoint());
+    if (!connected) {
+        exchange.errors[peer] = connected.error();
+        co_return;
+    }
+    auto& socket = exchange.sockets[peer];
+    socket = std::move(*connected);
+    auto stream = tls::Stream<tcp::Socket>::create(socket, *context, peer == 0 ? "" : "localhost");
+    if (!stream) {
+        exchange.errors[peer] = stream.error();
+        co_return;
+    }
+    if (destroy_context) context.reset();
+    const auto handshake = co_await stream->handshake();
+    if (!handshake) {
+        exchange.errors[peer] = handshake.error();
+        co_return;
+    }
+    exchange.negotiated[peer] = stream->negotiated_protocol();
+    // ALPN 只选择名称，这里传递任意应用数据，不假装实现 HTTP/2。
+    if (peer == 0) {
+        const auto sent = co_await write_all(*stream, bytes_of("alpn"));
+        CHECK(sent.has_value());
+        const auto shutdown = co_await stream->shutdown();
+        CHECK(shutdown.has_value());
+    } else {
+        std::array<std::byte, 16> buffer{};
+        std::string received;
+        for (;;) {
+            const auto read = co_await stream->read_some(buffer);
+            if (!read) {
+                CHECK(read.error() == Errc::eof);
+                break;
+            }
+            received.append(reinterpret_cast<const char*>(buffer.data()), *read);
+        }
+        CHECK(received == "alpn");
+    }
+}
+
+void run_alpn_exchange(const Certificates& certificates,
+                       std::string_view name,
+                       std::span<const std::string_view> server_protocols,
+                       std::span<const std::string_view> client_protocols,
+                       std::string_view expected,
+                       bool failure = false,
+                       bool destroy_context = false) {
+    test::section(name);
+    const auto make_owned_context = [&certificates](std::span<const std::string_view> protocols,
+                                                    bool server_side) {
+        std::vector<std::string> storage;
+        storage.reserve(protocols.size());
+        for (const auto protocol : protocols) storage.emplace_back(protocol);
+        std::vector<std::string_view> copied;
+        for (const auto& protocol : storage) copied.push_back(protocol);
+        return server_side
+                   ? tls::Context::server_alpn(certificates.server, certificates.key, copied)
+                   : tls::Context::client_alpn(certificates.ca, copied);
+    };
+    // 配置输入在握手前销毁，验证 API 复制数据而不保留 string_view。
+    auto server = make_owned_context(server_protocols, true);
+    auto client = make_owned_context(client_protocols, false);
+    CHECK(server.has_value());
+    CHECK(client.has_value());
+    if (!server || !client) return;
+    AlpnExchange exchange;
+    auto loop = EventLoop::create();
+    CHECK(loop.has_value());
+    if (!loop) return;
+    auto listener = tcp::Listener::bind(*loop, Endpoint::loopback(0));
+    CHECK(listener.has_value());
+    if (!listener) return;
+    struct Cleanup {
+        AlpnExchange& exchange;
+        ~Cleanup() {
+            for (auto& socket : exchange.sockets) socket.close();
+        }
+    } cleanup{exchange};
+    run_alpn_peer(*loop, *listener, std::move(*server), exchange, 0, destroy_context);
+    run_alpn_peer(*loop, *listener, std::move(*client), exchange, 1, destroy_context);
+    const auto deadline = EventLoop::Clock::now() + 5s;
+    while (exchange.done < 2 && EventLoop::Clock::now() < deadline) {
+        const auto iteration = loop->run_once(10ms);
+        CHECK(iteration.has_value());
+        if (!iteration) break;
+    }
+    CHECK(exchange.done == 2);
+    for (std::size_t peer = 0; peer < 2; ++peer) {
+        if (failure) {
+            CHECK(exchange.errors[peer] == tls::Errc::protocol_error);
+        } else {
+            CHECK(!exchange.errors[peer]);
+            CHECK(exchange.negotiated[peer] == expected);
+        }
+    }
+}
+
+void test_alpn(const Certificates& certificates) {
+    constexpr std::array<std::string_view, 2> server{"h2", "http/1.1"};
+    constexpr std::array<std::string_view, 2> reversed{"http/1.1", "h2"};
+    constexpr std::array<std::string_view, 1> http1{"http/1.1"};
+    constexpr std::array<std::string_view, 1> unmatched{"other/1"};
+    run_alpn_exchange(certificates, "ALPN h2 按服务器而非客户端优先顺序选择", server, reversed, "h2");
+    run_alpn_exchange(certificates, "ALPN 客户端只提供 HTTP/1.1 时回退", server, http1, "http/1.1");
+    run_alpn_exchange(certificates, "ALPN 客户端无扩展时允许无协商", server, {}, "");
+    run_alpn_exchange(certificates, "ALPN 服务端禁用时允许无协商", {}, reversed, "");
+    run_alpn_exchange(certificates, "ALPN 无共同协议发送 fatal alert", server, unmatched, "", true);
+    run_alpn_exchange(certificates, "ALPN Context 早析构后 SSL_CTX 仍保留列表", server, reversed,
+                      "h2", false, true);
+    const std::string binary{"h\0\xff", 3};
+    const std::array<std::string_view, 2> binary_server{binary, "h2"};
+    const std::array<std::string_view, 2> binary_client{"h2", binary};
+    run_alpn_exchange(certificates, "ALPN 二进制协议名保留 NUL 与高位字节", binary_server,
+                      binary_client, binary, false, true);
+
+    test::section("ALPN 列表校验与编码长度边界");
+    const auto invalid = [&certificates](std::span<const std::string_view> protocols) {
+        const auto client = tls::Context::client_alpn(certificates.ca, protocols);
+        const auto server_context =
+            tls::Context::server_alpn(certificates.server, certificates.key, protocols);
+        CHECK(!client && client.error() == Errc::invalid_argument);
+        CHECK(!server_context && server_context.error() == Errc::invalid_argument);
+    };
+    const std::array<std::string_view, 1> empty{""};
+    invalid(empty);
+    const std::array<std::string_view, 2> duplicate{"h2", "h2"};
+    invalid(duplicate);
+    const std::array<std::string_view, 2> binary_duplicate{binary, binary};
+    invalid(binary_duplicate);
+    const std::string oversized(256, 'x');
+    const std::array<std::string_view, 1> oversized_protocol{oversized};
+    invalid(oversized_protocol);
+    const auto legacy_client = tls::Context::client(certificates.ca, oversized);
+    CHECK(!legacy_client && legacy_client.error() == Errc::invalid_argument);
+    const auto legacy_server = tls::Context::server(certificates.server, certificates.key, oversized);
+    CHECK(!legacy_server && legacy_server.error() == Errc::invalid_argument);
+
+    const std::string longest(255, 'x');
+    const std::array<std::string_view, 1> longest_protocol{longest};
+    run_alpn_exchange(certificates, "ALPN 255 字节名称可协商", longest_protocol, longest_protocol,
+                      longest);
+    std::vector<std::string> names;
+    names.reserve(256);
+    for (unsigned int i = 0; i < 256; ++i) {
+        names.emplace_back(255, 'x');
+        names.back()[0] = static_cast<char>(i);
+    }
+    std::vector<std::string_view> protocols;
+    for (const auto& protocol : names) protocols.push_back(protocol);
+    invalid(protocols);  // 256 * (255 + 1) = 65536。
+    protocols.back() = protocols.back().substr(0, 254);
+    CHECK(tls::Context::client_alpn(certificates.ca, protocols).has_value());
+    CHECK(tls::Context::server_alpn(certificates.server, certificates.key, protocols).has_value());
+}
+
 void test_configuration(const Certificates& certificates) {
     test::section("TLS 配置错误与错误域");
     const auto missing = (certificates.directory / "does-not-exist.pem").string();
@@ -665,6 +835,7 @@ int main() {
         Certificates certificates;
         certificates.create();
         test_configuration(certificates);
+        test_alpn(certificates);
         test_concurrent_operations(certificates);
         test_options_reach_the_underlying_stream(certificates);
         run_exchange(certificates, "HTTPS DNS 身份验证与 close_notify", "localhost");

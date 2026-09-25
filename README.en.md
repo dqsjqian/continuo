@@ -6,7 +6,7 @@
 
 One completion-shaped I/O interface across kqueue, epoll and IOCP, without teaching protocols about sockets.
 
-C++23 · TCP · Optional OpenSSL 3 · HTTP/1.1
+C++23 · TCP / UDP · Async name resolution · TLS · HTTP/1.1 / HTTP/2 · Experimental QUIC / HTTP/3
 
 [简体中文](README.md) | **English**
 
@@ -17,7 +17,7 @@ C++23 · TCP · Optional OpenSSL 3 · HTTP/1.1
 > *Basso continuo*: the continuously played bass line that provides a musical foundation.
 > Continuo aims to be that foundation for networking software, not another all-in-one HTTP framework.
 
-**Current stage: an experimental foundation, not a production-ready networking stack.** TCP, optional TLS and HTTP/1.1 have implementations and tests. Single-threaded `TaskScope` now provides explicit child-task ownership and joining, but complete I/O cancellation, deadlines and end-to-end backpressure remain unfinished. APIs may change as their contracts mature; there is no stable ABI promise yet.
+**Current stage: phase-one protocol implementation in progress, not a production-ready networking stack.** New modules cover UDP, bounded asynchronous system name resolution, an HTTP/1 client, multi-protocol ALPN, optional nghttp2, and experimental QUIC / HTTP/3 engines based on ngtcp2 / nghttp3. Per-operation cancellation and deadlines exist; cross-layer shutdown, end-to-end backpressure and complete platform acceptance remain unfinished. H2/H3 are phase-one goals: engine round trips are not complete phase-one acceptance. APIs may change as their contracts mature; there is no stable ABI promise yet.
 
 ## Why Continuo
 
@@ -35,8 +35,13 @@ flowchart TB
     App[Application: composition and lifetime ownership]
     App -.-> HTTP[http · HTTP/1.1]
     App -.-> TLS[tls · Optional OpenSSL 3]
-    App -.-> TCP[transport · TCP]
+    App -.-> TCP[transport · TCP / UDP / Resolver]
+    App -.-> H2[http2 · Optional nghttp2]
+    App -.-> H3[http3 · Experimental nghttp3]
     HTTP --> Core[core · Task / TaskScope / Result / AsyncStream / Executor / Buffer / EventLoop]
+    H2 --> Core
+    H3 --> QUIC[quic · ngtcp2 / QUIC TLS]
+    QUIC --> TCP
     TLS --> Core
     TCP --> Core
     Core --> Backends[kqueue · epoll · IOCP]
@@ -47,9 +52,12 @@ Solid arrows show dependencies; dashed arrows show application composition. HTTP
 | Directory / build target | Responsibility |
 |---|---|
 | `modules/core` · `continuo::core` | Coroutines and task scopes, errors, stream and executor interfaces, buffers, event loop and timers |
-| `modules/transport` · `continuo::transport` | Numeric IP addresses, TCP listen / connect / read / write |
-| `modules/tls` · `continuo::tls` | Optional TLS stream, certificate and hostname verification, ALPN |
-| `modules/http` · `continuo::http` | HTTP/1.1 parsing, serialization and single-connection request handling |
+| `modules/transport` · `continuo::transport` | IP endpoints, TCP, message-preserving UDP and bounded background system resolution |
+| `modules/tls` · `continuo::tls` | Optional TLS stream, certificate and hostname verification, multi-protocol ALPN |
+| `modules/http` · `continuo::http` | HTTP/1 request / response parsing, serialization, connection server and client |
+| `modules/http2` · `continuo::http2` | Optional nghttp2 Session, multiplexed streams and generic stream adapter |
+| `modules/quic` · `continuo::quic` | Experimental QUIC v1 datagram engine, dedicated TLS 1.3, retransmission and flow control |
+| `modules/http3` · `continuo::http3` | Experimental nghttp3 / QPACK engine; applications drive datagrams and timers |
 
 `tools/ci/check_layering.py` checks dependency direction, rejects host-framework headers, centralizes platform detection in `platform.hpp`, and keeps OS headers out of protocols. Static layering checks do not establish runtime safety.
 
@@ -60,10 +68,13 @@ Solid arrows show dependencies; dashed arrows show application composition. HTTP
 | Execution and lifetimes | Lazy, move-only `Task` that terminates rather than destroy a started, unfinished frame; single-threaded `TaskScope` spawn / join and cooperative stop token; single-threaded `EventLoop`, timers and posted work | Cross-layer join / drain contracts and continued lifetime validation; destroying the loop mid-dispatch is refused rather than supported |
 | Cancellation and deadlines | `OperationOptions` travels from `EventLoop` through TCP and TLS to the HTTP connection loop; `BoundedStream` marks the streams that can honour it; HTTP converts `idle_timeout` / `request_timeout` into a fresh absolute deadline per request | The Windows side has CI evidence only and none locally; a cancelled IOCP read may discard bytes the kernel already moved, so that connection must be closed rather than reused |
 | TCP | IPv4 / IPv6, listen, connect, short transfers, exclusive binding by default | Continued close / completion race validation; end-to-end operation and queue bounds |
-| TLS (optional) | OpenSSL 3, certificate-chain and DNS-name / IP verification, one ALPN identifier, close notifications; handshake / read / write / shutdown accept `OperationOptions` and forward it downwards | Mobile TLS; broader interoperability evidence |
-| HTTP/1.1 | Incremental parsing, serialization, keep-alive, pipelined request handling, HEAD, chunked responses | Request bodies currently use bounded buffering; streaming requests, routing and a complete client remain unimplemented |
-| Security and resources | Parser limits, malformed-input tests, bounded TLS BIO | End-to-end backpressure, aggregate memory bounds, broader fuzzing and failure injection |
-| Future transports and protocols | TCP stream contracts as a starting point | UDP / datagrams, DNS, further protocols and backends; HTTP/2 and HTTP/3 are not implemented |
+| UDP | IPv4 / IPv6, peer endpoints, empty datagrams, truncation errors consuming the entire packet, same-direction exclusion, cancellation and deadlines | New code lacks Linux / Windows runtime evidence; no batch I/O, ancillary messages or ECN |
+| DNS / name resolution | Bounded workers and queue, system getaddrinfo, deduplication, cancellation of waits and absolute deadlines; workers do not hold the loop | Not a DNS wire implementation; system calls cannot be interrupted and destructor join may wait; no Happy Eyeballs |
+| TLS (optional) | OpenSSL 3, certificate-chain and DNS-name / IP verification, server-preference multi-protocol ALPN, close notifications and budget forwarding | ALPN does not automatically switch HTTP implementations; mobile TLS and wider interoperability remain unverified |
+| HTTP/1 | Incremental request / response parsing, keep-alive, HEAD, chunked, 1xx / EOF framing; on-demand response body chunks and external server cancellation | Server requests remain bounded-buffered; client requests use known-length spans; no pool, redirects, proxy, 100-continue or tunnels |
+| HTTP/2 (optional) | nghttp2 client / server, HPACK, multiplexing, bounded buffering, consumption-driven windows, RST_STREAM / GOAWAY; real TCP / TLS tests | No h2c Upgrade, server push, CONNECT or outbound 1xx / trailers; outbound bodies are not asynchronous sources; independent interoperability and platform acceptance pending |
+| QUIC / HTTP/3 (experimental) | ngtcp2 + nghttp3 + dedicated OpenSSL ossl QUIC TLS; encrypted client/server datagrams, QPACK, streaming receive, cancellation and two-stage GOAWAY | Upstream ossl backend remains experimental; fixed path, no migration / 0-RTT / Retry policy; UDP scheduling entry point, independent interoperability and platform acceptance pending |
+| Security and resources | Protocol limits, malformed-input tests, bounded TLS BIO and isolated mutations for key fixes | End-to-end backpressure, aggregate connection memory, broad fuzz / overload / performance testing; neither phase one nor production readiness is complete |
 
 “Implemented” does not mean that an area has passed complete acceptance testing. `stop()` is still **not cancellation**: it asks `run()` to return. Per-operation cancellation is what `OperationOptions` is for, and it now reaches every layer — but a mechanism being in place is not the same as evidence for it, and the Windows half has only ever run on CI.
 
@@ -77,11 +88,11 @@ Solid arrows show dependencies; dashed arrows show application composition. HTTP
 | iOS / Android | kqueue / epoll | Non-TLS cross-compilation only; no device runtime evidence. Android needs **NDK 29 or newer** — see the build requirements below |
 | BSD | kqueue | Backend portability direction; no dedicated CI evidence |
 
-The latest confirmed passing three-desktop CI baseline is `a123370`. The IOCP cancellation semantics have **no runtime evidence at all** on the development machine: locally they are only cross-compiled through mingw-w64 as a type and lifetime check, and mingw is not MSVC — compiling is not running. A CI configuration is not proof that the current code passed.
+The last recorded three-desktop CI baseline is `a123370`, not evidence for this round's new protocols. This round provides macOS runtime, partial MinGW compilation and NDK29 non-TLS cross-compilation evidence only: **there is no new Windows or Linux runtime evidence for UDP / DNS / H2 / H3**. MinGW cannot replace MSVC / IOCP execution, and the existing CI configuration does not establish that uncommitted code passed. Commands, results and remaining work are recorded in the [phase-one handoff](docs/HANDOFF.md).
 
 ## A look at the API
 
-These are compilable coroutine functions, not a complete runnable server. The host must start and await the task while driving the associated `EventLoop`; a complete structured server-launch API is not available yet.
+These are composable coroutine functions. From `main`, `EventLoop::run_until_complete(Task<void>)` starts a root task and drives the loop until it completes; see `examples/echo_server.cpp` for a runnable TCP example. Top-level native builds enable `CONTINUO_BUILD_EXAMPLES` by default. Running `./build/continuo_echo_server 0 1` prints an ephemeral port, accepts one connection, and exits after peer EOF. The connection count is a total acceptance limit, not a concurrency bound; interrupting the default unlimited server is not graceful shutdown.
 
 ### TCP: read a chunk, write it back
 

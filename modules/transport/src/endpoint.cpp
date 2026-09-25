@@ -2,6 +2,7 @@
 
 #include "socket_compat.hpp"
 
+#include <charconv>
 #include <cstdio>
 
 namespace continuo::transport {
@@ -14,7 +15,7 @@ namespace {
 }  // namespace
 
 Result<Endpoint> Endpoint::parse(std::string_view address, std::uint16_t port) {
-    if (address.empty()) {
+    if (address.empty() || address.find('\0') != std::string_view::npos) {
         return fail(Errc::invalid_argument);
     }
 
@@ -38,9 +39,25 @@ Result<Endpoint> Endpoint::parse(std::string_view address, std::uint16_t port) {
         char* const percent = std::strchr(text, '%');
         if (percent != nullptr) {
             *percent = '\0';
-#if !CONTINUO_PLATFORM_WINDOWS
-            v6.sin6_scope_id = ::if_nametoindex(percent + 1);
+            const std::string_view scope(percent + 1);
+            if (scope.empty()) return fail(Errc::invalid_argument);
+            std::uint32_t index{};
+            const auto parsed = std::from_chars(scope.data(), scope.data() + scope.size(), index);
+            if (parsed.ec == std::errc{} && parsed.ptr == scope.data() + scope.size()) {
+                v6.sin6_scope_id = index;
+            } else {
+                // A digits-only overflow is not an interface name.
+                if (scope.find_first_not_of("0123456789") == std::string_view::npos)
+                    return fail(Errc::invalid_argument);
+#if CONTINUO_PLATFORM_WINDOWS
+                // Numeric scopes are portable. Interface names are POSIX-only
+                // until the Windows adapter-name mapping is implemented.
+                return fail(Errc::invalid_argument);
+#else
+                v6.sin6_scope_id = ::if_nametoindex(percent + 1);
+                if (v6.sin6_scope_id == 0) return fail(Errc::invalid_argument);
 #endif
+            }
         }
 
         if (::inet_pton(AF_INET6, text, &v6.sin6_addr) != 1) {
@@ -162,6 +179,8 @@ std::string Endpoint::address() const {
         if (::inet_ntop(AF_INET6, &v6.sin6_addr, text, sizeof(text)) == nullptr) {
             return {};
         }
+        if (v6.sin6_scope_id != 0)
+            return std::string{text} + "%" + std::to_string(v6.sin6_scope_id);
     } else {
         sockaddr_in v4{};
         std::memcpy(&v4, storage_.data(), sizeof(v4));

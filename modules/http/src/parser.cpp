@@ -228,6 +228,8 @@ Result<ParseStep> RequestParser::parse(Buffer& input) {
             case BodyKind::chunked:
                 state_ = State::body_chunk_header;
                 break;
+            case BodyKind::close_delimited:
+                return fail(ParseError::framing_conflict);
             }
             return ParseStep::head;
         }
@@ -452,6 +454,9 @@ Result<void> RequestParser::decide_framing() {
     }
 
     if (has_te) {
+        if (request_.version == Version::http_1_0) {
+            return fail(ParseError::invalid_transfer_encoding);
+        }
         const std::vector<std::string_view> raw = request_.headers.get_all("Transfer-Encoding");
         std::vector<std::string_view> codings;
         for (const std::string_view field : raw) {

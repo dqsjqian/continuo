@@ -1,0 +1,16 @@
+add_executable(continuo_test_http2 test_session.cpp)
+target_link_libraries(continuo_test_http2 PRIVATE continuo::http2 continuo::warnings NGHTTP2::NGHTTP2)
+target_include_directories(continuo_test_http2 PRIVATE ${PROJECT_SOURCE_DIR}/modules/core/tests)
+add_test(NAME continuo_http2 COMMAND continuo_test_http2)
+set_tests_properties(continuo_http2 PROPERTIES TIMEOUT 30)
+
+add_executable(continuo_test_http2_network test_network.cpp)
+target_link_libraries(continuo_test_http2_network PRIVATE continuo::http2 continuo::transport continuo::warnings)
+target_include_directories(continuo_test_http2_network PRIVATE ${PROJECT_SOURCE_DIR}/modules/core/tests)
+if(CONTINUO_ENABLE_TLS)
+    target_link_libraries(continuo_test_http2_network PRIVATE continuo::tls)
+    target_compile_definitions(continuo_test_http2_network PRIVATE CONTINUO_HTTP2_TEST_TLS=1
+        CONTINUO_HTTP2_TEST_BINARY_DIR="${CMAKE_CURRENT_BINARY_DIR}")
+endif()
+add_test(NAME continuo_http2_network COMMAND continuo_test_http2_network)
+set_tests_properties(continuo_http2_network PROPERTIES TIMEOUT 45)

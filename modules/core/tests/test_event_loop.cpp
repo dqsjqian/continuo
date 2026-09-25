@@ -27,7 +27,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <memory>
 #include <span>
+#include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -795,6 +797,56 @@ void test_cancel_leaves_other_direction_armed() {
     CHECK(write_outcome.has_value());
     CHECK(loop.outstanding() == 0);
 }
+
+void test_detach_and_shutdown_resume_waiters() {
+    test::section("detach 与 shutdown 同步排空双向等待，允许重入 detach");
+
+    struct Waiter {
+        static DetachedTask go(EventLoop& loop, NativeHandle handle, bool writable,
+                               bool shutdown, Result<void>& outcome, int& done) {
+            outcome = co_await (writable ? loop.wait_writable(handle)
+                                         : loop.wait_readable(handle));
+            ++done;
+            loop.detach(handle);
+            if (shutdown) {
+                const auto stepped = loop.run_once(0ms);
+                CHECK(!stepped.has_value());
+                CHECK(stepped.error() == Errc::cancelled);
+            }
+        }
+    };
+
+    for (const bool shutdown : {false, true}) {
+        HandlePair pair;
+        CHECK(pair.valid());
+        if (!pair.valid()) return;
+        auto created = EventLoop::create();
+        CHECK(created.has_value());
+        if (!created) return;
+        auto loop = std::make_unique<EventLoop>(std::move(*created));
+        CHECK(loop->attach(pair.first()).has_value());
+        Result<void> read_outcome{};
+        Result<void> write_outcome{};
+        int done = 0;
+        Waiter::go(*loop, pair.first(), false, shutdown, read_outcome, done);
+        Waiter::go(*loop, pair.first(), true, shutdown, write_outcome, done);
+        CHECK(done == 0);
+        CHECK(loop->outstanding() == 2);
+        if (shutdown) {
+            loop.reset();
+        } else {
+            loop->detach(pair.first());
+            CHECK(loop->outstanding() == 0);
+            CHECK(loop->run_once(0ms).has_value());
+            loop.reset();
+        }
+        CHECK(done == 2);
+        CHECK(!read_outcome.has_value());
+        CHECK(read_outcome.error() == Errc::cancelled);
+        CHECK(!write_outcome.has_value());
+        CHECK(write_outcome.error() == Errc::cancelled);
+    }
+}
 #endif  // CONTINUO_HAS_READINESS_API
 
 void test_deadline_on_a_suspended_read() {
@@ -1183,6 +1235,118 @@ void test_stop_token_outlives_its_scope() {
     CHECK(outcome.has_value());
 }
 
+/// Root tasks used by the next test. Free functions rather than lambdas: a
+/// lambda's closure would have to outlive the coroutine, and these outlive the
+/// expression that creates them.
+Task<void> root_returns_without_suspending(int& ran) {
+    ++ran;
+    co_return;
+}
+
+Task<void> root_sleeps(EventLoop& loop, int& ran) {
+    (void)co_await loop.sleep_for(1ms);
+    ++ran;
+}
+
+Task<void> root_throws_after_suspending(EventLoop& loop) {
+    (void)co_await loop.sleep_for(1ms);
+    throw std::runtime_error("root failed");
+}
+
+Task<void> root_owns_frame(EventLoop& loop, std::shared_ptr<int> owned, bool throws) {
+    CHECK(*owned == 42);
+    CHECK((co_await loop.sleep_for(1ms)).has_value());
+    if (throws) {
+        throw std::runtime_error("root failed with owned state");
+    }
+}
+
+Task<void> root_waits_for_cancel(EventLoop& loop, std::stop_source& source) {
+    loop.post([&source] { source.request_stop(); });
+    const Result<void> result = co_await loop.sleep_for(1h, {.stop = source.get_token()});
+    CHECK(!result.has_value());
+    CHECK(result.error() == Errc::cancelled);
+}
+
+Task<void> root_stops_loop(EventLoop& loop, int& ran) {
+    loop.post([&loop] { loop.stop(); });
+    CHECK((co_await loop.sleep_for(1ms)).has_value());
+    ++ran;
+}
+
+void test_run_until_complete() {
+    test::section("run_until_complete drives a root task from synchronous code");
+
+    Result<EventLoop> created = EventLoop::create();
+    CHECK(created.has_value());
+    EventLoop& loop = created.value();
+
+    // A task that never suspends needs no pumping at all.
+    int ran = 0;
+    CHECK(loop.run_until_complete(root_returns_without_suspending(ran)).has_value());
+    CHECK(ran == 1);
+
+    // One that suspends is pumped until it finishes, and the loop is left with
+    // nothing outstanding — the timer went with it.
+    CHECK(loop.run_until_complete(root_sleeps(loop, ran)).has_value());
+    CHECK(ran == 2);
+    CHECK(loop.outstanding() == 0);
+
+    // An exception out of a root coroutine has nowhere else to surface.
+    CHECK_THROWS(loop.run_until_complete(root_throws_after_suspending(loop)),
+                 std::runtime_error);
+
+    // The loop is still usable afterwards: the failed root was finished, so
+    // its frame was reclaimed normally rather than abandoned.
+    CHECK(loop.outstanding() == 0);
+    CHECK(loop.run_until_complete(root_returns_without_suspending(ran)).has_value());
+    CHECK(ran == 3);
+
+    CHECK_THROWS(loop.run_until_complete(Task<void>{}), std::logic_error);
+    const auto immediate_failure = []() -> Task<void> {
+        throw std::runtime_error("immediate root failure");
+        co_return;
+    };
+    CHECK_THROWS(loop.run_until_complete(immediate_failure()), std::runtime_error);
+
+    // State stored as a coroutine parameter survives the body until the frame
+    // itself is reclaimed. A weak pointer checks both normal and failed roots.
+    for (const bool throws : {false, true}) {
+        auto owned = std::make_shared<int>(42);
+        const std::weak_ptr<int> observed = owned;
+        Task<void> task = root_owns_frame(loop, std::move(owned), throws);
+        CHECK(!observed.expired());
+        if (throws) {
+            CHECK_THROWS(loop.run_until_complete(std::move(task)), std::runtime_error);
+        } else {
+            CHECK(loop.run_until_complete(std::move(task)).has_value());
+        }
+        CHECK(observed.expired());
+        CHECK(loop.outstanding() == 0);
+    }
+
+    std::stop_source source;
+    CHECK(loop.run_until_complete(root_waits_for_cancel(loop, source)).has_value());
+    CHECK(loop.outstanding() == 0);
+
+    // Finishing one root must not drain work unrelated to that root.
+    bool posted_ran = false;
+    loop.post([&posted_ran] { posted_ran = true; });
+    CHECK(loop.run_until_complete(root_returns_without_suspending(ran)).has_value());
+    CHECK(!posted_ran);
+    CHECK(loop.outstanding() != 0);
+    CHECK(loop.run_once(0ms).has_value());
+    CHECK(posted_ran);
+
+    // stop is not cancellation, including when observed before starting.
+    CHECK(loop.run_until_complete(root_stops_loop(loop, ran)).has_value());
+    CHECK(loop.stopped());
+    CHECK(ran == 5);
+    CHECK(loop.run_until_complete(root_sleeps(loop, ran)).has_value());
+    CHECK(ran == 6);
+    CHECK(loop.outstanding() == 0);
+}
+
 // ── contract violations, asserted out-of-process ─────────────────────────────
 
 /// Each mode commits exactly one violation and must not return.
@@ -1204,6 +1368,54 @@ int run_contract_violation(std::string_view mode) {
         EventLoop& loop = created.value();
         loop.post([&loop] { (void)loop.run_once(0ms); });
         (void)loop.run_once(0ms);
+#if CONTINUO_HAS_READINESS_API
+    } else if (mode == "destroy-during-detach" ||
+               mode == "reentrant-run-once-during-detach") {
+        // 已释放 mutex 的 system_error 也会触发 terminate；不能误认作契约保护。
+        std::set_terminate([] { std::_Exit(std::current_exception() ? 78 : 77); });
+        HandlePair pair;
+        if (!pair.valid()) return 2;
+        auto* loop = new EventLoop{std::move(*created)};
+        if (!loop->attach(pair.first())) {
+            delete loop;
+            return 2;
+        }
+        struct Waiter {
+            static DetachedTask read(EventLoop* target, NativeHandle handle, bool destroy) {
+                const auto outcome = co_await target->wait_readable(handle);
+                if (outcome || outcome.error() != Errc::cancelled) std::_Exit(3);
+                if (destroy) {
+                    delete target;
+                } else {
+                    (void)target->run_once(0ms);
+                }
+            }
+            static DetachedTask write(EventLoop& target, NativeHandle handle, int& done) {
+                const auto outcome = co_await target.wait_writable(handle);
+                if (outcome || outcome.error() != Errc::cancelled) std::_Exit(3);
+                ++done;
+            }
+        };
+        int sibling_done = 0;
+        const bool destroy = mode == "destroy-during-detach";
+        Waiter::read(loop, pair.first(), destroy);
+        Waiter::write(*loop, pair.first(), sibling_done);
+        if (loop->outstanding() != 2 || sibling_done != 0) std::_Exit(3);
+        // 不调用 run_once：必须命中外部 detach，而不是现有批次保护。
+        loop->detach(pair.first());
+        if (!destroy) delete loop;
+#endif
+    } else if (mode == "root-task-deadlock") {
+        // Suspends on nothing the loop registered, so no completion, timer or
+        // posted callable can ever resume it. Hanging would be the easy
+        // behaviour; saying so is the useful one.
+        struct Parks {
+            [[nodiscard]] bool await_ready() const noexcept { return false; }
+            void await_suspend(std::coroutine_handle<>) const noexcept {}
+            void await_resume() const noexcept {}
+        };
+        const auto parked = []() -> Task<void> { co_await Parks{}; };
+        (void)created.value().run_until_complete(parked());
     } else {
         return 2;
     }
@@ -1228,6 +1440,7 @@ int main(int argc, char** argv) {
     test_cancel_in_flight();
 #if CONTINUO_HAS_READINESS_API
     test_cancel_leaves_other_direction_armed();
+    test_detach_and_shutdown_resume_waiters();
 #endif
     test_deadline_on_a_suspended_read();
     test_deadline_is_absolute_across_retries();
@@ -1236,5 +1449,6 @@ int main(int argc, char** argv) {
     test_shutdown_cancels_deadlines_too();
     test_stop_from_another_thread();
     test_stop_token_outlives_its_scope();
+    test_run_until_complete();
     return test::summary();
 }

@@ -7,6 +7,7 @@
 add_library(continuo_http
     src/message.cpp
     src/parser.cpp
+    src/response_parser.cpp
     src/serializer.cpp
 )
 
