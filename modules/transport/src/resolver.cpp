@@ -1,5 +1,16 @@
 #include "continuo/transport/resolver.hpp"
 
+// GCC 14/15 inlines the expected<vector<Endpoint>, error_code> move out of
+// the job's optional and reports _M_end_of_storage (stl_vector.h:106) as
+// possibly uninitialized. The value is fully constructed before it is
+// stored, so this is a false positive — and because the diagnostic is
+// attributed to the inlined header code rather than the co_return below, it
+// can only be suppressed at file scope. GCC 16 and MinGW GCC were checked
+// against the same code and do not warn.
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 14
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
+
 #include "socket_compat.hpp"
 
 #include <algorithm>
@@ -261,14 +272,7 @@ public:
             // fully constructed before it was stored, and the optional is
             // engaged. See the -Wmaybe-uninitialized reports on moved
             // std::expected with vector payloads (GCC 14, PR108661 family).
-#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 14
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
-#endif
             co_return std::move(*job->result);
-#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 14
-#pragma GCC diagnostic pop
-#endif
         }
         if (job->user_cancelled) co_return fail(Errc::cancelled);
         if (!waited && waited.error() == Errc::timed_out) co_return fail(Errc::timed_out);

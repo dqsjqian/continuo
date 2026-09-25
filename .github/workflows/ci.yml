@@ -35,11 +35,23 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest,  std: 23, backend: epoll }
+          # Linux clang is a separate matrix entry: clang-18's __cpp_concepts
+          # stays at 201907L, which makes libstdc++ hide std::expected behind
+          # its feature-test gate even in C++23 mode. clang-19 is the first
+          # release where the concepts macro matches the language mode, so it
+          # is the oldest clang this library promises on Linux.
+          - { os: ubuntu-latest,  std: 23, backend: epoll-clang, cc: clang-19, cxx: clang++-19 }
           - { os: macos-latest,   std: 23, backend: kqueue }
           - { os: windows-latest, std: 23, backend: iocp }
     name: ${{ matrix.backend }} / c++${{ matrix.std }}
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install clang
+        if: matrix.cxx
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.cc }}
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_STANDARD=${{ matrix.std }}
       - name: Build
