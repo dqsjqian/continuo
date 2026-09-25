@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <stop_token>
 #include <utility>
+#include <vector>
 
 namespace continuo {
 
@@ -31,6 +32,10 @@ public:
     ~TaskScope() {
         if (!joined_ && (used_ || joining_)) {
             std::terminate();
+        }
+        // 退休队列里只剩已完成的 runner 帧；此刻其执行链早已返回。
+        for (auto runner : retired_) {
+            runner.destroy();
         }
     }
 
@@ -77,6 +82,7 @@ private:
     struct Runner {
         struct promise_type {
             TaskScope* scope{};
+            bool retired = false;
 
             Runner get_return_object() noexcept {
                 return Runner{std::coroutine_handle<promise_type>::from_promise(*this)};
@@ -88,15 +94,16 @@ private:
 
                 std::coroutine_handle<>
                 await_suspend(std::coroutine_handle<promise_type> self) const noexcept {
+                    // 已到最终挂起边界。 runner 帧绝不能在这里销毁：本帧
+                    // 里还驻留着 co_await 子任务时的唤醒机器码与局部状态，
+                    // MSVC（含协程帧合并优化）会在销毁后的收尾路径上触碰
+                    // 它们（ASan heap-use-after-free）。帧移交给 scope 的
+                    // 退休队列，由 spawn 的 resume 返回后或 scope 析构时
+                    // 在安全点销毁。
                     auto* owner = self.promise().scope;
-                    // 已到最终挂起边界。必须先做计数与续体结算、再销毁
-                    // runner 帧：MSVC 的优化器会把续体/owner 的读取落到
-                    // 已销毁的帧里（heap-use-after-free，协程省略后更明
-                    // 显）。结算结果与 owner 之外不再触碰本帧，销毁之后
-                    // 仅作对称转移。
-                    auto continuation = owner->child_completed();
-                    self.destroy();
-                    return continuation;
+                    self.promise().retired = true;
+                    owner->retire(self);
+                    return owner->child_completed();
                 }
 
                 void await_resume() const noexcept {}
@@ -122,14 +129,13 @@ private:
         void start(TaskScope& scope) noexcept {
             handle.promise().scope = &scope;
             auto running = std::exchange(handle, {});
-            // Defeat MSVC's coroutine frame fusion (HALO). run_child's only
-            // suspend is the child task itself, so MSVC fuses the two frames
-            // into one allocation; the Task awaiter then frees that block
-            // while run_child is still executing on it. Storing the frame
-            // address into the scope makes the allocation observable and
-            // keeps the frames separate. Harmless on every other compiler.
             scope.frame_guard_ = running.address();
             running.resume();
+            // 子任务同步完成时（帧已入退休队列），resume 已经返回，此处在
+            // 栈上安全销毁；异步完成的帧由 scope 析构统一销毁。
+            if (running && running.promise().retired) {
+                scope.reclaim(running);
+            }
         }
     };
 
@@ -184,6 +190,24 @@ private:
     std::stop_source stop_source_;
     std::exception_ptr failure_;
     void* frame_guard_ = nullptr;  // MSVC HALO escape hatch, see Runner::start
+    std::vector<std::coroutine_handle<>> retired_;
+
+    /// runner 帧登记退休：不在自身执行链里销毁，由安全点统一回收。
+    void retire(std::coroutine_handle<> runner) {
+        retired_.push_back(runner);
+    }
+
+    /// start 的 resume 返回后回收同步完成的 runner 帧。
+    void reclaim(std::coroutine_handle<> runner) {
+        for (std::size_t i = retired_.size(); i-- > 0;) {
+            if (retired_[i] == runner) {
+                retired_.erase(retired_.begin() + static_cast<long>(i));
+                runner.destroy();
+                return;
+            }
+        }
+        runner.destroy();  // 不在队列里（例如同步完成未入队），直接销毁
+    }
     std::coroutine_handle<> waiter_{};
     std::size_t pending_{0};
     bool used_{false};
