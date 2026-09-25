@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(continuo
-    VERSION 0.1.2
+    VERSION 0.1.3
     DESCRIPTION "Coroutine-native C++23 networking library — transport, protocols, and nothing else"
     LANGUAGES CXX
 )

@@ -89,10 +89,14 @@ private:
                 std::coroutine_handle<>
                 await_suspend(std::coroutine_handle<promise_type> self) const noexcept {
                     auto* owner = self.promise().scope;
-                    // 已到最终挂起边界；先释放 runner 的参数及帧，再减少计数。
-                    // 对父任务只作对称转移，转移后不再触碰 scope 或本 awaiter。
+                    // 已到最终挂起边界。必须先做计数与续体结算、再销毁
+                    // runner 帧：MSVC 的优化器会把续体/owner 的读取落到
+                    // 已销毁的帧里（heap-use-after-free，协程省略后更明
+                    // 显）。结算结果与 owner 之外不再触碰本帧，销毁之后
+                    // 仅作对称转移。
+                    auto continuation = owner->child_completed();
                     self.destroy();
-                    return owner->child_completed();
+                    return continuation;
                 }
 
                 void await_resume() const noexcept {}
