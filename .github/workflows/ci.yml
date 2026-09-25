@@ -115,6 +115,59 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: ctest --test-dir build/asan --output-on-failure
 
+  # Optional protocol engines (nghttp2 / ngtcp2 / nghttp3) with their
+  # dependencies built from pinned, hash-verified sources by the same
+  # script a developer would run locally. POSIX only for now: the
+  # dependency script has not been validated on Windows.
+  protocols:
+    needs: discipline
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install OpenSSL on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - name: Build OpenSSL 3.5 for QUIC (Linux)
+        if: runner.os == 'Linux'
+        # The distro OpenSSL (3.0) predates SSL_set_quic_tls_cbs, which the
+        # ngtcp2 ossl adapter requires. Build a private 3.5 copy for the
+        # protocol dependencies; the core/TLS matrix above keeps using the
+        # system OpenSSL.
+        run: |
+          set -eux
+          curl -fsSL -o openssl.tar.gz \
+            https://github.com/openssl/openssl/releases/download/openssl-3.5.0/openssl-3.5.0.tar.gz
+          tar xzf openssl.tar.gz
+          cd openssl-3.5.0
+          ./Configure --prefix="$RUNNER_TEMP/openssl35" --libdir=lib no-shared no-tests
+          make -j"$(nproc)"
+          make install_sw
+          echo "OPENSSL_ROOT_DIR=$RUNNER_TEMP/openssl35" >> "$GITHUB_ENV"
+      - name: Locate OpenSSL on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+      - name: Build pinned protocol dependencies
+        run: python3 tools/ci/build_protocol_deps.py --openssl-root "$OPENSSL_ROOT_DIR"
+      - name: Configure with TLS, HTTP/2 and HTTP/3
+        shell: bash
+        run: >
+          cmake -S . -B build/protocols -DCMAKE_BUILD_TYPE=Debug
+          -DCONTINUO_ENABLE_TLS=ON
+          -DCONTINUO_ENABLE_HTTP2=ON
+          -DCONTINUO_ENABLE_HTTP3=ON
+          -DCMAKE_PREFIX_PATH="$PWD/build/protocol-deps/prefix"
+      - name: Build
+        run: cmake --build build/protocols --parallel
+      - name: Test
+        run: ctest --test-dir build/protocols --output-on-failure
+
   # Mobile targets cross-compile only; no runner executes them. Keeping them in
   # CI catches the usual breakage — a POSIX assumption that does not hold on a
   # sandboxed platform — without pretending the tests ran.
