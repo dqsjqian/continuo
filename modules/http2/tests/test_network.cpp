@@ -69,7 +69,8 @@ Task<void> serve(S& transport, Results& results, OperationOptions options) {
             responded[id] = true;
             ++completed;
         }
-        CHECK((co_await connection.flush(options)).has_value());
+        const auto flushed = co_await connection.flush(options);
+        CHECK(flushed.has_value());
     }
     // 大响应仍可能等待流窗口；继续驱动直到两条流都关闭。
     for (;;) {
@@ -81,7 +82,8 @@ Task<void> serve(S& transport, Results& results, OperationOptions options) {
         if (!result) co_return;
     }
     CHECK(connection.session().goaway().has_value());
-    CHECK((co_await connection.flush(options)).has_value());
+    const auto flushed = co_await connection.flush(options);
+    CHECK(flushed.has_value());
     results.server = true;
 }
 
@@ -109,7 +111,8 @@ Task<void> query(S& transport, Results& results, OperationOptions options) {
             bodies[id].insert(bodies[id].end(), chunk->begin(), chunk->end());
             if (!stream->remote_end) complete = false;
         }
-        CHECK((co_await connection.flush(options)).has_value());
+        const auto flushed = co_await connection.flush(options);
+        CHECK(flushed.has_value());
         if (complete) break;
     }
     CHECK(bodies[*post] == std::vector<std::byte>(bytes(payload).begin(), bytes(payload).end()));

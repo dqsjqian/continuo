@@ -328,6 +328,13 @@ Task<void> tcp_cancel(EventLoop& loop, bool timeout, bool server_side) {
         if (server_side) {
             CHECK_VALUE(co_await loop.sleep_for(10ms));
             stop.request_stop();
+            // Keep the connection open until the server has observed the
+            // cancellation. Ending the coroutine right away destroys the
+            // socket, and on Linux epoll the resulting EOF can be delivered
+            // to the parked server read *before* the cancellation, which
+            // turns the external stop into an ordinary between-requests
+            // close — a valid outcome, but not the one under test.
+            static_cast<void>(co_await loop.sleep_for(100ms));
         } else {
             ClientConnection connection{*connected};
             auto req = request();

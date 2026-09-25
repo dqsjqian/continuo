@@ -357,7 +357,14 @@ Engine::create(Options options, std::span<const std::uint8_t> initial, std::uint
         auto name = s->options.peer_name.c_str();
         if (transport::Endpoint::parse(s->options.peer_name, 0)) {
             if (X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(s->ssl), name) != 1) rv = -1;
-        } else if (SSL_set1_host(s->ssl, name) != 1 || SSL_set_tlsext_host_name(s->ssl, name) != 1)
+        } else if (SSL_set1_host(s->ssl, name) != 1 ||
+                   // The convenience macro expands to a C-style cast; use its
+                   // underlying control call so GCC's -Wold-style-cast stays
+                   // enabled, matching the tls module's precedent.
+                   SSL_ctrl(s->ssl,
+                            SSL_CTRL_SET_TLSEXT_HOSTNAME,
+                            TLSEXT_NAMETYPE_host_name,
+                            const_cast<char*>(name)) != 1)
             rv = -1;
         Bytes protocol{static_cast<std::uint8_t>(s->options.alpn.size())};
         protocol.insert(protocol.end(), s->options.alpn.begin(), s->options.alpn.end());
