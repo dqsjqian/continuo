@@ -254,7 +254,22 @@ public:
             {.stop = job->completion.get_token(), .deadline = options.deadline});
         const std::lock_guard lock{job->mutex};
         job->abandoned = true;
-        if (job->result) co_return std::move(*job->result);
+        if (job->result) {
+            // GCC 14 ( -O2/-O3 ) inlines the expected<vector, error_code>
+            // move through the optional here and reports _M_end_of_storage
+            // as possibly uninitialized — a false positive: the value was
+            // fully constructed before it was stored, and the optional is
+            // engaged. See the -Wmaybe-uninitialized reports on moved
+            // std::expected with vector payloads (GCC 14, PR108661 family).
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 14
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
+            co_return std::move(*job->result);
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 14
+#pragma GCC diagnostic pop
+#endif
+        }
         if (job->user_cancelled) co_return fail(Errc::cancelled);
         if (!waited && waited.error() == Errc::timed_out) co_return fail(Errc::timed_out);
         co_return fail(Errc::cancelled);

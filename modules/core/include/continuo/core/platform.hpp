@@ -74,8 +74,11 @@ namespace continuo {
 /// drag `<winsock2.h>` into every translation unit that includes it.
 using NativeHandle = UINT_PTR;
 
-/// Value representing "no handle" (`INVALID_SOCKET`).
-inline constexpr NativeHandle invalid_handle = static_cast<NativeHandle>(~0ull);
+/// Value representing "no handle" (`INVALID_SOCKET`). The signed `-1`
+/// converts modulo 2^N, matching the Win32 `(UINT_PTR)-1` idiom; a `~0ull`
+/// source would make the cast a no-op on toolchains where UINT_PTR is
+/// already `unsigned long long` (MinGW), tripping -Wuseless-cast.
+inline constexpr NativeHandle invalid_handle = static_cast<NativeHandle>(-1);
 #else
 /// A file descriptor the loop can perform I/O on.
 using NativeHandle = int;
