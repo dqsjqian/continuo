@@ -211,7 +211,12 @@ auto client = continuo::tls::Context::client({
 
 ## 🚀 快速开始
 
-需要 **CMake 3.20+、C++23 编译器**（GCC 13+ / Clang 18+ / MSVC v143），非 TLS 构建零第三方依赖。
+需要 **CMake 3.20+、C++23 编译器**。本库自身在 GCC 13+ / Clang 18+ 下可编译，但消费端有两条实测边界，建议直接从新编译器起步：
+
+- **GCC 14+**：GCC 13 的协程优化器对「持有 move-only 类型的消费者协程」存在内部编译器错误（build_special_member_call ICE，GCC 14 修复）。
+- **Linux 上 Clang 19+**：clang-18 的 `__cpp_concepts` 仍停留在 201907L，libstdc++ 据此隐藏 `std::expected`，`<expected>` 会展开为空。
+
+非 TLS 构建零第三方依赖。
 
 ```bash
 git clone https://github.com/dqsjqian/continuo.git
@@ -232,14 +237,24 @@ cmake --build build/tls -j && ctest --test-dir build/tls --output-on-failure
 
 ### 📦 在自己的项目中使用
 
+推荐与 Aria、AriaAgent 相同的**哈希钉定发布档**方式：CI 会把每个版本的源码包发布到 GitHub Release，取回、校验 SHA256、再 `add_subdirectory`，配置期不引入任何子模块或 vendored 目录：
+
 ```cmake
-# 源码位于 vendor/continuo 时
-add_subdirectory(vendor/continuo)
+include(ariaFetchPinned)  # 或你自己仓库里的等价「下载 + SHA256 校验」原语
+aria_fetch_pinned_archive(
+    NAME      continuo
+    VERSION   0.1.1
+    URL       "https://github.com/dqsjqian/continuo/releases/download/v0.1.1/continuo-0.1.1.tar.gz"
+    SHA256    a30f4cb21834ec7e6191076c9ef0ce614a3c2e62acf42dd52198c0b51c2feb64
+)
+set(CONTINUO_BUILD_TESTS OFF)
+set(CONTINUO_BUILD_EXAMPLES OFF)
+add_subdirectory(${ARIA_PINNED_CONTINUO_SOURCE_DIR} continuo)
 target_link_libraries(my_app PRIVATE continuo::transport continuo::http)
-# TLS：配置 -DCONTINUO_ENABLE_TLS=ON 并额外链接 continuo::tls
+# TLS：同时 set(CONTINUO_ENABLE_TLS ON) 并额外链接 continuo::tls
 ```
 
-安装消费：`find_package(continuo REQUIRED COMPONENTS core transport http)`，需要 TLS 时加 `tls` 组件。`CONTINUO_BUILD_TESTS` 顶层默认开启，作为子目录时默认关闭。
+本地开发也可以直接指向源码树：`add_subdirectory(vendor/continuo)`（子目录模式下 `CONTINUO_BUILD_TESTS` 默认关闭）。安装消费则用 `find_package(continuo REQUIRED COMPONENTS core transport http)`，需要 TLS 时加 `tls` 组件。
 
 Android 需 **NDK 29 或更新**：NDK 27/28 的 libc++ 把 `std::stop_token` 门控关闭了；NDK 29（clang 21）在 API 24 上实测可构建。
 

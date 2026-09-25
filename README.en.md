@@ -211,7 +211,12 @@ Most recent all-platform CI pass: 13/13 jobs (three desktop run + sanitizers + p
 
 ## 🚀 Quick start
 
-Requires **CMake 3.20+ and a C++23 compiler** (GCC 13+ / Clang 18+ / MSVC v143). Non-TLS builds have zero third-party dependencies.
+Requires **CMake 3.20+ and a C++23 compiler**. The library itself compiles on GCC 13+ / Clang 18+, but two tested consumer-side boundaries argue for starting newer:
+
+- **GCC 14+**: GCC 13's coroutine optimizer ICEs (build_special_member_call) on consumer coroutines that hold move-only types; fixed in GCC 14.
+- **Clang 19+ on Linux**: clang-18 keeps `__cpp_concepts` at 201907L, so libstdc++ hides `std::expected` behind its feature-test and `<expected>` expands to nothing.
+
+Non-TLS builds have zero third-party dependencies.
 
 ```bash
 git clone https://github.com/dqsjqian/continuo.git
@@ -232,14 +237,24 @@ Optional higher protocols: `CONTINUO_ENABLE_HTTP2=ON` / `CONTINUO_ENABLE_HTTP3=O
 
 ### 📦 Using it in your project
 
+The recommended pattern — the one Aria and AriaAgent use — is a **hash-pinned release archive**: every version ships a source tarball on GitHub Releases; download it, verify its SHA256, then `add_subdirectory` it. No submodules, no vendored trees, no configure-time network beyond the pinned fetch:
+
 ```cmake
-# when the sources live in vendor/continuo
-add_subdirectory(vendor/continuo)
+include(ariaFetchPinned)  # or your repo's equivalent download + SHA256 primitive
+aria_fetch_pinned_archive(
+    NAME      continuo
+    VERSION   0.1.1
+    URL       "https://github.com/dqsjqian/continuo/releases/download/v0.1.1/continuo-0.1.1.tar.gz"
+    SHA256    a30f4cb21834ec7e6191076c9ef0ce614a3c2e62acf42dd52198c0b51c2feb64
+)
+set(CONTINUO_BUILD_TESTS OFF)
+set(CONTINUO_BUILD_EXAMPLES OFF)
+add_subdirectory(${ARIA_PINNED_CONTINUO_SOURCE_DIR} continuo)
 target_link_libraries(my_app PRIVATE continuo::transport continuo::http)
-# TLS: configure -DCONTINUO_ENABLE_TLS=ON and additionally link continuo::tls
+# TLS: also set(CONTINUO_ENABLE_TLS ON) and additionally link continuo::tls
 ```
 
-Installed consumption: `find_package(continuo REQUIRED COMPONENTS core transport http)`, add the `tls` component when needed. `CONTINUO_BUILD_TESTS` defaults on at top level, off as a subdirectory.
+For local development, pointing at a source tree works too: `add_subdirectory(vendor/continuo)` (`CONTINUO_BUILD_TESTS` defaults off in subdirectory mode). Installed consumption uses `find_package(continuo REQUIRED COMPONENTS core transport http)`, add the `tls` component when needed.
 
 Android requires **NDK 29 or newer**: NDK 27/28's libc++ gates `std::stop_token` off; NDK 29 (clang 21) builds on API 24 as tested.
 
