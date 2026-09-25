@@ -642,6 +642,8 @@ cancellation-safety claim.
 resolution, HTTP/1 client and HTTP/2 engines now exist; QUIC/HTTP3 are experimental.
 The current implementation still lacks complete request-body streaming, a QUIC
 UDP scheduling entry point, independent H2/H3 interoperability and full platform
-acceptance. Routing, native OS trust-store integration, mTLS policy, end-to-end
-resource bounds and multi-threaded loops also remain incomplete. See HANDOFF.md
-for the current tested snapshot rather than the historical counts above.
+acceptance. Routing, native OS trust-store integration, end-to-end resource
+bounds and multi-threaded loops also remain incomplete; mTLS policy is now
+available on `tls::Context` but native OS trust-store integration is still open.
+Judge the current tested snapshot by the repository's own CI and tests rather
+than the historical counts above.

@@ -22,8 +22,8 @@ endforeach()
 # this one proves the whole stack over the kernel's UDP.
 # GCC 13 hits an internal compiler error (build_special_member_call) on the
 # move-only connection coroutine tests; GCC 14+ and Clang compile cleanly.
-# Skip on GCC 13 until the runner image moves on — the tests are WILL_FAIL
-# there anyway until the closing-exchange stall is fixed (see HANDOFF).
+# Skip on GCC 13 until the runner image moves on — the closing-exchange
+# tests report expected failures there.
 if(NOT (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 14))
     add_executable(test_quic_udp test_udp_transport.cpp)
     target_link_libraries(test_quic_udp PRIVATE continuo::quic continuo::warnings)
