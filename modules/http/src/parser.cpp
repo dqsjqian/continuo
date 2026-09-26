@@ -3,6 +3,7 @@
 #include "grammar.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -59,52 +60,39 @@ struct Line {
     return std::optional<Line>{Line{text.substr(0, content), lf + 1}};
 }
 
-/// Parse an unsigned decimal integer with overflow detection.
+/// Parse an unsigned integer with overflow detection, in base 10 or 16.
 ///
-/// Rejects signs, whitespace, and any non-digit — `Content-Length: +10` and
-/// `Content-Length: 10 ` are both errors, because tolerating either means
-/// disagreeing with some other parser about the body length.
-[[nodiscard]] std::optional<std::uint64_t> parse_decimal(std::string_view text) noexcept {
+/// `std::from_chars` already encodes the whole contract: no sign (not even
+/// `+`), no whitespace, overflow reported, and `ptr == last` is the
+/// full-consumption check — exactly the strictness a body-length field
+/// demands, since tolerating `+10` or `10 ` means disagreeing with some other
+/// parser about where a message ends.
+[[nodiscard]] std::optional<std::uint64_t>
+parse_integer(std::string_view text, int base) noexcept {
     if (text.empty()) {
         return std::nullopt;
     }
     std::uint64_t value = 0;
-    for (const char c : text) {
-        if (c < '0' || c > '9') {
-            return std::nullopt;
-        }
-        const auto digit = static_cast<std::uint64_t>(c - '0');
-        if (value > (std::numeric_limits<std::uint64_t>::max() - digit) / 10) {
-            return std::nullopt;  // overflow
-        }
-        value = value * 10 + digit;
+    const char* const first = text.data();
+    const char* const last = first + text.size();
+    const auto [end, ec] = std::from_chars(first, last, value, base);
+    if (ec != std::errc{} || end != last) {
+        return std::nullopt;
     }
     return value;
 }
 
+/// Parse an unsigned decimal integer with overflow detection.
+///
+/// Rejects signs, whitespace, and any non-digit — `Content-Length: +10` and
+/// `Content-Length: 10 ` are both errors.
+[[nodiscard]] std::optional<std::uint64_t> parse_decimal(std::string_view text) noexcept {
+    return parse_integer(text, 10);
+}
+
 /// Parse an unsigned hexadecimal integer with overflow detection.
 [[nodiscard]] std::optional<std::uint64_t> parse_hex(std::string_view text) noexcept {
-    if (text.empty()) {
-        return std::nullopt;
-    }
-    std::uint64_t value = 0;
-    for (const char c : text) {
-        std::uint64_t digit = 0;
-        if (c >= '0' && c <= '9') {
-            digit = static_cast<std::uint64_t>(c - '0');
-        } else if (c >= 'a' && c <= 'f') {
-            digit = static_cast<std::uint64_t>(c - 'a' + 10);
-        } else if (c >= 'A' && c <= 'F') {
-            digit = static_cast<std::uint64_t>(c - 'A' + 10);
-        } else {
-            return std::nullopt;
-        }
-        if (value > (std::numeric_limits<std::uint64_t>::max() - digit) / 16) {
-            return std::nullopt;
-        }
-        value = value * 16 + digit;
-    }
-    return value;
+    return parse_integer(text, 16);
 }
 
 class ParseCategory final : public std::error_category {
