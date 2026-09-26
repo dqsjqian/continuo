@@ -141,12 +141,21 @@ public:
         }
         sent_head_ = true;
 
-        if (!head_request_ && !body.empty() && !status_forbids_body(response.status)) {
-            out.append(body);
-        }
-
         finished_ = true;
-        co_return co_await write_all(*stream_, out.readable(), io_);
+        // Head and body go out without being concatenated when the stream
+        // can scatter (writev/WSASend); a stream without that ability keeps
+        // the plain path. A HEAD response, or a status that forbids bodies,
+        // carries headers only.
+        if (head_request_ || body.empty() || status_forbids_body(response.status)) {
+            co_return co_await write_all(*stream_, out.readable(), io_);
+        }
+        if constexpr (BoundedVectorWriteStream<Stream>) {
+            const std::span<const std::byte> pieces[2] = {out.readable(), body};
+            co_return co_await writev_all(*stream_, pieces, io_);
+        } else {
+            out.append(body);
+            co_return co_await write_all(*stream_, out.readable(), io_);
+        }
     }
 
     /// Begin a streaming response whose size is not yet known.
@@ -307,6 +316,19 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
                 head_ready = true;
                 if (parser.request().body_kind == BodyKind::none) {
                     body_drained = true;
+                } else if (parser.request().body_kind == BodyKind::length) {
+                    // The parser knows the declared size once the head is in;
+                    // reserving it up front turns the vector's doubling
+                    // growth (≈2× the body in copies for large uploads) into
+                    // one allocation plus the linear copies that are
+                    // structurally unavoidable (the input buffer rolls).
+                    // Clamped to the configured limit: a declared size beyond
+                    // it never gets read anyway, and reserving on a hostile
+                    // Content-Length would be a pre-read amplification.
+                    const std::uint64_t declared = parser.request().content_length;
+                    if (declared <= options.limits.max_body_size) {
+                        body.reserve(static_cast<std::size_t>(declared));
+                    }
                 }
                 break;
 
@@ -365,7 +387,30 @@ Task<Result<void>> serve_connection(Stream& stream, Handler handler, ServerOptio
         // reading but not the responding would bound half an exchange.
         ResponseWriter<Stream> writer{stream, head_request, keep_alive, io};
 
-        Result<void> handled = co_await handler(request, writer, body.readable());
+        Result<void> handled{};
+        // A throwing handler is an internal error, not a protocol event: the
+        // exception must not escape `serve_connection` (the caller's loop has
+        // no idea what to do with a half-served connection) and must not be
+        // silently swallowed either. The contract, mirroring the `Result`
+        // failure path below: if nothing was sent yet, answer 500 and close;
+        // if a head is already on the wire the response is half-written, so
+        // the only honest option is to drop the connection. Either way the
+        // caller gets `Errc::internal` rather than an exception it cannot
+        // attribute to a connection.
+        bool handler_threw = false;
+        try {
+            handled = co_await handler(request, writer, body.readable());
+        } catch (...) {
+            // co_await is illegal inside a catch handler, so the 500 is sent
+            // after the handler — the flag carries the branch out.
+            handler_threw = true;
+        }
+        if (handler_threw) {
+            if (!writer.sent_head()) {
+                static_cast<void>(co_await detail::send_error(stream, 500, io));
+            }
+            co_return fail(Errc::internal);
+        }
         if (!handled) {
             // The handler failed before writing anything: a 500 is still
             // possible. If it already sent a head, the only honest option is

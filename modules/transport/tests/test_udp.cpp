@@ -311,7 +311,24 @@ void close_lifetimes() {
 }  // namespace
 
 int main() {
+    // A runtime probe, not a build-time guess: sandboxes and some CI runners
+    // have no IPv6 at all, and there is no code path to test when the kernel
+    // refuses the very first bind. Skipping loudly beats failing on hardware
+    // the library never promised.
+    bool ipv6_usable = false;
+    {
+        auto probe = EventLoop::create();
+        if (probe) {
+            const auto bound = udp::Socket::bind(*probe, Endpoint::loopback(0, Family::ipv6));
+            ipv6_usable = bound.has_value();
+        }
+    }
+
     for (const auto family : {Family::ipv4, Family::ipv6}) {
+        if (family == Family::ipv6 && !ipv6_usable) {
+            test::section("IPv6 数据报（本环境无 IPv6，跳过）");
+            continue;
+        }
         test::section(family == Family::ipv4 ? "IPv4 数据报" : "IPv6 数据报");
         auto created = EventLoop::create();
         auto& loop = created.value();

@@ -26,7 +26,6 @@
 #endif
 
 #include "mira/core/error.hpp"
-#include "mira/core/platform.hpp"
 
 #include <cstddef>
 #include <cstring>

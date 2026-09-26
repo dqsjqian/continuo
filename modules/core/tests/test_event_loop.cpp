@@ -1274,6 +1274,93 @@ Task<void> root_stops_loop(EventLoop& loop, int& ran) {
     ++ran;
 }
 
+void test_moved_from_loop_operations_fail_cleanly() {
+    test::section("operations on a moved-from loop fail, not crash");
+
+    Result<EventLoop> created = EventLoop::create();
+    CHECK(created.has_value());
+
+    // Move the loop out; the source owns nothing now.
+    EventLoop moved{std::move(created.value())};
+
+    HandlePair pair;
+    NativeHandle handle = pair.valid() ? pair.first() : NativeHandle{-1};
+
+    std::array<std::byte, 16> scratch{};
+
+    // The old guards: read/write/accept/connect/receive_from/send_to/yield.
+    Result<std::size_t> read_outcome = std::size_t{1};
+    {
+        struct Probe {
+            static DetachedTask go(EventLoop& dead, NativeHandle h,
+                                   std::span<std::byte> into, Result<std::size_t>& slot) {
+                slot = co_await dead.read(h, into);
+                co_return;
+            }
+        };
+        Probe::go(created.value(), handle, scratch, read_outcome);
+    }
+    CHECK(!read_outcome.has_value());
+    CHECK(read_outcome.error() == Errc::cancelled);
+
+    Result<void> sleep_outcome = Result<void>{};
+    {
+        struct Probe {
+            static DetachedTask go(EventLoop& dead, Result<void>& slot) {
+                slot = co_await dead.sleep_for(1ms);
+                co_return;
+            }
+        };
+        Probe::go(created.value(), sleep_outcome);
+    }
+    CHECK(!sleep_outcome.has_value());
+    CHECK(sleep_outcome.error() == Errc::cancelled);
+
+    Result<void> wait_outcome = Result<void>{};
+    {
+        struct Probe {
+            static DetachedTask go(EventLoop& dead, NativeHandle h, Result<void>& slot) {
+                slot = co_await dead.wait_readable(h);
+                co_return;
+            }
+        };
+        Probe::go(created.value(), handle, wait_outcome);
+    }
+    CHECK(!wait_outcome.has_value());
+    CHECK(wait_outcome.error() == Errc::cancelled);
+
+    Result<void> yield_outcome = Result<void>{};
+    {
+        struct Probe {
+            static DetachedTask go(EventLoop& dead, Result<void>& slot) {
+                co_await dead.yield();
+                slot = Result<void>{};
+                co_return;
+            }
+        };
+        Probe::go(created.value(), yield_outcome);
+    }
+    // yield() on a dead loop simply returns without suspending.
+    CHECK(yield_outcome.has_value());
+
+    // The moved-to loop still works normally.
+    Result<void> nap_outcome = fail(Errc::cancelled);
+    struct Nap {
+        static DetachedTask go(EventLoop& alive, Result<void>& slot) {
+            slot = co_await alive.sleep_for(1ms);
+            co_return;
+        }
+    };
+    Nap::go(moved, nap_outcome);
+    for (int i = 0; i < 100 && !nap_outcome.has_value() &&
+                    nap_outcome.error() == Errc::cancelled;
+         ++i) {
+        CHECK(moved.run_once(50ms).has_value());
+    }
+    CHECK(nap_outcome.has_value());
+    CHECK(moved.outstanding() == 0);
+}
+
 void test_run_until_complete() {
     test::section("run_until_complete drives a root task from synchronous code");
 
@@ -1448,6 +1535,7 @@ int main(int argc, char** argv) {
     test_completion_beats_deadline_in_one_batch();
     test_shutdown_cancels_deadlines_too();
     test_stop_from_another_thread();
+    test_moved_from_loop_operations_fail_cleanly();
     test_stop_token_outlives_its_scope();
     test_run_until_complete();
     return test::summary();

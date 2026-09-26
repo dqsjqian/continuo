@@ -152,15 +152,65 @@ Task<void> run(EventLoop& loop, const char* certificate, const char* key) {
     co_await scope.join();
 }
 
+// 评审报告 Critical 回归：对端静默 + 调用方预算已过期。
+//
+// 修复前的行为：do_pump 把 timed_out 一律当引擎定时器到期“处理成功”，
+// read 的 for(;;) 拿不到 chunk 再来一轮，而 loop 对过期 deadline 的提交
+// 是同步拒绝（不挂起）——循环在同一次 dispatch 里同步空转，loop 线程上
+// 的 posted work、定时器、其他连接全部饿死，且无任何诊断。
+//
+// 修复后的契约：调用方预算到期 → 该操作立刻以 timed_out 失败返回；
+// 引擎自己的定时器到期才走 handle_expiry 继续泵。
+Task<void> silent_peer_budget(EventLoop& loop, const char* certificate) {
+    // A socket that receives our Initial and never answers: the black-hole peer.
+    auto black_hole = transport::udp::Socket::bind(loop, Endpoint::loopback(0));
+    if (!black_hole) throw std::runtime_error("黑洞套接字绑定失败");
+
+    quic::Options options;
+    options.local = Endpoint::loopback(0);
+    options.remote = require(black_hole->local_endpoint());
+    options.ca_file = certificate;  // the engine needs a loadable CA to build
+    options.peer_name = "localhost";
+    options.alpn = "h3";
+
+    // A handshake against a silent peer must fail on its own budget — and it
+    // must be the deadline path, not a spin.
+    const auto handshake_began = Clock::now();
+    auto connected =
+        co_await UdpConnection::connect(loop, options, {.deadline = Clock::now() + 300ms});
+    const auto handshake_elapsed = Clock::now() - handshake_began;
+    check(!connected.has_value(), "静默对端竟然完成了握手");
+    if (!connected.has_value()) {
+        check(connected.error() == Errc::timed_out, "握手失败码必须是 timed_out");
+    }
+    check(handshake_elapsed < 5s, "握手超时必须按时返回，不得空转卡死");
+
+    // Leave the loop healthy: the caller (main, outside any coroutine) checks
+    // afterwards that posted work still runs, i.e. the failed pump released
+    // the thread instead of spinning inside one dispatch.
+    loop.post([] {});
+}
+
 }  // namespace
 
+// 检查点：见 test/timeout-expectations.md（评审报告 C1 回归）
 int main(int argc, char** argv) {
     if (argc < 3) return 2;
     auto loop = EventLoop::create();
     if (!loop) return 2;
     try {
         static_cast<void>(loop->run_until_complete(run(*loop, argv[1], argv[2])));
-        std::cout << "QUIC over UDP loopback：握手、200KB 双向流、流控与关闭通过\n";
+        static_cast<void>(loop->run_until_complete(silent_peer_budget(*loop, argv[1])));
+
+        // Outside any coroutine it is legal to drive the loop again; if the
+        // failed pump had spun, we would never get here (run_until_complete
+        // would still be inside it) and this posted work would never run.
+        bool posted_ran = false;
+        loop->post([&posted_ran] { posted_ran = true; });
+        check(loop->run_once(100ms).has_value(), "loop 仍然可跑");
+        check(posted_ran, "posted work 未被饿死");
+
+        std::cout << "QUIC over UDP loopback：握手、200KB 双向流、流控、关闭与预算超时通过\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

@@ -31,7 +31,7 @@
 #include <chrono>
 #include <coroutine>
 #include <cstddef>
-#include <functional>
+#include <functional>  // std::move_only_function lives in <functional>
 #include <memory>
 #include <span>
 
@@ -101,6 +101,16 @@ public:
     [[nodiscard]] Task<Result<std::size_t>> write(NativeHandle handle,
                                                   std::span<const std::byte> source,
                                                   OperationOptions options = {});
+
+    /// Write several buffers in one submission (writev(2) / WSASend).
+    ///
+    /// Same short-write semantics as `write`: resolves with the number of
+    /// bytes accepted. The kernel gathers the pieces; no layer copies the
+    /// body behind a handler's back. Empty pieces are skipped, and an
+    /// entirely empty span is a 0-byte success, mirroring `write`.
+    [[nodiscard]] Task<Result<std::size_t>>
+    writev(NativeHandle handle, std::span<const std::span<const std::byte>> pieces,
+           OperationOptions options = {});
 
     /// Accept one connection from a listening handle.
     ///
@@ -172,7 +182,11 @@ public:
     [[nodiscard]] Task<void> yield();
 
     /// Queue `work` to run on the loop thread. Safe from any thread.
-    void post(std::function<void()> work);
+    ///
+    /// Move-only: a callable capturing a `Task` (itself move-only) can be
+    /// posted without wrapping, which is a routine need in a coroutine
+    /// library. `std::function` would demand copyability and reject it.
+    void post(std::move_only_function<void()> work);
 
     // ── driving ─────────────────────────────────────────────────────────────
 

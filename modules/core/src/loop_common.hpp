@@ -17,7 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <exception>
-#include <functional>
+#include <functional>  // std::move_only_function
 #include <map>
 #include <optional>
 #include <stop_token>
@@ -219,9 +219,14 @@ rejected_before_submit(const OperationOptions& options) noexcept {
 /// applies to `run_once` and to destroying the loop.
 class DispatchScope {
 public:
-    explicit DispatchScope(int& depth) noexcept : depth_(depth) { ++depth_; }
+    // `atomic<int>`: shutdown may run on a foreign thread while a dispatch is
+    // in flight, and its violation check reads the depth from there. A plain
+    // int would be a data race the diagnostics path itself commits.
+    explicit DispatchScope(std::atomic<int>& depth) noexcept : depth_(depth) {
+        depth_.fetch_add(1, std::memory_order_relaxed);
+    }
 
-    ~DispatchScope() { --depth_; }
+    ~DispatchScope() { depth_.fetch_sub(1, std::memory_order_relaxed); }
 
     DispatchScope(const DispatchScope&) = delete;
     DispatchScope& operator=(const DispatchScope&) = delete;
@@ -229,7 +234,7 @@ public:
     DispatchScope& operator=(DispatchScope&&) = delete;
 
 private:
-    int& depth_;
+    std::atomic<int>& depth_;
 };
 
 /// Awaiter that parks the caller until a backend resolves its operation.
@@ -248,7 +253,9 @@ private:
 /// built on an already-stopped token runs synchronously, which here would mean
 /// resuming a coroutine from inside its own `await_suspend`. Deferring to the
 /// loop is what closes that window, and it is the same mechanism that makes a
-/// stop request from another thread safe.
+/// stop request from another thread safe. If the registration itself fails to
+/// allocate, the awaiter degrades to operating without a cancel callback
+/// rather than propagating an exception through an irreversible submission.
 template<typename T, typename Submit, typename RequestCancel>
 class OperationAwaiter {
 public:
@@ -274,7 +281,22 @@ public:
         }
         id_ = *submitted;
         if (stop_.stop_possible()) {
-            callback_.emplace(stop_, Notify{this});
+            // Registering the callback can allocate, and allocation can throw.
+            // By this point the submission is irreversible: the loop holds the
+            // handle and the result slot, so letting an exception propagate
+            // here would destroy the awaiter (and the frame's result slot)
+            // while the operation is still in flight — the loop would then
+            // finalize a dead object and resume a frame that never suspended,
+            // both undefined behavior. Degrade instead: without the callback,
+            // cancellation is not delivered early, but the operation itself
+            // still completes (or times out) and resumes normally. Losing one
+            // cancellation under OOM is the honest failure mode.
+            try {
+                callback_.emplace(stop_, Notify{this});
+            } catch (...) {
+                // Deliberately swallowed: see the comment above. Every path
+                // out of here must leave the awaiter suspended-and-tracked.
+            }
         }
         return true;
     }
@@ -325,17 +347,19 @@ template<typename Impl>
 /// Work queued by `post()`, drained on the loop thread.
 class PostQueue {
 public:
-    void push(std::function<void()> work) { queued_.push_back(std::move(work)); }
+    void push(std::move_only_function<void()> work) { queued_.push_back(std::move(work)); }
 
     [[nodiscard]] bool empty() const noexcept { return queued_.empty(); }
     [[nodiscard]] std::size_t size() const noexcept { return queued_.size(); }
 
-    void drain_into(std::vector<std::function<void()>>& out) noexcept { out.swap(queued_); }
+    void drain_into(std::vector<std::move_only_function<void()>>& out) noexcept {
+        out.swap(queued_);
+    }
 
     void clear() noexcept { queued_.clear(); }
 
 private:
-    std::vector<std::function<void()>> queued_{};
+    std::vector<std::move_only_function<void()>> queued_{};
 };
 
 }  // namespace Mira::detail

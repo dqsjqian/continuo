@@ -11,6 +11,7 @@
 #include "mira/core/event_loop.hpp"
 #include "mira/core/task.hpp"
 #include "mira/http3/engine.hpp"
+#include "mira/quic/connection.hpp"  // DatagramTransport concept
 #include "mira/quic/engine.hpp"
 
 #include <array>
@@ -53,7 +54,11 @@ struct BodyChunk {
 /// quic::Connection; a listener that routes many clients by connection ID is
 /// not provided yet. Operations must not overlap; `read_body` pumps until
 /// the stream produces.
-template<typename Transport>
+///
+/// Constrained by the same `DatagramTransport` concept as `quic::Connection`,
+/// so an unsuitable transport fails at the declaration rather than deep
+/// inside a pump.
+template<quic::DatagramTransport Transport>
 class Connection {
 public:
     Connection(Connection&&) noexcept = default;
@@ -292,16 +297,28 @@ private:
         const std::uint64_t now = detail::now_ns();
         OperationOptions wait = io;
         // See quic: NGTCP2_INFINITY must not become a deadline (overflow spin).
+        bool engine_timer_armed = false;
         if (const std::uint64_t expiry = engine_->expiry();
             expiry > now && expiry != std::numeric_limits<std::uint64_t>::max()) {
             const auto deadline = EventLoop::Clock::time_point{std::chrono::nanoseconds{expiry}};
             if (!wait.deadline || deadline < *wait.deadline) wait.deadline = deadline;
+            engine_timer_armed = true;
+        }
+
+        // See quic: the caller's expired budget must fail the operation, not
+        // be mistaken for the engine's timer and "handled" into a spin.
+        if (io.deadline && *io.deadline <= EventLoop::Clock::now()) {
+            co_return fail(Errc::timed_out);
         }
 
         std::array<std::byte, detail::kMaxDatagram> buffer{};
         auto received = co_await transport_->receive_from(buffer, wait);
         if (!received) {
             if (received.error() == Errc::timed_out) {
+                if (engine_timer_armed && wait.deadline == io.deadline) {
+                    // The caller's own deadline won the race mid-wait.
+                    co_return fail(Errc::timed_out);
+                }
                 if (auto handled = engine_->handle_expiry(detail::now_ns()); !handled) {
                     co_return fail(handled.error());
                 }

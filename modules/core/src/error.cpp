@@ -35,6 +35,8 @@ public:
             return "invalid argument";
         case Errc::not_supported:
             return "not supported on this platform";
+        case Errc::internal:
+            return "internal error (exception crossed a library boundary)";
         }
         return "unknown Mira error (" + std::to_string(value) + ")";
     }
@@ -57,6 +59,7 @@ public:
             return std::make_error_condition(std::errc::value_too_large);
         case Errc::ok:
         case Errc::eof:
+        case Errc::internal:
             break;
         }
         return {value, *this};

@@ -130,6 +130,14 @@ public:
         Result<void>* void_result{nullptr};
         Result<std::size_t>* size_result{nullptr};
         WSABUF buffer{};
+        // Scatter-write state: WSASend takes an array of buffers, so a
+        // multi-piece write keeps its descriptors here for the duration of
+        // the overlapped operation. 16 covers head + body + trailer shapes
+        // without an allocation; the span shape is a convenience, not a
+        // capacity promise (callers with more pieces can loop `write`).
+        static constexpr std::size_t kMaxScatter = 16;
+        std::array<WSABUF, kMaxScatter> scatter{};
+        DWORD scatter_count{0};
         // Winsock 在异步完成之前仍可写地址长度和 flags。
         SOCKADDR_STORAGE datagram_address{};
         int datagram_address_size{sizeof(SOCKADDR_STORAGE)};
@@ -193,7 +201,7 @@ public:
 
         std::vector<std::pair<detail::OperationId, Error>> orphans;
         std::vector<std::pair<SOCKET, OVERLAPPED*>> to_cancel;
-        std::vector<std::function<void()>> discarded_work;
+        std::vector<std::move_only_function<void()>> discarded_work;
         std::size_t kernel_backed = 0;
         {
             const std::lock_guard lock{mutex_};
@@ -368,6 +376,64 @@ public:
         const int status = ::WSASend(static_cast<SOCKET>(handle),
                                      &operation->buffer,
                                      1,
+                                     nullptr,
+                                     0,
+                                     &operation->overlapped,
+                                     nullptr);
+        if (status == 0 || ::WSAGetLastError() == WSA_IO_PENDING) {
+            return acquired.id;
+        }
+
+        const Error error = last_socket_error();
+        discard(acquired.id);
+        return fail(error);
+    }
+
+    /// Scatter form of `submit_write`: WSASend gathers the descriptors in one
+    /// overlapped submission, so the pieces reach the kernel unconcatenated.
+    [[nodiscard]] Result<detail::OperationId>
+    submit_writev(NativeHandle handle, std::span<const std::span<const std::byte>> pieces,
+                  const OperationOptions& options, std::coroutine_handle<> coroutine,
+                  Result<std::size_t>* result) {
+        if (shutting_down()) {
+            return fail(Errc::cancelled);
+        }
+        if (const std::optional<Error> rejected = detail::rejected_before_submit(options)) {
+            return fail(*rejected);
+        }
+        std::size_t total = 0;
+        DWORD count = 0;
+        for (const std::span<const std::byte> piece : pieces) {
+            if (piece.empty() || count == Operation::kMaxScatter) {
+                continue;
+            }
+            // The pieces are borrowed for the duration of the operation — the
+            // same contract the single-buffer form has always had.
+            total += piece.size();
+        }
+        if (total == 0) {
+            return fail(Errc::invalid_argument);
+        }
+
+        const Acquired acquired =
+            acquire_operation(Kind::write, coroutine, std::nullopt, options);
+        Operation* operation = acquired.operation;
+        operation->size_result = result;
+        operation->socket = static_cast<SOCKET>(handle);
+        for (const std::span<const std::byte> piece : pieces) {
+            if (piece.empty() || operation->scatter_count == Operation::kMaxScatter) {
+                continue;
+            }
+            operation->scatter[operation->scatter_count].buf =
+                const_cast<CHAR*>(reinterpret_cast<const CHAR*>(piece.data()));
+            operation->scatter[operation->scatter_count].len =
+                static_cast<ULONG>(piece.size());
+            ++operation->scatter_count;
+        }
+
+        const int status = ::WSASend(static_cast<SOCKET>(handle),
+                                     operation->scatter.data(),
+                                     operation->scatter_count,
                                      nullptr,
                                      0,
                                      &operation->overlapped,
@@ -589,7 +655,7 @@ public:
         }
     }
 
-    [[nodiscard]] Result<void> post(std::function<void()> work) {
+    [[nodiscard]] Result<void> post(std::move_only_function<void()> work) {
         {
             const std::lock_guard lock{mutex_};
             if (shutting_down()) {
@@ -691,7 +757,7 @@ public:
 
         std::vector<detail::TimerTarget> expired;
         std::vector<detail::OperationId> cancels;
-        std::vector<std::function<void()>> to_run;
+        std::vector<std::move_only_function<void()>> to_run;
         {
             const std::lock_guard lock{mutex_};
             timers_.extract_expired(detail::Clock::now(), expired);
@@ -996,7 +1062,7 @@ private:
 
     /// Non-zero while a batch is being delivered. Loop thread only, which is
     /// the same restriction `run_once` and destroying the loop already carry.
-    int dispatch_depth_{0};
+    std::atomic<int> dispatch_depth_{0};
 
     LPFN_ACCEPTEX accept_ex_{nullptr};
     LPFN_CONNECTEX connect_ex_{nullptr};
@@ -1047,7 +1113,7 @@ void EventLoop::detach(NativeHandle handle) {
     impl_->detach(handle);
 }
 
-void EventLoop::post(std::function<void()> work) {
+void EventLoop::post(std::move_only_function<void()> work) {
     (void)impl_->post(std::move(work));
 }
 void EventLoop::stop() {
@@ -1086,7 +1152,10 @@ Task<Result<std::size_t>> EventLoop::read(NativeHandle handle,
     if (destination.empty()) {
         co_return std::size_t{0};
     }
+    // A moved-from loop owns nothing; the submit closure would dereference a
+    // null Impl. Mirrors the POSIX backend's guard on every operation.
     Impl* impl = impl_.get();
+    if (!impl || impl->shutting_down()) co_return fail(Errc::cancelled);
     // `options` is a by-value coroutine parameter, so capturing it by
     // reference captures a slot in this frame, which outlives the awaiter.
     auto submit = [impl, handle, destination, &options](std::coroutine_handle<> coroutine,
@@ -1107,9 +1176,33 @@ Task<Result<std::size_t>> EventLoop::write(NativeHandle handle,
         co_return std::size_t{0};
     }
     Impl* impl = impl_.get();
+    if (!impl || impl->shutting_down()) co_return fail(Errc::cancelled);
     auto submit = [impl, handle, source, &options](std::coroutine_handle<> coroutine,
                                                    Result<std::size_t>* result) {
         return impl->submit_write(handle, source, options, coroutine, result);
+    };
+    co_return co_await detail::await_operation<Result<std::size_t>>(
+        std::move(submit), detail::cancel_through(impl), options.stop);
+}
+
+Task<Result<std::size_t>> EventLoop::writev(NativeHandle handle,
+                                            std::span<const std::span<const std::byte>> pieces,
+                                            OperationOptions options) {
+    if (const std::optional<Error> rejected = detail::rejected_before_submit(options)) {
+        co_return fail(*rejected);
+    }
+    std::size_t total = 0;
+    for (const std::span<const std::byte> piece : pieces) {
+        total += piece.size();
+    }
+    if (total == 0) {
+        co_return std::size_t{0};
+    }
+    Impl* impl = impl_.get();
+    if (!impl || impl->shutting_down()) co_return fail(Errc::cancelled);
+    auto submit = [impl, handle, pieces, &options](std::coroutine_handle<> coroutine,
+                                                   Result<std::size_t>* result) {
+        return impl->submit_writev(handle, pieces, options, coroutine, result);
     };
     co_return co_await detail::await_operation<Result<std::size_t>>(
         std::move(submit), detail::cancel_through(impl), options.stop);
@@ -1121,6 +1214,7 @@ EventLoop::accept(NativeHandle listener, int address_family, OperationOptions op
         co_return fail(*rejected);
     }
     Impl* impl = impl_.get();
+    if (!impl || impl->shutting_down()) co_return fail(Errc::cancelled);
     auto submit = [impl, listener, address_family, &options](std::coroutine_handle<> coroutine,
                                                              Result<std::size_t>* result) {
         return impl->submit_accept(listener, address_family, options, coroutine, result);
@@ -1151,6 +1245,7 @@ Task<Result<void>> EventLoop::connect(NativeHandle handle,
         co_return fail(*rejected);
     }
     Impl* impl = impl_.get();
+    if (!impl || impl->shutting_down()) co_return fail(Errc::cancelled);
     auto submit = [impl, handle, address, &options](std::coroutine_handle<> coroutine,
                                                     Result<std::size_t>* result) {
         return impl->submit_connect(handle, address, options, coroutine, result);
@@ -1171,7 +1266,7 @@ Task<Result<void>> EventLoop::connect(NativeHandle handle,
 Task<Result<EventLoop::DatagramResult>> EventLoop::receive_from(
     NativeHandle handle, std::span<std::byte> destination, OperationOptions options) {
     Impl* impl = impl_.get();
-    if (!impl) co_return fail(Errc::cancelled);
+    if (!impl || impl->shutting_down()) co_return fail(Errc::cancelled);
     DatagramResult datagram;
     auto submit = [impl, handle, destination, &options, &datagram](
         std::coroutine_handle<> coroutine, Result<std::size_t>* result) {
@@ -1188,7 +1283,7 @@ Task<Result<std::size_t>> EventLoop::send_to(
     NativeHandle handle, std::span<const std::byte> source,
     std::span<const std::byte> address, OperationOptions options) {
     Impl* impl = impl_.get();
-    if (!impl) co_return fail(Errc::cancelled);
+    if (!impl || impl->shutting_down()) co_return fail(Errc::cancelled);
     auto submit = [impl, handle, source, address, &options](
         std::coroutine_handle<> coroutine, Result<std::size_t>* result) {
         return impl->submit_datagram(handle, {}, source, address, nullptr,
@@ -1207,6 +1302,8 @@ Task<Result<void>> EventLoop::wait_for(NativeHandle, bool, OperationOptions) {
 }
 
 Task<Result<void>> EventLoop::sleep_until(Clock::time_point deadline, OperationOptions options) {
+    // Same moved-from guard as the rest of the completion API.
+    if (!impl_ || impl_->shutting_down()) co_return fail(Errc::cancelled);
     Impl* impl = impl_.get();
     auto submit = [impl, deadline, &options](std::coroutine_handle<> coroutine,
                                              Result<void>* result) {
@@ -1221,6 +1318,7 @@ Task<Result<void>> EventLoop::sleep_for(Duration delay, OperationOptions options
 }
 
 Task<void> EventLoop::yield() {
+    if (!impl_ || impl_->shutting_down()) co_return;
     Impl* impl = impl_.get();
     auto submit = [impl](std::coroutine_handle<> coroutine, Result<void>* result) {
         // Keep yield in the tracked timer queue so shutdown resumes it after

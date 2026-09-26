@@ -324,6 +324,58 @@ void test_keep_alive_pipeline() {
     CHECK(count_occurrences(stream.sent(), "HTTP/1.1 200 OK") == 2);
 }
 
+void test_handler_exception_is_contained() {
+    test::section("a throwing handler gets a 500 or a close, never an escape");
+
+    // Branch 1: std::exception before anything was sent → 500 + fail(internal).
+    {
+        ScriptedStream stream{"GET /boom HTTP/1.1\r\nHost: x\r\n\r\n"};
+        auto handler = [](const Request&, auto&, std::span<const std::byte>)
+            -> Task<Result<void>> { throw std::runtime_error("handler exploded"); };
+
+        const Result<void> served = serve_connection(stream, handler).sync_get();
+        CHECK(!served.has_value());
+        CHECK(served.error() == Errc::internal);
+        CHECK(stream.sent().starts_with("HTTP/1.1 500 Internal Server Error"));
+    }
+
+    // Branch 2: a non-std exception type — the catch must be catch-all.
+    {
+        ScriptedStream stream{"GET /alien HTTP/1.1\r\nHost: x\r\n\r\n"};
+        struct Alien {};
+        auto handler = [](const Request&, auto&, std::span<const std::byte>)
+            -> Task<Result<void>> { throw Alien{}; };
+
+        const Result<void> served = serve_connection(stream, handler).sync_get();
+        CHECK(!served.has_value());
+        CHECK(served.error() == Errc::internal);
+        CHECK(stream.sent().starts_with("HTTP/1.1 500 Internal Server Error"));
+    }
+
+    // Branch 3: throw *after* the head is on the wire → no second response,
+    // the half-written exchange is abandoned.
+    {
+        ScriptedStream stream{"GET /half HTTP/1.1\r\nHost: x\r\n\r\n"};
+        auto handler = [](const Request&, auto& writer, std::span<const std::byte>)
+            -> Task<Result<void>> {
+            Response response;
+            response.status = 200;
+            if (const Result<void> head = co_await writer.send_head_chunked(response);
+                !head) {
+                co_return fail(head.error());
+            }
+            throw std::runtime_error("mid-stream explosion");
+        };
+
+        const Result<void> served = serve_connection(stream, handler).sync_get();
+        CHECK(!served.has_value());
+        CHECK(served.error() == Errc::internal);
+        // Exactly one status line ever: the 500 must not stack on the 200.
+        CHECK(count_occurrences(stream.sent(), "HTTP/1.1") == 1);
+        CHECK(stream.sent().starts_with("HTTP/1.1 200 OK"));
+    }
+}
+
 void test_body_is_drained_even_if_ignored() {
     test::section("request body always drained");
 
@@ -793,6 +845,7 @@ int main() {
 
     test_single_exchange();
     test_keep_alive_pipeline();
+    test_handler_exception_is_contained();
     test_body_is_drained_even_if_ignored();
     test_body_delivered_to_handler();
     test_chunked_request_body();

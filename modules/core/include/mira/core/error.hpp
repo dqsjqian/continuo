@@ -28,6 +28,11 @@ enum class Errc {
     limit_exceeded,
     invalid_argument,
     not_supported,
+    /// A library boundary caught an exception it cannot attribute to a
+    /// protocol event — e.g. a user handler that threw. Distinguishable from
+    /// every I/O condition above so callers can tell "the connection broke"
+    /// from "the code on this side broke".
+    internal,
 };
 
 [[nodiscard]] const std::error_category& mira_category() noexcept;

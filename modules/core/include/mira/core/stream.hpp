@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <span>
 #include <utility>
+#include <vector>
 
 namespace Mira {
 
@@ -84,6 +85,134 @@ concept BoundedWriteStream =
 /// A bidirectional stream that can be cut short in both directions.
 template<typename S>
 concept BoundedStream = BoundedReadStream<S> && BoundedWriteStream<S>;
+
+// ── scattered writes ────────────────────────────────────────────────────────
+//
+// A response is naturally two pieces — a serialised head and a body the
+// handler already owns. Concatenating them into one buffer costs a full copy
+// of the body, and the kernel can take the two pieces directly (writev(2),
+// WSASend), so the seam offers the vector shape and every implementer that
+// can passes it straight down.
+
+/// A stream that can write several buffers in one operation.
+///
+/// Refines `AsyncWriteStream` rather than replacing it: an implementer
+/// without a scattered-write syscall falls back to its own `write_some` in a
+/// loop, and the composed `writev_all` below works either way.
+template<typename S>
+concept AsyncVectorWriteStream =
+    AsyncWriteStream<S> && requires(S& stream,
+                                    std::span<const std::span<const std::byte>> pieces) {
+        { stream.writev_some(pieces) } -> std::same_as<Task<Result<std::size_t>>>;
+    };
+
+/// A scattered-write stream whose writes accept cancellation and a deadline.
+template<typename S>
+concept BoundedVectorWriteStream =
+    AsyncVectorWriteStream<S> &&
+    requires(S& stream, std::span<const std::span<const std::byte>> pieces,
+             OperationOptions options) {
+        { stream.writev_some(pieces, options) } -> std::same_as<Task<Result<std::size_t>>>;
+    };
+
+/// Write every byte of every piece, looping over short writes.
+///
+/// The pieces are consumed as-written: after a short write the remaining tail
+/// of the partially-written piece plus everything after it is re-submitted,
+/// so the loop needs no index arithmetic from the caller and no copy of
+/// anything.
+template<AsyncVectorWriteStream S>
+Task<Result<void>>
+writev_all(S& stream, std::span<const std::span<const std::byte>> pieces) {
+    // Nothing offered means nothing owed — the same answer `write_all` gives
+    // for an empty source, rather than mistaking an empty submission for a
+    // peer that closed.
+    std::size_t offered = 0;
+    for (const std::span<const std::byte> p : pieces) {
+        offered += p.size();
+    }
+    if (offered == 0) {
+        co_return Result<void>{};
+    }
+    std::size_t piece = 0;
+    std::size_t offset = 0;
+    while (piece < pieces.size()) {
+        std::vector<std::span<const std::byte>> tail;
+        // The tail always starts with the current piece — `subspan(offset)`
+        // is the whole piece when nothing of it has been written yet.
+        tail.push_back(pieces[piece].subspan(offset));
+        tail.insert(tail.end(), pieces.begin() + static_cast<std::ptrdiff_t>(piece) + 1,
+                    pieces.end());
+        Result<std::size_t> n = co_await stream.writev_some(tail);
+        if (!n) {
+            co_return fail(n.error());
+        }
+        if (*n == 0) {
+            co_return fail(Errc::eof);
+        }
+        // Advance the (piece, offset) cursor by *n bytes across the tail.
+        std::size_t remaining = *n;
+        while (remaining > 0 && piece < pieces.size()) {
+            const std::size_t available = pieces[piece].size() - offset;
+            if (remaining < available) {
+                offset += remaining;
+                remaining = 0;
+            } else {
+                remaining -= available;
+                ++piece;
+                offset = 0;
+            }
+        }
+    }
+    co_return Result<void>{};
+}
+
+/// The bounded form of `writev_all`: `options` applies to every submission,
+/// which is what an absolute deadline over a whole scattered transfer means.
+///
+/// No default parameter, for the same reason as the bounded `write_all`: a
+/// default would make the two forms ambiguous for a stream that satisfies
+/// both concepts.
+template<BoundedVectorWriteStream S>
+Task<Result<void>> writev_all(S& stream,
+                              std::span<const std::span<const std::byte>> pieces,
+                              OperationOptions options) {
+    std::size_t offered = 0;
+    for (const std::span<const std::byte> p : pieces) {
+        offered += p.size();
+    }
+    if (offered == 0) {
+        co_return Result<void>{};
+    }
+    std::size_t piece = 0;
+    std::size_t offset = 0;
+    while (piece < pieces.size()) {
+        std::vector<std::span<const std::byte>> tail;
+        tail.push_back(pieces[piece].subspan(offset));
+        tail.insert(tail.end(), pieces.begin() + static_cast<std::ptrdiff_t>(piece) + 1,
+                    pieces.end());
+        Result<std::size_t> n = co_await stream.writev_some(tail, options);
+        if (!n) {
+            co_return fail(n.error());
+        }
+        if (*n == 0) {
+            co_return fail(Errc::eof);
+        }
+        std::size_t remaining = *n;
+        while (remaining > 0 && piece < pieces.size()) {
+            const std::size_t available = pieces[piece].size() - offset;
+            if (remaining < available) {
+                offset += remaining;
+                remaining = 0;
+            } else {
+                remaining -= available;
+                ++piece;
+                offset = 0;
+            }
+        }
+    }
+    co_return Result<void>{};
+}
 
 /// Write the whole buffer, looping over short writes.
 ///

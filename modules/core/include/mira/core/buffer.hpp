@@ -92,6 +92,16 @@ public:
         pending_ = 0;
     }
 
+    /// Pre-allocate room for `n` future bytes without growing `size()`.
+    ///
+    /// For a buffer whose final length is known up front (e.g. a request body
+    /// whose Content-Length has been parsed), this turns the vector's doubling
+    /// growth — which copies every byte ≈2× on the way — into one allocation
+    /// plus the linear appends. No-op-safe: never shrinks.
+    void reserve(std::size_t n) {
+        storage_.reserve(n);
+    }
+
 private:
     /// Move unread bytes to the front when the consumed prefix is worth
     /// reclaiming — i.e. when it would save a reallocation.

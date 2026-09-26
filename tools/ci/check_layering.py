@@ -76,7 +76,7 @@ FORBIDDEN_INCLUDES: dict[str, tuple[str, ...]] = {
 
 # Include prefixes no layer may use, with the reason reported to the user.
 BANNED_EVERYWHERE: dict[str, str] = {
-    "aria/": "Mirat not depend on Aria; hosts integrate via the executor/stream seams",
+    "aria/": "Mira must not depend on Aria; hosts integrate via the executor/stream seams",
 }
 
 # OS headers a protocol module must never reach for.

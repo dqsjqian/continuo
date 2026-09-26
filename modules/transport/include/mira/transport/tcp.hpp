@@ -101,6 +101,13 @@ public:
     [[nodiscard]] Task<Result<std::size_t>> write_some(std::span<const std::byte> source,
                                                        OperationOptions options = {});
 
+    /// Write several buffers in one submission (writev/WSASend); short
+    /// writes are normal. The kernel gathers — a response head and body go
+    /// out without being concatenated first.
+    [[nodiscard]] Task<Result<std::size_t>>
+    writev_some(std::span<const std::span<const std::byte>> pieces,
+                OperationOptions options = {});
+
     /// Address of the peer, as reported by the OS.
     [[nodiscard]] Result<Endpoint> peer_endpoint() const;
 

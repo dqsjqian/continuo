@@ -2,7 +2,7 @@
 
 // Mira/core/executor.hpp — where coroutines get resumed.
 //
-// Miras not own a thread policy. The `Executor` concept is the single
+// Mira does not own a thread policy. The `Executor` concept is the single
 // hook a host uses to decide *which thread* runs a resumption, which is what
 // lets the library sit under a GUI framework's main loop, a per-core event
 // loop, or a plain thread pool without any of them knowing about the others.
@@ -25,10 +25,35 @@
 
 namespace Mira {
 
-/// A scheduler Mira hand resumptions to.
+namespace detail {
+
+/// The exact callable `schedule_on` posts: a coroutine handle wrapped in a
+/// copyable, callable shape. Naming the type is what lets the `Executor`
+/// concept probe the *real* requirement — accepting this closure — rather
+/// than an incidental one like "accepts a function pointer", which a
+/// capture-carrying closure can never satisfy.
+struct PostedResumption {
+    std::coroutine_handle<> awaiting;
+
+    void operator()() const noexcept { awaiting.resume(); }
+};
+
+}  // namespace detail
+
+/// An executor accepts any callable Mira needs to post, including the
+/// stateful resumption closure above. Probing with `PostedResumption` itself
+/// means a type satisfying the concept actually works with `schedule_on`,
+/// rather than failing later inside the template body.
 template<typename E>
-concept Executor = requires(E& executor, void (*work)()) {
-    { executor.post(work) } -> std::same_as<void>;
+concept Executor = requires(E& executor, detail::PostedResumption&& work) {
+    { executor.post(std::move(work)) } -> std::same_as<void>;
+};
+
+/// The precise per-callable form, for hosts that want to check their own
+/// executor types against arbitrary work shapes.
+template<typename E, typename F>
+concept ExecutorFor = requires(E& executor, F&& work) {
+    { executor.post(std::forward<F>(work)) } -> std::same_as<void>;
 };
 
 /// Executor that runs posted work synchronously on the calling thread.
@@ -58,9 +83,11 @@ template<Executor E>
         [[nodiscard]] bool await_ready() const noexcept { return false; }
 
         void await_suspend(std::coroutine_handle<> awaiting) {
-            // The handle is copied by value into the posted callable: capturing
-            // by reference here would dangle as soon as this awaiter dies.
-            target_.post([awaiting]() mutable { awaiting.resume(); });
+            // The handle is wrapped in the named closure the `Executor`
+            // concept probes with, so "compiles against the concept" and
+            // "works at runtime" cannot drift apart. Capturing by reference
+            // here would dangle as soon as this awaiter dies.
+            target_.post(detail::PostedResumption{awaiting});
         }
 
         void await_resume() const noexcept {}

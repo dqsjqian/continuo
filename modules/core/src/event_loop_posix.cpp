@@ -22,6 +22,7 @@
     #include <fcntl.h>
     #include <mutex>
     #include <sys/socket.h>
+    #include <sys/uio.h>
     #include <unistd.h>
     #include <unordered_map>
     #include <utility>
@@ -125,7 +126,7 @@ public:
         }
 
         std::vector<detail::OperationId> orphans;
-        std::vector<std::function<void()>> discarded_work;
+        std::vector<std::move_only_function<void()>> discarded_work;
         {
             const std::lock_guard lock{mutex_};
             orphans.reserve(operations_.size());
@@ -164,9 +165,15 @@ public:
     }
 
     void detach(int fd) noexcept {
-        if (auto it = datagrams_.find(fd); it != datagrams_.end()) {
-            for (const auto& closed : it->second) if (closed) *closed = true;
-            datagrams_.erase(it);
+        // `detach` runs on the loop thread, but `acquire_datagram`/
+        // `release_datagram` may run on a foreign thread (see their comment),
+        // so this table access takes the lock like every other one.
+        {
+            const std::lock_guard lock{mutex_};
+            if (auto it = datagrams_.find(fd); it != datagrams_.end()) {
+                for (const auto& closed : it->second) if (closed) *closed = true;
+                datagrams_.erase(it);
+            }
         }
         // Remove kernel interest before cancellation resumes user code, which
         // can register another operation. Never disarm that new registration.
@@ -175,7 +182,13 @@ public:
     }
 
     // 占位覆盖整个重试循环，不随 readiness 通知提前释放。
+    // Held under `mutex_`, same as `add_waiter`/`add_timer`: a coroutine that
+    // migrated to another thread via `schedule_on` may call `receive_from`
+    // off the loop thread, and the loop thread can be inside `detach` at the
+    // same moment. The rest of the submission paths tolerate cross-thread
+    // callers; this table must not be the exception.
     std::shared_ptr<bool> acquire_datagram(int fd, bool writing) {
+        const std::lock_guard lock{mutex_};
         auto& slot = datagrams_[fd][writing ? 1U : 0U];
         if (slot) return {};
         slot = std::make_shared<bool>(false);
@@ -183,6 +196,7 @@ public:
     }
 
     void release_datagram(int fd, bool writing, const std::shared_ptr<bool>& token) {
+        const std::lock_guard lock{mutex_};
         auto it = datagrams_.find(fd);
         if (it == datagrams_.end()) return;
         auto& slot = it->second[writing ? 1U : 0U];
@@ -305,7 +319,7 @@ public:
         wake();
     }
 
-    void post(std::function<void()> work) {
+    void post(std::move_only_function<void()> work) {
         {
             const std::lock_guard lock{mutex_};
             if (shutting_down()) return;
@@ -367,7 +381,7 @@ public:
         // time these are delivered, an earlier resumption may already have
         // resolved one of them, and a stale id resolves to nothing.
         std::vector<std::pair<detail::OperationId, Result<void>>> resolved;
-        std::vector<std::function<void()>> to_run;
+        std::vector<std::move_only_function<void()>> to_run;
         std::vector<std::pair<int, detail::Interest>> to_rearm;
         std::vector<detail::TimerTarget> expired;
         std::vector<detail::OperationId> cancels;
@@ -649,7 +663,7 @@ private:
 
     /// Non-zero while a batch is being delivered. Loop thread only, which is
     /// the same restriction `run_once` and destroying the loop already carry.
-    int dispatch_depth_{0};
+    std::atomic<int> dispatch_depth_{0};
 
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> wake_pending_{false};
@@ -710,7 +724,7 @@ void EventLoop::detach(NativeHandle handle) {
     impl_->detach(handle);
 }
 
-void EventLoop::post(std::function<void()> work) {
+void EventLoop::post(std::move_only_function<void()> work) {
     impl_->post(std::move(work));
 }
 void EventLoop::stop() {
@@ -790,6 +804,50 @@ Task<Result<std::size_t>> EventLoop::write(NativeHandle handle,
         const ssize_t count = ::write(handle, source.data(), source.size());
         if (count >= 0) {
             co_return static_cast<std::size_t>(count);
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            co_return fail(last_os_error());
+        }
+        Result<void> ready = co_await wait_for(handle, /*writable=*/true, options);
+        if (!ready) {
+            co_return fail(ready.error());
+        }
+    }
+}
+
+Task<Result<std::size_t>> EventLoop::writev(NativeHandle handle,
+                                            std::span<const std::span<const std::byte>> pieces,
+                                            OperationOptions options) {
+    if (!impl_ || impl_->shutting_down()) co_return fail(Errc::cancelled);
+    if (const std::optional<Error> rejected = detail::rejected_before_submit(options)) {
+        co_return fail(*rejected);
+    }
+    // The kernel takes iovec arrays; this stack buffer bounds the scatter to
+    // what a response needs (head + body + trailer) without an allocation.
+    // A caller with more pieces than that can still loop `write` — the
+    // span-of-spans shape is a convenience, not a capacity promise.
+    std::array<::iovec, 16> scatter{};
+    std::size_t count = 0;
+    std::size_t total = 0;
+    for (const std::span<const std::byte> piece : pieces) {
+        if (piece.empty() || count == scatter.size()) {
+            continue;
+        }
+        scatter[count].iov_base = const_cast<std::byte*>(piece.data());
+        scatter[count].iov_len = piece.size();
+        ++count;
+        total += piece.size();
+    }
+    if (total == 0) {
+        co_return std::size_t{0};
+    }
+    for (;;) {
+        const ssize_t written = ::writev(handle, scatter.data(), static_cast<int>(count));
+        if (written >= 0) {
+            co_return static_cast<std::size_t>(written);
         }
         if (errno == EINTR) {
             continue;
@@ -975,7 +1033,11 @@ Task<Result<std::size_t>> EventLoop::send_to(
 
 Task<Result<void>>
 EventLoop::wait_for(NativeHandle handle, bool writable, OperationOptions options) {
+    // A moved-from loop owns nothing: fail rather than dereference a null
+    // Impl inside the submit closure. The read/write/accept/connect family
+    // already guards this way; timers must not be the odd one out.
     Impl* impl = impl_.get();
+    if (!impl || impl->shutting_down()) co_return fail(Errc::cancelled);
     auto submit = [impl, handle, writable, &options](std::coroutine_handle<> coroutine,
                                                      Result<void>* result) {
         return impl->add_waiter(handle, writable, options, coroutine, result);
@@ -987,6 +1049,9 @@ EventLoop::wait_for(NativeHandle handle, bool writable, OperationOptions options
 }
 
 Task<Result<void>> EventLoop::sleep_until(Clock::time_point deadline, OperationOptions options) {
+    // Same moved-from guard as wait_for: the loop that was moved out of owns
+    // no timers, and the submit closure would dereference a null Impl.
+    if (!impl_ || impl_->shutting_down()) co_return fail(Errc::cancelled);
     Impl* impl = impl_.get();
     auto submit = [impl, deadline, &options](std::coroutine_handle<> coroutine,
                                              Result<void>* result) {

@@ -30,6 +30,14 @@ Task<Result<std::size_t>> Socket::write_some(std::span<const std::byte> source,
     co_return co_await loop_->write(handle_, source, std::move(options));
 }
 
+Task<Result<std::size_t>> Socket::writev_some(
+    std::span<const std::span<const std::byte>> pieces, OperationOptions options) {
+    if (loop_ == nullptr || handle_ == invalid_handle) {
+        co_return fail(Errc::invalid_argument);
+    }
+    co_return co_await loop_->writev(handle_, pieces, std::move(options));
+}
+
 Result<Endpoint> Socket::peer_endpoint() const {
     if (handle_ == invalid_handle) {
         return fail(Errc::invalid_argument);

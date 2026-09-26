@@ -1,4 +1,27 @@
-find_program(MIRA_QUIC_OPENSSL_TOOL NAMES openssl HINTS "${OPENSSL_ROOT_DIR}/bin" REQUIRED)
+# Prefer a fully working openssl over a broken system one. On hosts where a
+# Homebrew toolchain shadows system libraries, /bin/openssl can fail to even
+# start (libssl version mismatch). find_program's prefix search can land on
+# that broken binary before the toolchain's own, so the explicit paths come
+# first. Note OPENSSL_ROOT_DIR may be empty on this host: a naive
+# "${OPENSSL_ROOT_DIR}/bin" would collapse to "/bin" and re-select the broken
+# binary, hence the guarded list assembly.
+set(MIRA_QUIC_OPENSSL_HINTS "")
+if(OPENSSL_ROOT_DIR)
+    list(APPEND MIRA_QUIC_OPENSSL_HINTS "${OPENSSL_ROOT_DIR}/bin")
+endif()
+list(APPEND MIRA_QUIC_OPENSSL_HINTS
+    /home/linuxbrew/.linuxbrew/bin
+    /opt/homebrew/bin
+)
+find_program(MIRA_QUIC_OPENSSL_TOOL
+    NAMES openssl
+    HINTS ${MIRA_QUIC_OPENSSL_HINTS}
+    PATHS /home/linuxbrew/.linuxbrew/bin /opt/homebrew/bin
+    NO_DEFAULT_PATH
+)
+if(NOT MIRA_QUIC_OPENSSL_TOOL)
+    find_program(MIRA_QUIC_OPENSSL_TOOL NAMES openssl REQUIRED)
+endif()
 set(MIRA_QUIC_TEST_CERT "${CMAKE_CURRENT_BINARY_DIR}/cert.pem" CACHE INTERNAL "QUIC 测试证书")
 set(MIRA_QUIC_TEST_KEY "${CMAKE_CURRENT_BINARY_DIR}/key.pem" CACHE INTERNAL "QUIC 测试私钥")
 execute_process(COMMAND "${MIRA_QUIC_OPENSSL_TOOL}" req -x509 -newkey rsa:2048 -nodes
