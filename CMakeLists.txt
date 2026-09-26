@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(Mira
-    VERSION 0.1.5
+    VERSION 0.2.0
     DESCRIPTION "Coroutine-native C++23 networking library — transport, protocols, and nothing else"
     LANGUAGES CXX
 )
@@ -169,8 +169,8 @@ if(MIRA_INSTALL)
         if((optional_module STREQUAL "Tls" AND MIRA_ENABLE_TLS)
            OR (optional_module STREQUAL "Http2" AND MIRA_ENABLE_HTTP2)
            OR (optional_module STREQUAL "Http3" AND MIRA_ENABLE_HTTP3))
-            install(EXPORT Mira${optional_module}Targets
-                FILE Mira${optional_module}Targets.cmake
+            install(EXPORT mira${optional_module}Targets
+                FILE mira${optional_module}Targets.cmake
                 NAMESPACE Mira::
                 DESTINATION ${MIRA_CMAKE_DESTINATION}
             )
