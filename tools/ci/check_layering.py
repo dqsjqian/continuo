@@ -16,7 +16,7 @@ Rule 1 — layering is one-way.
 
 Rule 2 — no host framework dependency.
 
-    Mirat stay usable without Aria (or any other framework). Hosts
+    Mira must stay usable without Aria (or any other framework). Hosts
     integrate through the executor and stream seams; a single `#include
     <aria/...>` anywhere in the library would turn an optional adapter into a
     hard dependency for every consumer.
@@ -61,17 +61,17 @@ LAYERS: dict[str, tuple[str, ...]] = {
 
 # Layer -> include path prefixes it is not allowed to reach for.
 FORBIDDEN_INCLUDES: dict[str, tuple[str, ...]] = {
-    "core": ("Mira/tls/", "openssl/", "Mira/transport/", "Mira/http/", "Mira/ws/",
-             "Mira/h2/", "Mira/h3/", "Mira/dns/", "Mira/http2/", "Mira/http3/",
-             "Mira/quic/", "nghttp2/", "nghttp3/", "ngtcp2/"),
-    "transport": ("Mira/tls/", "openssl/", "Mira/http/", "Mira/ws/", "Mira/h2/",
-                  "Mira/h3/", "Mira/dns/", "Mira/http2/", "Mira/http3/",
-                  "Mira/quic/", "nghttp2/", "nghttp3/", "ngtcp2/"),
-    "tls": ("Mira/transport/", "Mira/http/", "Mira/ws/", "Mira/h2/",
-            "Mira/h3/", "Mira/dns/", "Mira/http2/", "Mira/http3/", "Mira/quic/"),
-    "quic": ("Mira/http/", "Mira/http2/", "Mira/http3/", "Mira/h2/",
-             "Mira/h3/", "nghttp2/", "nghttp3/"),
-    "protocol": ("openssl/", "Mira/tls/", "Mira/transport/"),
+    "core": ("mira/tls/", "openssl/", "mira/transport/", "mira/http/", "mira/ws/",
+             "mira/h2/", "mira/h3/", "mira/dns/", "mira/http2/", "mira/http3/",
+             "mira/quic/", "nghttp2/", "nghttp3/", "ngtcp2/"),
+    "transport": ("mira/tls/", "openssl/", "mira/http/", "mira/ws/", "mira/h2/",
+                  "mira/h3/", "mira/dns/", "mira/http2/", "mira/http3/",
+                  "mira/quic/", "nghttp2/", "nghttp3/", "ngtcp2/"),
+    "tls": ("mira/transport/", "mira/http/", "mira/ws/", "mira/h2/",
+            "mira/h3/", "mira/dns/", "mira/http2/", "mira/http3/", "mira/quic/"),
+    "quic": ("mira/http/", "mira/http2/", "mira/http3/", "mira/h2/",
+             "mira/h3/", "nghttp2/", "nghttp3/"),
+    "protocol": ("openssl/", "mira/tls/", "mira/transport/"),
 }
 
 # Include prefixes no layer may use, with the reason reported to the user.
@@ -95,7 +95,7 @@ RAW_PLATFORM_MACROS: tuple[str, ...] = (
 )
 
 # The single file allowed to do platform detection, relative to repo root.
-PLATFORM_DETECTION_HOME = "modules/core/include/Mira/core/platform.hpp"
+PLATFORM_DETECTION_HOME = "modules/core/include/mira/core/platform.hpp"
 
 INCLUDE_RE = re.compile(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]')
 

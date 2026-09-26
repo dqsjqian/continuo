@@ -18,7 +18,7 @@
 ---
 
 > *Basso Mira*，通奏低音：持续演奏的低音声部，为整首乐曲提供基础。
-> Mira络软件的这一层基础 —— 不是又一个包办一切的 HTTP 框架。
+> Mira 是网络软件的这一层基础 —— 不是又一个包办一切的 HTTP 框架。
 
 **当前阶段：一期协议实现进行中，还不是生产就绪的网络栈。** API 会随契约完善继续演进，暂不承诺稳定 ABI。
 
@@ -229,7 +229,7 @@ ctest --test-dir build/debug --output-on-failure
 启用 TLS（需要 OpenSSL 3）：
 
 ```bash
-cmake -S . -B build/tls -DCMAKE_BUILD_TYPE=Debug -DCONTINUO_ENABLE_TLS=ON
+cmake -S . -B build/tls -DCMAKE_BUILD_TYPE=Debug -DMIRA_ENABLE_TLS=ON
 cmake --build build/tls -j && ctest --test-dir build/tls --output-on-failure
 ```
 
@@ -243,9 +243,9 @@ cmake --build build/tls -j && ctest --test-dir build/tls --output-on-failure
 include(ariaFetchPinned)  # 或你自己仓库里的等价「下载 + SHA256 校验」原语
 aria_fetch_pinned_archive(
     NAME      Mira
-    VERSION   0.1.2
-    URL       "https://github.com/dqsjqian/Mira/releases/download/v0.1.2/Mira-0.1.2.tar.gz"
-    SHA256    508c56092c004bda7e7e606e2c266fab8a918b38bab46c96b37604862681dafa
+    VERSION   0.2.0
+    URL       "https://github.com/dqsjqian/Mira/releases/download/v0.2.0/Mira-0.2.0.tar.gz"
+    SHA256    8f536d56d4b5218797da638f068e753838e4917ac3f2fbc6e5534c87c059cf17
 )
 set(MIRA_BUILD_TESTS OFF)
 set(MIRA_BUILD_EXAMPLES OFF)
