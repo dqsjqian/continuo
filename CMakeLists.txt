@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(Mira
-    VERSION 0.2.0
+    VERSION 0.3.0
     DESCRIPTION "Coroutine-native C++23 networking library — transport, protocols, and nothing else"
     LANGUAGES CXX
 )
