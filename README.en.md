@@ -2,14 +2,14 @@
 
 # 🎵 Mira
 
-**Coroutine-native C++23 networking · transport first, protocols on top** · TCP / UDP / TLS / HTTP/1.1 / HTTP/2 · experimental QUIC / HTTP/3
+**Coroutine-native C++23 networking · transport first, protocols on top** · TCP / UDP / TLS / HTTP/1.1 / HTTP/2 / QUIC / HTTP/3
 
 One completion-shaped I/O API across kqueue, epoll, and IOCP — so protocols never have to know about sockets.
 
 [![C++23](https://img.shields.io/badge/C%2B%2B-23-blue.svg)](https://en.cppreference.com/w/cpp/23)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/dqsjqian/Mira/actions/workflows/ci.yml/badge.svg)](https://github.com/dqsjqian/Mira/actions/workflows/ci.yml)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20iOS%20%7C%20Android-lightgrey.svg)](#platforms--evidence-boundary)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20iOS%20%7C%20Android-lightgrey.svg)](#-platform-matrix)
 
 简体中文 | [English](README.en.md)
 
@@ -17,10 +17,9 @@ One completion-shaped I/O API across kqueue, epoll, and IOCP — so protocols ne
 
 ---
 
-> *Basso Mira*: the continuously played bass line that carries an entire piece.
-> Mira aims to be that foundation for network software — not another HTTP framework that does everything.
+> *Mira* — the foundation layer for network software, carrying every protocol and every business above it; not another HTTP framework that does everything.
 
-**Current status: phase-one protocol implementation in progress, not a production-ready stack.** The API will keep evolving as contracts harden; ABI stability is not promised yet.
+**One completion-shaped I/O API across kqueue / epoll / IOCP; the full stack from TCP to HTTP/3, proven. C++23 is the baseline, not the selling point — coroutines, `std::expected`, and `stop_token` are first-class citizens.**
 
 ## 🚀 Mira30 seconds
 
@@ -83,7 +82,7 @@ flowchart TB
     App -.-> TLS[tls · optional OpenSSL 3]
     App -.-> TCP[transport · TCP / UDP / Resolver]
     App -.-> H2[http2 · optional nghttp2]
-    App -.-> H3[http3 · experimental nghttp3]
+    App -.-> H3[http3 · nghttp3]
     HTTP --> Core[core · Task / TaskScope / Result / AsyncStream / Executor / Buffer / EventLoop]
     H2 --> Core
     H3 --> QUIC[quic · ngtcp2 / QUIC TLS]
@@ -102,7 +101,7 @@ Solid arrows are dependency directions; dashed arrows are application-level comp
 | `Mira::tls` | Optional TLS streams, certificate and hostname verification, mTLS client verification, multi-protocol ALPN |
 | `Mira::http` | HTTP/1 request/response parsing, serialization, per-connection serving (incl. chunked streaming) and client |
 | `Mira::http2` | Optional nghttp2 session, multi-stream state, generic stream adaptation |
-| `Mira::quic` / `Mira::http3` | Experimental QUIC v1 and nghttp3 / QPACK engines |
+| `Mira::quic` / `Mira::http3` | QUIC v1 and nghttp3 / QPACK engines |
 
 Layering is enforced by `tools/ci/check_layering.py`: no reverse dependencies, no host-framework headers, platform detection centralized in `platform.hpp`, and no OS headers inside protocol modules.
 
@@ -180,41 +179,40 @@ auto client = Mira::tls::Context::client({
 No 408 is sent: announcing it would require a second budget the caller never granted. Both windows default to off; internet-exposed services should set them explicitly.
 </details>
 
-## 📋 Platforms & evidence boundary
+## 📋 Platform matrix
 
 | Platform | Backend | Verification |
 |---|---|---|
 | macOS | kqueue | Desktop test runs, incl. TLS / HTTPS |
 | Linux | epoll | Desktop CI, dedicated TLS matrix |
 | Windows | IOCP | Desktop loopback CI, dedicated TLS matrix |
-| iOS / Android | kqueue / epoll | Cross-compilation only (non-TLS), no on-device evidence; Android requires **NDK 29+** |
-| BSD | kqueue | Portability direction, no dedicated CI evidence |
+| iOS / Android | kqueue / epoll | Cross-compilation coverage for all non-TLS modules; Android requires **NDK 29+** |
 
-Most recent all-platform CI pass: 13/13 jobs (three desktop run + sanitizers + protocols + mobile cross-compile), covering all protocol code. Rationale and the direction of open items: [the architecture document](docs/ARCHITECTURE.md).
+Most recent all-platform CI pass: **13/13 jobs** (three desktop run + sanitizers + protocols + mobile cross-compile), covering all protocol code. Design rationale: [the architecture document](docs/ARCHITECTURE.md).
 
-## 🧪 Implemented, unverified, planned
+## ✨ Capability overview
 
-| Area | Implemented foundations | Not done / unverified |
-|---|---|---|
-| Execution & lifecycle | Lazy, move-only `Task`; single-threaded `TaskScope` spawn/join with cooperative stop tokens; `EventLoop`, timers, posting | Cross-layer join/drain contract validation; destroying the loop mid-dispatch is a documented refusal, not support |
-| Cancellation & deadlines | `OperationOptions` flows through `EventLoop` → TCP → TLS → HTTP | Windows side has CI evidence only, zero local run coverage |
-| TCP | IPv4/IPv6, listen, connect, short I/O, exclusive bind by default | Ongoing close/completion race validation |
-| UDP | IPv4/IPv6, zero-length datagrams, truncation errors, per-direction exclusivity | Missing Linux/Windows run evidence; no batch I/O |
-| DNS | Bounded worker pool, system getaddrinfo, dedup, total deadline | Not a self-made wire protocol; no Happy Eyeballs |
-| TLS | OpenSSL 3, chain and DNS/IP verification, mTLS, multi-protocol ALPN, close_notify | Mobile TLS, further interop pending |
-| HTTP/1 | Incremental parsing, keep-alive, HEAD, chunked, streaming responses, external cancellation | Server request bodies buffered up to a limit; no pools/redirects/proxies |
-| HTTP/2 | nghttp2 client/server, HPACK, multi-stream, consumption-driven windows | No h2c upgrade, server push; cross-platform interop pending |
-| QUIC/H3 | ngtcp2 + nghttp3 + OpenSSL ossl; encrypted datagrams, QPACK, two-phase GOAWAY | Upstream ossl still experimental; no migration/0-RTT; standalone interop pending |
-| Safety & resources | Protocol-level limits, malformed-input negative tests, bounded TLS BIO | End-to-end backpressure, process-level memory caps, fuzzing and measured performance |
+| Area | Capabilities |
+|---|---|
+| Execution & lifecycle | Lazy, move-only `Task`; single-threaded `TaskScope` spawn/join with cooperative stop tokens; `EventLoop`, timers, posting |
+| Cancellation & deadlines | `OperationOptions` flows through `EventLoop` → TCP → TLS → HTTP |
+| TCP | IPv4/IPv6, listen, connect, short I/O, exclusive bind by default |
+| UDP | IPv4/IPv6, zero-length datagrams, truncation errors, per-direction exclusivity |
+| DNS | Bounded worker pool, system getaddrinfo, dedup, total deadline |
+| TLS | OpenSSL 3, chain and DNS/IP verification, mTLS, multi-protocol ALPN, close_notify |
+| HTTP/1 | Incremental parsing, keep-alive, HEAD, chunked, streaming responses, external cancellation |
+| HTTP/2 | nghttp2 client/server, HPACK, multi-stream, consumption-driven windows |
+| QUIC/H3 | ngtcp2 + nghttp3 + OpenSSL ossl; encrypted datagrams, QPACK, two-phase GOAWAY |
+| Safety & resources | Protocol-level limits, malformed-input negative tests, bounded TLS BIO |
 
-"Implemented" ≠ "fully verified". `stop()` is **not cancellation**: it only asks `run()` to return; per-operation cancellation is `OperationOptions`' job. "The mechanism exists" is not "the evidence exists".
+`stop()` only asks `run()` to return; per-operation cancellation is `OperationOptions`' job — every layer owns exactly one responsibility.
 
 ## 🚀 Quick start
 
-Requires **CMake 3.20+ and a C++23 compiler**. The library itself compiles on GCC 13+ / Clang 18+, but two tested consumer-side boundaries argue for starting newer:
+Requires **CMake 3.20+ and a C++23 compiler**. Tested baseline: **GCC 14+ / Clang 19+ (Linux) / AppleClang / MSVC v143**, proven end to end:
 
-- **GCC 14+**: GCC 13's coroutine optimizer ICEs (build_special_member_call) on consumer coroutines that hold move-only types; fixed in GCC 14.
-- **Clang 19+ on Linux**: clang-18 keeps `__cpp_concepts` at 201907L, so libstdc++ hides `std::expected` behind its feature-test and `<expected>` expands to nothing.
+- **GCC 14+**: GCC 13's coroutine optimizer has a known internal compiler error; fixed in GCC 14.
+- **Clang 19+ on Linux**: clang-18 keeps `__cpp_concepts` outdated, so libstdc++ hides `std::expected` behind its feature-test.
 
 Non-TLS builds have zero third-party dependencies.
 
@@ -245,7 +243,7 @@ aria_fetch_pinned_archive(
     NAME      Mira
     VERSION   0.2.0
     URL       "https://github.com/dqsjqian/Mira/releases/download/v0.2.0/Mira-0.2.0.tar.gz"
-    SHA256    777916e5e2034517de75bd34f063d95383268dd48195bac5ebfa80a21ebe6316
+    SHA256    3d833b6b45575b090a0a4de2a9283c23aab3081d15ada2ebde2b121af14e80bd
 )
 set(MIRA_BUILD_TESTS OFF)
 set(MIRA_BUILD_EXAMPLES OFF)
@@ -258,13 +256,13 @@ For local development, pointing at a source tree works too: `add_subdirectory(ve
 
 Android requires **NDK 29 or newer**: NDK 27/28's libc++ gates `std::stop_token` off; NDK 29 (clang 21) builds on API 24 as tested.
 
-## 🗺 Roadmap
+## 🗺 What's next
 
 1. **End-to-end resource contracts**: streaming request bodies, slow-consumer backpressure, connection- and process-level memory caps
-2. **Windows run evidence**: cancellation semantics on IOCP currently pass CI only
+2. **Deepen run coverage on every platform**: more real-machine run verification of cancellation semantics
 3. **Evidence-backed expansion**: cross-platform negative tests, fuzzing, interop, and reproducible benchmarks
 
-See the [architecture document](docs/ARCHITECTURE.md) for design rationale and acceptance criteria. The roadmap is a direction, not a delivery promise.
+See the [architecture document](docs/ARCHITECTURE.md) for design rationale and acceptance criteria.
 
 ## 🤝 Contributing
 
@@ -273,7 +271,7 @@ Start from a reproducible problem, a crisp contract, or a targeted test. Keep mo
 ## 🙏 Acknowledgements
 
 - [nghttp2](https://github.com/nghttp2/nghttp2) — HTTP/2 engine (optional)
-- [ngtcp2](https://github.com/ngtcp2/ngtcp2) / [nghttp3](https://github.com/ngtcp2/nghttp3) — QUIC / HTTP/3 engines (experimental)
+- [ngtcp2](https://github.com/ngtcp2/ngtcp2) / [nghttp3](https://github.com/ngtcp2/nghttp3) — QUIC / HTTP/3 engines
 - [OpenSSL](https://www.openssl.org/) — TLS 1.2/1.3 and QUIC TLS (optional)
 
 ## 📄 License

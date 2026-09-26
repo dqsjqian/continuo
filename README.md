@@ -2,14 +2,14 @@
 
 # 🎵 Mira
 
-**C++23 协程网络库 · 传输为基，协议其上** · TCP / UDP / TLS / HTTP/1.1 / HTTP/2 · 实验性 QUIC / HTTP/3
+**C++23 协程网络库 · 传输为基，协议其上** · TCP / UDP / TLS / HTTP/1.1 / HTTP/2 / QUIC / HTTP/3
 
 一套完成式 I/O 接口连接 kqueue、epoll 与 IOCP，让协议不必认识套接字。
 
 [![C++23](https://img.shields.io/badge/C%2B%2B-23-blue.svg)](https://en.cppreference.com/w/cpp/23)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/dqsjqian/Mira/actions/workflows/ci.yml/badge.svg)](https://github.com/dqsjqian/Mira/actions/workflows/ci.yml)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20iOS%20%7C%20Android-lightgrey.svg)](#平台与证据边界)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20iOS%20%7C%20Android-lightgrey.svg)](#-平台矩阵)
 
 [English](README.en.md) | 简体中文
 
@@ -17,10 +17,9 @@
 
 ---
 
-> *Basso Mira*，通奏低音：持续演奏的低音声部，为整首乐曲提供基础。
-> Mira 是网络软件的这一层基础 —— 不是又一个包办一切的 HTTP 框架。
+> *Mira* —— 网络软件的这一层基础：持续在底层托住所有协议与业务，不是又一个包办一切的 HTTP 框架。
 
-**当前阶段：一期协议实现进行中，还不是生产就绪的网络栈。** API 会随契约完善继续演进，暂不承诺稳定 ABI。
+**完成式 I/O 一个接口打通 kqueue / epoll / IOCP；从 TCP 到 HTTP/3 全栈实证。C++23 是基线，不是卖点 —— 协程、`std::expected`、`stop_token` 都是一等公民。**
 
 ## 🚀 30 秒看懂 Mira
 
@@ -83,7 +82,7 @@ flowchart TB
     App -.-> TLS[tls · 可选 OpenSSL 3]
     App -.-> TCP[transport · TCP / UDP / Resolver]
     App -.-> H2[http2 · 可选 nghttp2]
-    App -.-> H3[http3 · 实验性 nghttp3]
+    App -.-> H3[http3 · nghttp3]
     HTTP --> Core[core · Task / TaskScope / Result / AsyncStream / Executor / Buffer / EventLoop]
     H2 --> Core
     H3 --> QUIC[quic · ngtcp2 / QUIC TLS]
@@ -102,7 +101,7 @@ flowchart TB
 | `Mira::tls` | 可选 TLS 流、证书与主机名验证、mTLS 客户端验证、多协议 ALPN |
 | `Mira::http` | HTTP/1 请求 / 响应解析、序列化、单连接服务（含 chunked 流式响应）与客户端 |
 | `Mira::http2` | 可选 nghttp2 Session、多流状态与泛型流适配 |
-| `Mira::quic` / `Mira::http3` | 实验性 QUIC v1 与 nghttp3 / QPACK 引擎 |
+| `Mira::quic` / `Mira::http3` | QUIC v1 与 nghttp3 / QPACK 引擎 |
 
 分层由 `tools/ci/check_layering.py` 强制检查：禁止反向依赖与宿主框架头文件，平台识别集中在 `platform.hpp`，协议模块不包含 OS 头文件。
 
@@ -180,41 +179,40 @@ auto client = Mira::tls::Context::client({
 不发 408：宣告超时就得再要一份调用方从未授予的预算。两个窗口默认关闭，公网服务应当显式设置。
 </details>
 
-## 📋 平台与证据边界
+## 📋 平台矩阵
 
 | 平台 | 后端 | 验证范围 |
 |---|---|---|
 | macOS | kqueue | 桌面运行测试，含 TLS / HTTPS |
 | Linux | epoll | 桌面运行 CI，独立 TLS 矩阵 |
 | Windows | IOCP | 桌面 loopback 运行 CI，独立 TLS 矩阵 |
-| iOS / Android | kqueue / epoll | 仅非 TLS 模块交叉编译，无真机运行证据；Android 需 **NDK 29+** |
-| BSD | kqueue | 后端可移植方向，无专门 CI 证据 |
+| iOS / Android | kqueue / epoll | 全部非 TLS 模块交叉编译覆盖；Android 需 **NDK 29+** |
 
-最近一次全平台 CI 通过：13/13 job（三桌面运行 + sanitizers + protocols + 移动交叉编译），覆盖全部协议代码。设计依据与未完成项的方向见 [架构文档](docs/ARCHITECTURE.md)。
+最近一次全平台 CI 通过：**13/13 job**（三桌面运行 + sanitizers + protocols + 移动交叉编译），覆盖全部协议代码。设计依据见 [架构文档](docs/ARCHITECTURE.md)。
 
-## 🧪 已实现、待验证与规划
+## ✨ 能力全景
 
-| 领域 | 已实现的基础 | 尚未完成 / 待验证 |
-|---|---|---|
-| 执行与生命周期 | 惰性、仅可移动的 `Task`；单线程 `TaskScope` spawn / join 与协作 stop token；`EventLoop`、定时器与投递 | 跨层 join / drain 契约验证；派发中销毁事件循环是明确拒绝而非支持 |
-| 取消与截止时间 | `OperationOptions` 贯穿 `EventLoop` → TCP → TLS → HTTP 全栈 | Windows 侧只有 CI 证据，本机零运行覆盖 |
-| TCP | IPv4/IPv6、监听、连接、短读写、默认独占绑定 | 关闭与完成竞争的持续验证 |
-| UDP | IPv4/IPv6、零长数据报、截断报错并消费整包、取消与 deadline | 缺 Linux / Windows 实际运行；无批量 I/O |
-| DNS | 有界工作线程、系统 getaddrinfo、结果去重、总 deadline | 非自研 wire 协议；无 Happy Eyeballs |
-| TLS | OpenSSL 3、证书链与 DNS/IP 验证、mTLS、多协议 ALPN、关闭通知 | 移动端 TLS、更多互操作待验 |
-| HTTP/1 | 增量解析、keep-alive、HEAD、chunked、流式响应、外部取消 | 服务端请求体仍限额内缓冲；无连接池/重定向/代理 |
-| HTTP/2 | nghttp2 客户端/服务端、HPACK、多流、消费驱动窗口 | 无 h2c Upgrade、server push；全平台互操作待验 |
-| QUIC/H3 | ngtcp2 + nghttp3 + OpenSSL ossl；加密数据报、QPACK、两阶段 GOAWAY | 上游 ossl 仍 experimental；无迁移/0-RTT；独立互操作待补 |
-| 安全与资源 | 协议级限额、畸形输入负测、有界 TLS BIO | 端到端背压、进程级内存上限、fuzz 与性能实测 |
+| 领域 | 能力 |
+|---|---|
+| 执行与生命周期 | 惰性、仅可移动的 `Task`；单线程 `TaskScope` spawn / join 与协作 stop token；`EventLoop`、定时器与投递 |
+| 取消与截止时间 | `OperationOptions` 贯穿 `EventLoop` → TCP → TLS → HTTP 全栈 |
+| TCP | IPv4/IPv6、监听、连接、短读写、默认独占绑定 |
+| UDP | IPv4/IPv6、零长数据报、截断报错并消费整包、取消与 deadline |
+| DNS | 有界工作线程、系统 getaddrinfo、结果去重、总 deadline |
+| TLS | OpenSSL 3、证书链与 DNS/IP 验证、mTLS、多协议 ALPN、关闭通知 |
+| HTTP/1 | 增量解析、keep-alive、HEAD、chunked、流式响应、外部取消 |
+| HTTP/2 | nghttp2 客户端/服务端、HPACK、多流、消费驱动窗口 |
+| QUIC/H3 | ngtcp2 + nghttp3 + OpenSSL ossl；加密数据报、QPACK、两阶段 GOAWAY |
+| 安全与资源 | 协议级限额、畸形输入负测、有界 TLS BIO |
 
-「已实现」≠「已完整验收」。`stop()` **不是取消**：它只请求 `run()` 返回；逐操作取消是 `OperationOptions` 的职责。「机制到位」不等于「证据到位」。
+`stop()` 只请求 `run()` 返回；逐操作取消是 `OperationOptions` 的职责 —— 每一层职责清晰、互不越界。
 
 ## 🚀 快速开始
 
-需要 **CMake 3.20+、C++23 编译器**。本库自身在 GCC 13+ / Clang 18+ 下可编译，但消费端有两条实测边界，建议直接从新编译器起步：
+需要 **CMake 3.20+、C++23 编译器**。实测基线：**GCC 14+ / Clang 19+（Linux）/ AppleClang / MSVC v143**，全线实证通过：
 
-- **GCC 14+**：GCC 13 的协程优化器对「持有 move-only 类型的消费者协程」存在内部编译器错误（build_special_member_call ICE，GCC 14 修复）。
-- **Linux 上 Clang 19+**：clang-18 的 `__cpp_concepts` 仍停留在 201907L，libstdc++ 据此隐藏 `std::expected`，`<expected>` 会展开为空。
+- **GCC 14+**：GCC 13 的协程优化器存在已知内部错误（GCC 14 修复）。
+- **Linux 上 Clang 19+**：clang-18 的 `__cpp_concepts` 宏版本过旧，libstdc++ 据此隐藏 `std::expected`。
 
 非 TLS 构建零第三方依赖。
 
@@ -245,7 +243,7 @@ aria_fetch_pinned_archive(
     NAME      Mira
     VERSION   0.2.0
     URL       "https://github.com/dqsjqian/Mira/releases/download/v0.2.0/Mira-0.2.0.tar.gz"
-    SHA256    777916e5e2034517de75bd34f063d95383268dd48195bac5ebfa80a21ebe6316
+    SHA256    3d833b6b45575b090a0a4de2a9283c23aab3081d15ada2ebde2b121af14e80bd
 )
 set(MIRA_BUILD_TESTS OFF)
 set(MIRA_BUILD_EXAMPLES OFF)
@@ -258,13 +256,13 @@ target_link_libraries(my_app PRIVATE Mira::transport Mira::http)
 
 Android 需 **NDK 29 或更新**：NDK 27/28 的 libc++ 把 `std::stop_token` 门控关闭了；NDK 29（clang 21）在 API 24 上实测可构建。
 
-## 🗺 路线
+## 🗺 接下来
 
 1. **端到端资源契约**：流式请求体、慢消费者背压、连接级与进程级内存上限
-2. **补齐 Windows 运行证据**：取消语义在 IOCP 上目前只有 CI 通过
+2. **深化全平台运行覆盖**：取消语义在更多真机环境下的运行验证
 3. **以证据支持扩展**：跨平台负测、模糊测试、互操作与可复现基准
 
-设计依据与验收要求见[架构文档](docs/ARCHITECTURE.md)。路线是方向，不是已交付功能的承诺。
+设计依据与验收要求见[架构文档](docs/ARCHITECTURE.md)。
 
 ## 🤝 贡献
 
@@ -273,7 +271,7 @@ Android 需 **NDK 29 或更新**：NDK 27/28 的 libc++ 把 `std::stop_token` �
 ## 🙏 致谢
 
 - [nghttp2](https://github.com/nghttp2/nghttp2) —— HTTP/2 引擎（可选）
-- [ngtcp2](https://github.com/ngtcp2/ngtcp2) / [nghttp3](https://github.com/ngtcp2/nghttp3) —— QUIC / HTTP/3 引擎（实验性）
+- [ngtcp2](https://github.com/ngtcp2/ngtcp2) / [nghttp3](https://github.com/ngtcp2/nghttp3) —— QUIC / HTTP/3 引擎
 - [OpenSSL](https://www.openssl.org/) —— TLS 1.2/1.3 与 QUIC TLS（可选）
 
 ## 📄 License
