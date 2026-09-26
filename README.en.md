@@ -241,9 +241,9 @@ The recommended pattern — the one Aria and AriaAgent use — is a **hash-pinne
 include(ariaFetchPinned)  # or your repo's equivalent download + SHA256 primitive
 aria_fetch_pinned_archive(
     NAME      Mira
-    VERSION   0.2.0
-    URL       "https://github.com/dqsjqian/Mira/releases/download/v0.2.0/Mira-0.2.0.tar.gz"
-    SHA256    3d833b6b45575b090a0a4de2a9283c23aab3081d15ada2ebde2b121af14e80bd
+    VERSION   0.3.0
+    URL       "https://github.com/dqsjqian/Mira/releases/download/v0.3.0/Mira-0.3.0.tar.gz"
+    SHA256    0019dfc4b32d63c1392aa264aed2253c1e0c2fb09216f8e2cc269bbfb8bb49b5
 )
 set(MIRA_BUILD_TESTS OFF)
 set(MIRA_BUILD_EXAMPLES OFF)
