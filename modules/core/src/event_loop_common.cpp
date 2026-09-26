@@ -6,7 +6,7 @@
 // per backend — which is the failure mode this library spends most of its
 // effort on.
 
-#include "Mira/core/event_loop.hpp"
+#include "mira/core/event_loop.hpp"
 
 #include <coroutine>
 #include <cstdio>

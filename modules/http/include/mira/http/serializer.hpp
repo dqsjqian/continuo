@@ -18,10 +18,10 @@
 // Writing to a `Buffer` rather than straight to a socket keeps this layer
 // synchronous and testable: the bytes can be asserted against a string.
 
-#include "Mira/core/buffer.hpp"
-#include "Mira/core/error.hpp"
-#include "Mira/http/message.hpp"
-#include "Mira/http/limits.hpp"
+#include "mira/core/buffer.hpp"
+#include "mira/core/error.hpp"
+#include "mira/http/message.hpp"
+#include "mira/http/limits.hpp"
 
 #include <cstddef>
 #include <cstdint>

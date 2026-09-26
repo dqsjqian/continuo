@@ -1,8 +1,8 @@
 #include "check.hpp"
-#include "Mira/core/task_scope.hpp"
-#include "Mira/http/client.hpp"
-#include "Mira/http/connection.hpp"
-#include "Mira/transport/tcp.hpp"
+#include "mira/core/task_scope.hpp"
+#include "mira/http/client.hpp"
+#include "mira/http/connection.hpp"
+#include "mira/transport/tcp.hpp"
 
 #include <array>
 #include <cstring>

@@ -3,7 +3,7 @@
 # A compiled library, not header-only. Header-only was considered and rejected:
 # the reference point for this project ships 22k lines in one header, and the
 # compile-time cost of that lands on every translation unit of every consumer.
-# A compiled target also gives Miraewhere to put a real ABI policy.
+# A compiled target also gives Mira somewhere to put a real ABI policy.
 
 add_library(mira_core
     src/error.cpp

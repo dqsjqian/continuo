@@ -15,11 +15,11 @@
 // thing that exercises this file; treat its first green run as the real
 // verification, not this comment.
 
-#include "Mira/core/platform.hpp"
+#include "mira/core/platform.hpp"
 
 #if MIRA_PLATFORM_WINDOWS
 
-    #include "Mira/core/event_loop.hpp"
+    #include "mira/core/event_loop.hpp"
 
 // clang-format off
 #    include <winsock2.h>

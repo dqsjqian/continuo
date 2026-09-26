@@ -18,9 +18,9 @@
 // Anything richer (read_exactly, read_until, write_all) is a free function
 // composed on top, never a new requirement on implementers.
 
-#include "Mira/core/error.hpp"
-#include "Mira/core/operation.hpp"
-#include "Mira/core/task.hpp"
+#include "mira/core/error.hpp"
+#include "mira/core/operation.hpp"
+#include "mira/core/task.hpp"
 
 #include <concepts>
 #include <cstddef>

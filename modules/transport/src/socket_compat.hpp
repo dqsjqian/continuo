@@ -6,7 +6,7 @@
 // so the rest of the module reads as ordinary C++. Nothing here does I/O; it
 // only creates, configures, and inspects sockets.
 
-#include "Mira/core/platform.hpp"
+#include "mira/core/platform.hpp"
 
 #if MIRA_PLATFORM_WINDOWS
 // clang-format off
@@ -25,8 +25,8 @@
     #include <unistd.h>
 #endif
 
-#include "Mira/core/error.hpp"
-#include "Mira/core/platform.hpp"
+#include "mira/core/error.hpp"
+#include "mira/core/platform.hpp"
 
 #include <cstddef>
 #include <cstring>

@@ -6,12 +6,12 @@
 // concept accepts one without naming it. `Listener` owns the bind semantics,
 // which is where this library began: see `ListenOptions::exclusive`.
 
-#include "Mira/core/error.hpp"
-#include "Mira/core/event_loop.hpp"
-#include "Mira/core/operation.hpp"
-#include "Mira/core/platform.hpp"
-#include "Mira/core/task.hpp"
-#include "Mira/transport/endpoint.hpp"
+#include "mira/core/error.hpp"
+#include "mira/core/event_loop.hpp"
+#include "mira/core/operation.hpp"
+#include "mira/core/platform.hpp"
+#include "mira/core/task.hpp"
+#include "mira/transport/endpoint.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -28,7 +28,7 @@ namespace Mira::transport::tcp {
 /// process is actively bound to, so two servers "successfully" listen on one
 /// port and split the incoming connections between them.
 ///
-/// Mirarefore does not expose `SO_REUSEADDR` as a portable flag. It
+/// Mira therefore does not expose `SO_REUSEADDR` as a portable flag. It
 /// exposes the *intent*, and each backend implements it with whatever option
 /// actually produces that behaviour — `SO_EXCLUSIVEADDRUSE` on Windows,
 /// plain `SO_REUSEADDR`-off on POSIX.

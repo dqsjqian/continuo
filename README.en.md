@@ -18,7 +18,7 @@ One completion-shaped I/O API across kqueue, epoll, and IOCP — so protocols ne
 ---
 
 > *Basso Mira*: the continuously played bass line that carries an entire piece.
-> Miras to be that foundation for network software — not another HTTP framework that does everything.
+> Mira aims to be that foundation for network software — not another HTTP framework that does everything.
 
 **Current status: phase-one protocol implementation in progress, not a production-ready stack.** The API will keep evolving as contracts harden; ABI stability is not promised yet.
 

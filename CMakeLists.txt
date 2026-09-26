@@ -10,9 +10,9 @@ project(Mira
 #
 # C++23 is the baseline. Use std::expected directly rather than maintaining a
 # second, subtly different error model for an older standard.
-set(CMAKE_CXX_STANDARD 23 CACHE STRING "C++ standard used to build Mira
+set(CMAKE_CXX_STANDARD 23 CACHE STRING "C++ standard used to build Mira")
 if(CMAKE_CXX_STANDARD LESS 23)
-    message(FATAL_ERROR "Mirauires C++23 or newer; use -DCMAKE_CXX_STANDARD=23")
+    message(FATAL_ERROR "Mira requires C++23 or newer; use -DCMAKE_CXX_STANDARD=23")
 endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -21,21 +21,21 @@ if(PROJECT_IS_TOP_LEVEL)
     set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 endif()
 
-option(MIRA_BUILD_TESTS "Build Mirats" ${PROJECT_IS_TOP_LEVEL})
+option(MIRA_BUILD_TESTS "Build Mira tests" ${PROJECT_IS_TOP_LEVEL})
 
 # Mobile/cross builds should not produce a host-style server unless requested.
 set(MIRA_BUILD_EXAMPLES_DEFAULT OFF)
 if(PROJECT_IS_TOP_LEVEL AND NOT CMAKE_CROSSCOMPILING)
     set(MIRA_BUILD_EXAMPLES_DEFAULT ON)
 endif()
-option(MIRA_BUILD_EXAMPLES "Build Miramples" ${MIRA_BUILD_EXAMPLES_DEFAULT})
+option(MIRA_BUILD_EXAMPLES "Build Mira examples" ${MIRA_BUILD_EXAMPLES_DEFAULT})
 
 option(MIRA_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(MIRA_ENABLE_TLS "Build the optional OpenSSL 3 TLS stream module" OFF)
 option(MIRA_ENABLE_HTTP2 "Build the optional nghttp2 HTTP/2 module" OFF)
 option(MIRA_ENABLE_HTTP3 "Build the optional QUIC and HTTP/3 modules (experimental)" OFF)
 
-# Off by default when embedded: a project that pulls Miravia
+# Off by default when embedded: a project that pulls Mira in via
 # add_subdirectory() has not asked to install our headers alongside its own.
 option(MIRA_INSTALL "Generate install and package-config rules"
        ${PROJECT_IS_TOP_LEVEL})
@@ -43,7 +43,7 @@ option(MIRA_INSTALL "Generate install and package-config rules"
 # ── Warning policy ──────────────────────────────────────────────────────────
 #
 # Applied through an interface target rather than global flags so that a
-# consumer pulling Miravia add_subdirectory() does not inherit our
+# consumer pulling Mira in via add_subdirectory() does not inherit our
 # warning policy for their own sources.
 
 add_library(mira_warnings INTERFACE)

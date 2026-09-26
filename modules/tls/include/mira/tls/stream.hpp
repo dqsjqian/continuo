@@ -1,7 +1,7 @@
 #pragma once
 
-#include "Mira/core/stream.hpp"
-#include "Mira/tls/engine.hpp"
+#include "mira/core/stream.hpp"
+#include "mira/tls/engine.hpp"
 
 #include <algorithm>
 #include <array>

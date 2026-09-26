@@ -14,7 +14,7 @@
 // still interested; one-shot pushes that decision back to the caller, which is
 // where it belongs.
 
-#include "Mira/core/error.hpp"
+#include "mira/core/error.hpp"
 
 #include <cstddef>
 #include <span>

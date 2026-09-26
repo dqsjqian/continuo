@@ -22,10 +22,10 @@
 // coroutine may freely submit more I/O, post work, or stop the loop. It may
 // not destroy or replace the loop it is being resumed by — see `~EventLoop`.
 
-#include "Mira/core/error.hpp"
-#include "Mira/core/operation.hpp"
-#include "Mira/core/platform.hpp"
-#include "Mira/core/task.hpp"
+#include "mira/core/error.hpp"
+#include "mira/core/operation.hpp"
+#include "mira/core/platform.hpp"
+#include "mira/core/task.hpp"
 
 #include <array>
 #include <chrono>

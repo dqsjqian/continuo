@@ -2,7 +2,7 @@
 
 // Minimal assertion harness.
 //
-// Miraore carries no third-party dependency, and that includes its own
+// Mira's core carries no third-party dependency, and that includes its own
 // test build: pulling doctest/Catch2 in just to print "1 assertion passed"
 // would make the zero-dependency claim untrue for anyone vendoring the repo.
 // Roughly forty lines buy pass/fail counting, file:line reporting, and a

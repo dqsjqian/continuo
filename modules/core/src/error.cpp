@@ -1,6 +1,6 @@
-#include "Mira/core/error.hpp"
+#include "mira/core/error.hpp"
 
-#include "Mira/core/platform.hpp"
+#include "mira/core/platform.hpp"
 
 #include <string>
 
@@ -39,7 +39,7 @@ public:
         return "unknown Mira error (" + std::to_string(value) + ")";
     }
 
-    /// Map Miraditions onto the portable `std::errc` equivalents so
+    /// Map Mira conditions onto the portable `std::errc` equivalents so
     /// that `ec == std::errc::timed_out` works across library boundaries.
     [[nodiscard]] std::error_condition default_error_condition(int value) const noexcept override {
         switch (static_cast<Errc>(value)) {

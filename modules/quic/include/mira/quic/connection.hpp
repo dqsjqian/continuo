@@ -9,12 +9,12 @@
 // background, the caller drives progress. One pump at a time; concurrent
 // streams multiplex through the shared session state.
 
-#include "Mira/core/error.hpp"
-#include "Mira/core/event_loop.hpp"
-#include "Mira/core/task.hpp"
-#include "Mira/quic/engine.hpp"
-#include "Mira/transport/endpoint.hpp"
-#include "Mira/transport/udp.hpp"
+#include "mira/core/error.hpp"
+#include "mira/core/event_loop.hpp"
+#include "mira/core/task.hpp"
+#include "mira/quic/engine.hpp"
+#include "mira/transport/endpoint.hpp"
+#include "mira/transport/udp.hpp"
 
 #include <array>
 #include <chrono>

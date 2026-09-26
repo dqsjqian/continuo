@@ -11,7 +11,7 @@
 // cancellation story, and belongs in a resolver built on the loop rather than
 // hidden inside an address type where every construction might take a second.
 
-#include "Mira/core/error.hpp"
+#include "mira/core/error.hpp"
 
 #include <algorithm>
 #include <array>

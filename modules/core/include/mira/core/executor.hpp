@@ -17,7 +17,7 @@
 // silently running I/O completions inline is exactly the kind of surprise this
 // seam is meant to prevent.
 
-#include "Mira/core/task.hpp"
+#include "mira/core/task.hpp"
 
 #include <concepts>
 #include <coroutine>

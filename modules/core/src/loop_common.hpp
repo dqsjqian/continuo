@@ -8,8 +8,8 @@
 // where the platforms genuinely differ, instead of drifting apart in code that
 // should be the same.
 
-#include "Mira/core/error.hpp"
-#include "Mira/core/operation.hpp"
+#include "mira/core/error.hpp"
+#include "mira/core/operation.hpp"
 
 #include <chrono>
 #include <coroutine>

@@ -2,9 +2,9 @@
 // protocol state machines; this one proves the whole stack — nghttp3 over
 // ngtcp2 over the kernel's UDP, driven through the event loop.
 
-#include "Mira/core/task_scope.hpp"
-#include "Mira/http3/connection.hpp"
-#include "Mira/transport/udp.hpp"
+#include "mira/core/task_scope.hpp"
+#include "mira/http3/connection.hpp"
+#include "mira/transport/udp.hpp"
 
 #include <algorithm>
 #include <chrono>

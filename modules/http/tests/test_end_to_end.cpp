@@ -11,8 +11,8 @@
 // test binary linking both is fine — the *library* boundary is what matters.
 
 #include "check.hpp"
-#include "Mira/http/connection.hpp"
-#include "Mira/transport/tcp.hpp"
+#include "mira/http/connection.hpp"
+#include "mira/transport/tcp.hpp"
 
 #include <array>
 #include <atomic>

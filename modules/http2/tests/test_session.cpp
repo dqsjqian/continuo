@@ -1,6 +1,6 @@
-#include "Mira/http2/session.hpp"
-#include "Mira/http2/connection.hpp"
-#include "Mira/core/event_loop.hpp"
+#include "mira/http2/session.hpp"
+#include "mira/http2/connection.hpp"
+#include "mira/core/event_loop.hpp"
 #include "check.hpp"
 
 #include <nghttp2/nghttp2.h>

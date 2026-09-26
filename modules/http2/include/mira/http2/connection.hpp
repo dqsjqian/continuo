@@ -1,7 +1,7 @@
 #pragma once
 
-#include "Mira/core/stream.hpp"
-#include "Mira/http2/session.hpp"
+#include "mira/core/stream.hpp"
+#include "mira/http2/session.hpp"
 
 #include <array>
 #include <utility>

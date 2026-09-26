@@ -7,11 +7,11 @@
 // emulation, and it is why the Windows backend can be a direct IOCP mapping
 // instead of the other way around.
 
-#include "Mira/core/platform.hpp"
+#include "mira/core/platform.hpp"
 
 #if MIRA_HAS_READINESS_API
 
-    #include "Mira/core/event_loop.hpp"
+    #include "mira/core/event_loop.hpp"
     #include "loop_common.hpp"
     #include "poller.hpp"
 

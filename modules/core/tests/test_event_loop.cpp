@@ -10,13 +10,13 @@
 // keeps every test deterministic — no sleeps, no "should be enough time".
 
 #include "check.hpp"
-#include "Mira/core/buffer.hpp"
-#include "Mira/core/error.hpp"
-#include "Mira/core/event_loop.hpp"
-#include "Mira/core/platform.hpp"
-#include "Mira/core/task.hpp"
+#include "mira/core/buffer.hpp"
+#include "mira/core/error.hpp"
+#include "mira/core/event_loop.hpp"
+#include "mira/core/platform.hpp"
+#include "mira/core/task.hpp"
 
-#include "Mira/core/operation.hpp"
+#include "mira/core/operation.hpp"
 
 #include <array>
 #include <atomic>

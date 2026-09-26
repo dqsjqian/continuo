@@ -1,6 +1,6 @@
 #include "check.hpp"
-#include "Mira/core/event_loop.hpp"
-#include "Mira/core/task_scope.hpp"
+#include "mira/core/event_loop.hpp"
+#include "mira/core/task_scope.hpp"
 
 #include <chrono>
 #include <cstdlib>

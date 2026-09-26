@@ -1,7 +1,7 @@
 #pragma once
 
-#include "Mira/core/error.hpp"
-#include "Mira/transport/endpoint.hpp"
+#include "mira/core/error.hpp"
+#include "mira/transport/endpoint.hpp"
 
 #include <cstdint>
 #include <memory>

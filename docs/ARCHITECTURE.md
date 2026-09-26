@@ -1,4 +1,4 @@
-# Mirarchitecture
+# Mira architecture
 
 ## What this library is
 
@@ -20,7 +20,7 @@ and protocols that ride on it. HTTP is one protocol family, not the purpose.
 - Evaluate correctness, API usability, performance and resource bounds through
   executable tests, interoperability checks and reproducible benchmarks.
   Existing libraries are comparison evidence, not the specification.
-- Current phase develops Miray. Consumer migration, removal of old
+- Current phase develops Mira only. Consumer migration, removal of old
   dependencies, and public release are later phases; keep this repository
   private for now.
 
@@ -47,7 +47,7 @@ be specified and measured end to end.
 
 ## The decision everything else follows from: completion, not readiness
 
-Miragets macOS, Linux, Windows, iOS, and Android. Those platforms do
+Mira targets macOS, Linux, Windows, iOS, and Android. Those platforms do
 not agree on what an asynchronous I/O API *is*:
 
 | | Model | Shape |
@@ -126,7 +126,7 @@ These static checks do not prove lifetime safety or runtime substitutability:
    protocol headers; transport must not include protocol headers. Reaching *up*
    a layer is precisely the move that makes a library unable to grow a second
    protocol later.
-2. **No host framework dependency.** Miraer includes `aria/…`. Hosts
+2. **No host framework dependency.** Mira never includes `aria/…`. Hosts
    integrate through the executor and stream seams, so the library stays usable
    standalone.
 3. **Platform detection has exactly one home.** Only `platform.hpp` may test

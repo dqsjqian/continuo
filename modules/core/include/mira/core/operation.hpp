@@ -17,7 +17,7 @@
 
 namespace Mira {
 
-/// The clock every deadline in Miraexpressed against.
+/// The clock every deadline in Mira is expressed against.
 ///
 /// Steady rather than system: a deadline must not move because something
 /// adjusted the wall clock, and a timeout that can be lengthened by an NTP

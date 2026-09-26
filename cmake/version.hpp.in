@@ -7,7 +7,7 @@
 // file has no effect; change `project(Mira VERSION ...)` instead.
 //
 // The encoded form exists so that a consumer can compile against two versions
-// of Mirale the API is still moving:
+// of Mira while the API is still moving:
 //
 //   #if MIRA_VERSION >= MIRA_VERSION_NUMBER(0, 3, 0)
 //       // use the newer signature

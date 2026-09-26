@@ -1,4 +1,4 @@
-// A TCP echo server, in the shape Miraends.
+// A TCP echo server, in the shape Mira intends.
 //
 // Three things here are the point, and none of them is the echoing:
 //
@@ -35,13 +35,13 @@
 #include <system_error>
 #include <utility>
 
-using mira::EventLoop;
-using mira::Errc;
-using mira::Result;
-using mira::Task;
-using mira::TaskScope;
-using mira::transport::Endpoint;
-namespace tcp = mira::transport::tcp;
+using Mira::EventLoop;
+using Mira::Errc;
+using Mira::Result;
+using Mira::Task;
+using Mira::TaskScope;
+using Mira::transport::Endpoint;
+namespace tcp = Mira::transport::tcp;
 
 namespace {
 
@@ -74,7 +74,7 @@ Task<void> echo(tcp::Socket socket, std::stop_token stop) {
         }
 
         const Result<void> written =
-            co_await mira::write_all(socket, std::span{buffer}.first(*read), {.stop = stop});
+            co_await Mira::write_all(socket, std::span{buffer}.first(*read), {.stop = stop});
         if (!written) {
             if (written.error() != Errc::cancelled) {
                 std::fprintf(stderr, "write: %s\n", written.error().message().c_str());

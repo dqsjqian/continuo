@@ -6,11 +6,11 @@
 // design document.
 
 #include "check.hpp"
-#include "Mira/core/buffer.hpp"
-#include "Mira/core/error.hpp"
-#include "Mira/core/executor.hpp"
-#include "Mira/core/stream.hpp"
-#include "Mira/core/task.hpp"
+#include "mira/core/buffer.hpp"
+#include "mira/core/error.hpp"
+#include "mira/core/executor.hpp"
+#include "mira/core/stream.hpp"
+#include "mira/core/task.hpp"
 
 #include <algorithm>
 #include <coroutine>
@@ -53,7 +53,7 @@ void test_error_model() {
     const Error timeout = Errc::timed_out;
     CHECK(timeout == Errc::timed_out);
 
-    // Miraditions compare equal to their portable std::errc peers.
+    // Mira conditions compare equal to their portable std::errc peers.
     CHECK(timeout == std::errc::timed_out);
     CHECK(make_error_code(Errc::would_block) == std::errc::operation_would_block);
 
@@ -260,7 +260,7 @@ void test_stream_seam() {
     Result<void> result = round_trip(stream, "hello Mira").sync_get();
     CHECK(result.has_value());
     CHECK(stream.contents() == "hello Mira");
-    CHECK(stream.write_calls() == 4);  // 14 bytes / 4-byte chunks
+    CHECK(stream.write_calls() == 3);  // 10 bytes / 4-byte chunks
 
     // Reading drains the same bytes, then reports a clean close.
     auto drain = [](MemoryStream& source) -> Task<Result<std::string>> {

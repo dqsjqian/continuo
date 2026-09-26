@@ -3,8 +3,8 @@
 // payload discipline — but the packets now traverse the kernel's UDP stack
 // and the event loop's datagram operations.
 
-#include "Mira/core/task_scope.hpp"
-#include "Mira/quic/connection.hpp"
+#include "mira/core/task_scope.hpp"
+#include "mira/quic/connection.hpp"
 
 #include <algorithm>
 #include <chrono>

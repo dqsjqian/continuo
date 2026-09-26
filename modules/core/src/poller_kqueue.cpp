@@ -4,7 +4,7 @@
 // file asks it instead of testing compiler macros directly, and the layering
 // check fails the build on any file that forgets.
 
-#include "Mira/core/platform.hpp"
+#include "mira/core/platform.hpp"
 
 #if defined(MIRA_IO_BACKEND_KQUEUE)
 

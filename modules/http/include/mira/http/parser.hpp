@@ -30,10 +30,10 @@
 //         }
 //     }
 
-#include "Mira/core/buffer.hpp"
-#include "Mira/core/error.hpp"
-#include "Mira/http/limits.hpp"
-#include "Mira/http/message.hpp"
+#include "mira/core/buffer.hpp"
+#include "mira/core/error.hpp"
+#include "mira/http/limits.hpp"
+#include "mira/http/message.hpp"
 
 #include <cstddef>
 #include <cstdint>

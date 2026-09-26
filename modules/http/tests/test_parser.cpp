@@ -14,8 +14,8 @@
 // two different requests in one byte stream.
 
 #include "check.hpp"
-#include "Mira/core/buffer.hpp"
-#include "Mira/http/parser.hpp"
+#include "mira/core/buffer.hpp"
+#include "mira/http/parser.hpp"
 
 #include <cstddef>
 #include <cstring>

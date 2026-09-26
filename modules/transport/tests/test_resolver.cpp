@@ -1,5 +1,5 @@
 #include "check.hpp"
-#include "Mira/transport/resolver.hpp"
+#include "mira/transport/resolver.hpp"
 
 #include <atomic>
 #include <chrono>

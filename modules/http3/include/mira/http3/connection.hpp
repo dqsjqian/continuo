@@ -7,11 +7,11 @@
 // a template parameter (udp::Socket satisfies it) so this protocol module
 // never includes transport headers directly — applications instantiate.
 
-#include "Mira/core/error.hpp"
-#include "Mira/core/event_loop.hpp"
-#include "Mira/core/task.hpp"
-#include "Mira/http3/engine.hpp"
-#include "Mira/quic/engine.hpp"
+#include "mira/core/error.hpp"
+#include "mira/core/event_loop.hpp"
+#include "mira/core/task.hpp"
+#include "mira/http3/engine.hpp"
+#include "mira/quic/engine.hpp"
 
 #include <array>
 #include <chrono>

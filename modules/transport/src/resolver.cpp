@@ -1,4 +1,4 @@
-#include "Mira/transport/resolver.hpp"
+#include "mira/transport/resolver.hpp"
 
 // GCC 14/15 inlines the expected<vector<Endpoint>, error_code> move out of
 // the job's optional and reports _M_end_of_storage (stl_vector.h:106) as

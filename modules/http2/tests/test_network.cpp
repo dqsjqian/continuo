@@ -1,9 +1,9 @@
 #include "check.hpp"
-#include "Mira/core/task_scope.hpp"
-#include "Mira/http2/connection.hpp"
-#include "Mira/transport/tcp.hpp"
+#include "mira/core/task_scope.hpp"
+#include "mira/http2/connection.hpp"
+#include "mira/transport/tcp.hpp"
 #ifdef MIRA_HTTP2_TEST_TLS
-#include "Mira/tls/stream.hpp"
+#include "mira/tls/stream.hpp"
 #include <openssl/pem.h>
 #include <openssl/rand.h>
 #include <openssl/x509v3.h>

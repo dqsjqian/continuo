@@ -16,9 +16,9 @@
 // one, which is why it needs a test rather than a comment.
 
 #include "check.hpp"
-#include "Mira/core/buffer.hpp"
-#include "Mira/http/connection.hpp"
-#include "Mira/http/serializer.hpp"
+#include "mira/core/buffer.hpp"
+#include "mira/http/connection.hpp"
+#include "mira/http/serializer.hpp"
 
 #include <algorithm>
 #include <array>

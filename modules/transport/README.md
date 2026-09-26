@@ -30,7 +30,7 @@ process **steal** a port another process is actively bound to — so two servers
 both "successfully" listen on one port and split the incoming connections
 between them.
 
-Mirarefore does not expose `SO_REUSEADDR` as a portable flag. It
+Mira therefore does not expose `SO_REUSEADDR` as a portable flag. It
 exposes the *intent*, and each platform implements that intent with whatever
 combination of socket options actually produces it. `tcp.hpp` carries the full
 reasoning; this is a summary, not the specification.

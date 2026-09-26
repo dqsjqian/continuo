@@ -1,8 +1,8 @@
 #pragma once
 
-#include "Mira/core/stream.hpp"
-#include "Mira/http/response_parser.hpp"
-#include "Mira/http/serializer.hpp"
+#include "mira/core/stream.hpp"
+#include "mira/http/response_parser.hpp"
+#include "mira/http/serializer.hpp"
 
 #include <algorithm>
 

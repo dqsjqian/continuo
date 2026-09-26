@@ -11,9 +11,9 @@
     #define MIRA_DIAG_STR2(x) #x
     #define MIRA_DIAG_STR(x) MIRA_DIAG_STR2(x)
     #if !defined(__cpp_lib_expected)
-        #error "Mirauires a C++23 standard library with std::expected; __cpp_lib_expected is undefined here (MiraMiratic: __cplusplus=" MIRA_DIAG_STR(__cplusplus) ")"
+        #error "Mira requires a C++23 standard library with std::expected; __cpp_lib_expected is undefined here (Mira diagnostic: __cplusplus=" MIRA_DIAG_STR(__cplusplus) ")"
     #else
-        #error "Mirauires a C++23 standard library with std::expected; __cpp_lib_expected is too old (MiraMiratic: __cplusplus=" MIRA_DIAG_STR(__cplusplus) " __cpp_lib_expected=" MIRA_DIAG_STR(__cpp_lib_expected) ")"
+        #error "Mira requires a C++23 standard library with std::expected; __cpp_lib_expected is too old (Mira diagnostic: __cplusplus=" MIRA_DIAG_STR(__cplusplus) " __cpp_lib_expected=" MIRA_DIAG_STR(__cpp_lib_expected) ")"
     #endif
 #endif
 

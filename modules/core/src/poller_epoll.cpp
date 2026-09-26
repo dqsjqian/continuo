@@ -5,7 +5,7 @@
 // transliteration of the kqueue backend rather than growing Linux-specific
 // cleverness.
 
-#include "Mira/core/platform.hpp"
+#include "mira/core/platform.hpp"
 
 #if defined(MIRA_IO_BACKEND_EPOLL)
 

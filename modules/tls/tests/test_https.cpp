@@ -1,9 +1,9 @@
 #include "check.hpp"
-#include "Mira/http/connection.hpp"
-#include "Mira/tls/context.hpp"
-#include "Mira/tls/error.hpp"
-#include "Mira/tls/stream.hpp"
-#include "Mira/transport/tcp.hpp"
+#include "mira/http/connection.hpp"
+#include "mira/tls/context.hpp"
+#include "mira/tls/error.hpp"
+#include "mira/tls/stream.hpp"
+#include "mira/transport/tcp.hpp"
 
 #include <algorithm>
 #include <array>

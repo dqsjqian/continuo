@@ -56,7 +56,7 @@ endif()
 foreach(_component IN LISTS mira_FIND_COMPONENTS)
     if(NOT mira_${_component}_FOUND)
         set(mira_NOT_FOUND_MESSAGE
-            "Miraponent '${_component}' is unavailable; rebuild with its MIRA_ENABLE_* option enabled, or omit that component.")
+            "Mira component '${_component}' is unavailable; rebuild with its MIRA_ENABLE_* option enabled, or omit that component.")
     endif()
 endforeach()
 check_required_components(Mira)

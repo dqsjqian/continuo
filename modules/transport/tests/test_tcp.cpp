@@ -10,8 +10,8 @@
 // mean the public API leaked a platform detail.
 
 #include "check.hpp"
-#include "Mira/core/stream.hpp"
-#include "Mira/transport/tcp.hpp"
+#include "mira/core/stream.hpp"
+#include "mira/transport/tcp.hpp"
 
 #include <array>
 #include <atomic>

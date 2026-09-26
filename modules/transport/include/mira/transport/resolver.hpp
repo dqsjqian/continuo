@@ -1,7 +1,7 @@
 #pragma once
 
-#include "Mira/core/event_loop.hpp"
-#include "Mira/transport/endpoint.hpp"
+#include "mira/core/event_loop.hpp"
+#include "mira/transport/endpoint.hpp"
 
 #include <cstddef>
 #include <functional>

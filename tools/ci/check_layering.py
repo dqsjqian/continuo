@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enforce Mirarchitectural invariants at build time.
+"""Enforce Mira's architectural invariants at build time.
 
 These rules exist because the failure mode they prevent is *gradual*. Nobody
 decides to weld the socket layer to the parser; it happens one include at a

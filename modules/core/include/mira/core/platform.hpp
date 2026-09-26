@@ -2,7 +2,7 @@
 
 // Mira/core/platform.hpp — the native handle, and what each platform can do.
 //
-// Miragets every platform its hosts ship on: macOS, Linux, Windows,
+// Mira targets every platform its hosts ship on: macOS, Linux, Windows,
 // iOS, and Android. Those platforms do not agree on what an asynchronous I/O
 // API even *is*, and that disagreement is the single most important
 // architectural fact in this library:
@@ -15,7 +15,7 @@
 // A library whose public API is readiness-shaped cannot be implemented on
 // IOCP without emulating it badly. A completion-shaped API, by contrast, maps
 // onto IOCP directly and is trivially emulated on a reactor (wait for ready,
-// then read). So Miraublic I/O API is completion-shaped on every
+// then read). So Mira's public I/O API is completion-shaped on every
 // platform — the same conclusion asio reached, and the direction io_uring has
 // since taken Linux.
 //

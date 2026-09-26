@@ -1,6 +1,6 @@
 #include "check.hpp"
-#include "Mira/core/stream.hpp"
-#include "Mira/transport/udp.hpp"
+#include "mira/core/stream.hpp"
+#include "mira/transport/udp.hpp"
 
 #include <array>
 #include <chrono>
