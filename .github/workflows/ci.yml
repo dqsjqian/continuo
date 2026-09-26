@@ -87,7 +87,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "CMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Configure TLS
-        run: cmake -S . -B build/tls -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_STANDARD=${{ matrix.std }} -DCONTINUO_ENABLE_TLS=ON
+        run: cmake -S . -B build/tls -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_STANDARD=${{ matrix.std }} -DMIRA_ENABLE_TLS=ON
       - name: Build TLS
         run: cmake --build build/tls --parallel --config Debug
       - name: Test TLS and HTTPS
@@ -118,7 +118,7 @@ jobs:
       - name: Configure with ASan + UBSan and TLS
         run: >
           cmake -S . -B build/asan -DCMAKE_BUILD_TYPE=Debug
-          -DCONTINUO_ENABLE_TLS=ON
+          -DMIRA_ENABLE_TLS=ON
           -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
       - name: Build
         run: cmake --build build/asan --parallel
@@ -171,9 +171,9 @@ jobs:
         shell: bash
         run: >
           cmake -S . -B build/protocols -DCMAKE_BUILD_TYPE=Debug
-          -DCONTINUO_ENABLE_TLS=ON
-          -DCONTINUO_ENABLE_HTTP2=ON
-          -DCONTINUO_ENABLE_HTTP3=ON
+          -DMIRA_ENABLE_TLS=ON
+          -DMIRA_ENABLE_HTTP2=ON
+          -DMIRA_ENABLE_HTTP3=ON
           -DCMAKE_PREFIX_PATH="$PWD/build/protocol-deps/prefix"
       - name: Build
         run: cmake --build build/protocols --parallel
@@ -192,7 +192,7 @@ jobs:
         run: >
           cmake -S . -B build/ios -G Xcode
           -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64
-          -DCONTINUO_BUILD_TESTS=OFF
+          -DMIRA_BUILD_TESTS=OFF
       - name: Build all non-TLS libraries (no target OpenSSL configured)
         run: cmake --build build/ios --config Debug
 
@@ -218,6 +218,6 @@ jobs:
           cmake -S . -B build/android
           -DCMAKE_TOOLCHAIN_FILE=$ANDROID_HOME/ndk/$MIRA_NDK_VERSION/build/cmake/android.toolchain.cmake
           -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24
-          -DCONTINUO_BUILD_TESTS=OFF
+          -DMIRA_BUILD_TESTS=OFF
       - name: Build all non-TLS libraries (no target OpenSSL configured)
         run: cmake --build build/android --parallel
