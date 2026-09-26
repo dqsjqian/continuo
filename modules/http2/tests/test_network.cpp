@@ -1,9 +1,9 @@
 #include "check.hpp"
-#include "continuo/core/task_scope.hpp"
-#include "continuo/http2/connection.hpp"
-#include "continuo/transport/tcp.hpp"
-#ifdef CONTINUO_HTTP2_TEST_TLS
-#include "continuo/tls/stream.hpp"
+#include "Mira/core/task_scope.hpp"
+#include "Mira/http2/connection.hpp"
+#include "Mira/transport/tcp.hpp"
+#ifdef MIRA_HTTP2_TEST_TLS
+#include "Mira/tls/stream.hpp"
 #include <openssl/pem.h>
 #include <openssl/rand.h>
 #include <openssl/x509v3.h>
@@ -18,9 +18,9 @@
 #include <stdexcept>
 #include <string>
 
-using namespace continuo;
-using namespace continuo::transport;
-using namespace continuo::http2;
+using namespace Mira;
+using namespace Mira::transport;
+using namespace Mira::http2;
 using namespace std::chrono_literals;
 
 namespace {
@@ -127,7 +127,7 @@ Task<void> query(S& transport, Results& results, OperationOptions options) {
     results.client = true;
 }
 
-#ifdef CONTINUO_HTTP2_TEST_TLS
+#ifdef MIRA_HTTP2_TEST_TLS
 struct CertificateFiles {
     std::filesystem::path directory;
     std::string certificate;
@@ -138,7 +138,7 @@ struct CertificateFiles {
         std::string suffix;
         constexpr char hex[] = "0123456789abcdef";
         for (auto value : random) { suffix += hex[value >> 4]; suffix += hex[value & 15]; }
-        directory = std::filesystem::path(CONTINUO_HTTP2_TEST_BINARY_DIR) / ("h2-cert-" + suffix);
+        directory = std::filesystem::path(MIRA_HTTP2_TEST_BINARY_DIR) / ("h2-cert-" + suffix);
         require(std::filesystem::create_directory(directory));
         std::filesystem::permissions(directory, std::filesystem::perms::owner_all);
         certificate = (directory / "cert.pem").string(); key = (directory / "key.pem").string();
@@ -180,7 +180,7 @@ struct CertificateFiles {
 #endif
 
 Task<void> server_task(tcp::Listener& listener, Results& results, OperationOptions options
-#ifdef CONTINUO_HTTP2_TEST_TLS
+#ifdef MIRA_HTTP2_TEST_TLS
     , const tls::Context* context
 #endif
 ) {
@@ -188,7 +188,7 @@ Task<void> server_task(tcp::Listener& listener, Results& results, OperationOptio
     CHECK(socket.has_value());
     if (!socket) co_return;
     FragmentedSocket fragmented{*socket};
-#ifdef CONTINUO_HTTP2_TEST_TLS
+#ifdef MIRA_HTTP2_TEST_TLS
     if (context) {
         auto secured = tls::Stream<FragmentedSocket>::create(fragmented, *context);
         require(secured.has_value());
@@ -203,7 +203,7 @@ Task<void> server_task(tcp::Listener& listener, Results& results, OperationOptio
     co_await serve(fragmented, results, options);
 }
 Task<void> client_task(EventLoop& loop, Endpoint endpoint, Results& results, OperationOptions options
-#ifdef CONTINUO_HTTP2_TEST_TLS
+#ifdef MIRA_HTTP2_TEST_TLS
     , const tls::Context* context
 #endif
 ) {
@@ -211,7 +211,7 @@ Task<void> client_task(EventLoop& loop, Endpoint endpoint, Results& results, Ope
     CHECK(socket.has_value());
     if (!socket) co_return;
     FragmentedSocket fragmented{*socket};
-#ifdef CONTINUO_HTTP2_TEST_TLS
+#ifdef MIRA_HTTP2_TEST_TLS
     if (context) {
         auto secured = tls::Stream<FragmentedSocket>::create(fragmented, *context, "localhost");
         require(secured.has_value());
@@ -226,7 +226,7 @@ Task<void> client_task(EventLoop& loop, Endpoint endpoint, Results& results, Ope
     co_await query(fragmented, results, options);
 }
 Task<void> scenario(EventLoop& loop
-#ifdef CONTINUO_HTTP2_TEST_TLS
+#ifdef MIRA_HTTP2_TEST_TLS
     , const tls::Context* client, const tls::Context* server
 #endif
 ) {
@@ -236,12 +236,12 @@ Task<void> scenario(EventLoop& loop
     OperationOptions options{.deadline = Clock::now() + 15s};
     TaskScope tasks;
     tasks.spawn(server_task(*listener, results, options
-#ifdef CONTINUO_HTTP2_TEST_TLS
+#ifdef MIRA_HTTP2_TEST_TLS
         , server
 #endif
     ));
     tasks.spawn(client_task(loop, listener->local_endpoint(), results, options
-#ifdef CONTINUO_HTTP2_TEST_TLS
+#ifdef MIRA_HTTP2_TEST_TLS
         , client
 #endif
     ));
@@ -254,12 +254,12 @@ int main() {
     auto loop = EventLoop::create();
     require(loop.has_value());
     auto plain_result = loop->run_until_complete(scenario(*loop
-#ifdef CONTINUO_HTTP2_TEST_TLS
+#ifdef MIRA_HTTP2_TEST_TLS
         , nullptr, nullptr
 #endif
     ));
     CHECK(plain_result.has_value());
-#ifdef CONTINUO_HTTP2_TEST_TLS
+#ifdef MIRA_HTTP2_TEST_TLS
     CertificateFiles files;
     const std::array<std::string_view, 2> client_protocols{"http/1.1", "h2"};
     const std::array<std::string_view, 2> server_protocols{"h2", "http/1.1"};

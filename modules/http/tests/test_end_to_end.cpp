@@ -6,13 +6,13 @@
 // scripted buffer. If the layers disagree about anything, this is where it
 // shows up.
 //
-// It lives in the http test suite rather than the library: `continuo::http`
-// links only against `continuo::core` and must never depend on transport. A
+// It lives in the http test suite rather than the library: `Mira::http`
+// links only against `Mira::core` and must never depend on transport. A
 // test binary linking both is fine — the *library* boundary is what matters.
 
 #include "check.hpp"
-#include "continuo/http/connection.hpp"
-#include "continuo/transport/tcp.hpp"
+#include "Mira/http/connection.hpp"
+#include "Mira/transport/tcp.hpp"
 
 #include <array>
 #include <atomic>
@@ -25,9 +25,9 @@
 #include <string>
 #include <string_view>
 
-using namespace continuo;
-using namespace continuo::http;
-using namespace continuo::transport;
+using namespace Mira;
+using namespace Mira::http;
+using namespace Mira::transport;
 using namespace std::chrono_literals;
 
 namespace {

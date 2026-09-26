@@ -1,10 +1,10 @@
-#include "continuo/transport/tcp.hpp"
+#include "Mira/transport/tcp.hpp"
 
 #include "socket_compat.hpp"
 
 #include <array>
 
-namespace continuo::transport::tcp {
+namespace Mira::transport::tcp {
 namespace {
 
 /// Scratch space for `getsockname`/`getpeername`, sized for `sockaddr_in6`.
@@ -225,4 +225,4 @@ Task<Result<Socket>> connect(EventLoop& loop,
     co_return wrapper;
 }
 
-}  // namespace continuo::transport::tcp
+}  // namespace Mira::transport::tcp

@@ -1,4 +1,4 @@
-#include "continuo/http/parser.hpp"
+#include "Mira/http/parser.hpp"
 
 #include "grammar.hpp"
 
@@ -9,7 +9,7 @@
 #include <string_view>
 #include <vector>
 
-namespace continuo::http {
+namespace Mira::http {
 namespace {
 
 [[nodiscard]] std::string_view as_text(std::span<const std::byte> bytes) noexcept {
@@ -109,7 +109,7 @@ struct Line {
 
 class ParseCategory final : public std::error_category {
 public:
-    [[nodiscard]] const char* name() const noexcept override { return "continuo.http"; }
+    [[nodiscard]] const char* name() const noexcept override { return "Mira.http"; }
 
     [[nodiscard]] std::string message(int value) const override {
         switch (static_cast<ParseError>(value)) {
@@ -671,4 +671,4 @@ Result<RequestParser::Progress> RequestParser::read_chunk_trailer(Buffer& input)
     }
 }
 
-}  // namespace continuo::http
+}  // namespace Mira::http

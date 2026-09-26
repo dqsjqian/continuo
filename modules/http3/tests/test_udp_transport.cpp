@@ -2,9 +2,9 @@
 // protocol state machines; this one proves the whole stack — nghttp3 over
 // ngtcp2 over the kernel's UDP, driven through the event loop.
 
-#include "continuo/core/task_scope.hpp"
-#include "continuo/http3/connection.hpp"
-#include "continuo/transport/udp.hpp"
+#include "Mira/core/task_scope.hpp"
+#include "Mira/http3/connection.hpp"
+#include "Mira/transport/udp.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -12,7 +12,7 @@
 #include <memory>
 #include <stdexcept>
 
-using namespace continuo;
+using namespace Mira;
 using namespace std::chrono_literals;
 using transport::Endpoint;
 using quic::Bytes;

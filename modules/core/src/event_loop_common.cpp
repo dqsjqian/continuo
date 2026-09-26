@@ -6,14 +6,14 @@
 // per backend — which is the failure mode this library spends most of its
 // effort on.
 
-#include "continuo/core/event_loop.hpp"
+#include "Mira/core/event_loop.hpp"
 
 #include <coroutine>
 #include <cstdio>
 #include <exception>
 #include <utility>
 
-namespace continuo {
+namespace Mira {
 namespace {
 
 /// Owns a root coroutine and records how it ended.
@@ -80,7 +80,7 @@ RootTask run_root(Task<void> task) {
 
 [[noreturn]] void unresolvable(const char* reason) {
     std::fprintf(stderr,
-                 "continuo::EventLoop::run_until_complete: %s.\n"
+                 "Mira::EventLoop::run_until_complete: %s.\n"
                  "The root coroutine is started and unfinished, so its frame cannot be\n"
                  "destroyed: the loop may still hold its handle, its result slot, and\n"
                  "buffers it borrowed. Terminating rather than corrupting memory.\n",
@@ -125,4 +125,4 @@ Result<void> EventLoop::run_until_complete(Task<void> task) {
     return Result<void>{};
 }
 
-}  // namespace continuo
+}  // namespace Mira

@@ -6,11 +6,11 @@
 // design document.
 
 #include "check.hpp"
-#include "continuo/core/buffer.hpp"
-#include "continuo/core/error.hpp"
-#include "continuo/core/executor.hpp"
-#include "continuo/core/stream.hpp"
-#include "continuo/core/task.hpp"
+#include "Mira/core/buffer.hpp"
+#include "Mira/core/error.hpp"
+#include "Mira/core/executor.hpp"
+#include "Mira/core/stream.hpp"
+#include "Mira/core/task.hpp"
 
 #include <algorithm>
 #include <coroutine>
@@ -25,7 +25,7 @@
 #include <string_view>
 #include <vector>
 
-using namespace continuo;
+using namespace Mira;
 
 namespace {
 
@@ -45,7 +45,7 @@ void test_error_model() {
     static_assert(std::is_same_v<Result<void>, std::expected<void, Error>>);
 
     const Error eof = make_error_code(Errc::eof);
-    CHECK(eof.category() == continuo_category());
+    CHECK(eof.category() == mira_category());
     CHECK(eof.value() == static_cast<int>(Errc::eof));
     CHECK(eof.message() == "stream closed by peer");
 
@@ -53,7 +53,7 @@ void test_error_model() {
     const Error timeout = Errc::timed_out;
     CHECK(timeout == Errc::timed_out);
 
-    // Continuo conditions compare equal to their portable std::errc peers.
+    // Miraditions compare equal to their portable std::errc peers.
     CHECK(timeout == std::errc::timed_out);
     CHECK(make_error_code(Errc::would_block) == std::errc::operation_would_block);
 
@@ -257,9 +257,9 @@ void test_stream_seam() {
     // write_all was written against the concept; it drives a non-socket
     // stream unchanged, looping over short writes.
     MemoryStream stream{4};
-    Result<void> result = round_trip(stream, "hello continuo").sync_get();
+    Result<void> result = round_trip(stream, "hello Mira").sync_get();
     CHECK(result.has_value());
-    CHECK(stream.contents() == "hello continuo");
+    CHECK(stream.contents() == "hello Mira");
     CHECK(stream.write_calls() == 4);  // 14 bytes / 4-byte chunks
 
     // Reading drains the same bytes, then reports a clean close.
@@ -281,7 +281,7 @@ void test_stream_seam() {
 
     Result<std::string> drained = drain(stream).sync_get();
     CHECK(drained.has_value());
-    CHECK(drained.value() == "hello continuo");
+    CHECK(drained.value() == "hello Mira");
 }
 
 // ── executor seam ────────────────────────────────────────────────────────────

@@ -16,9 +16,9 @@
 // one, which is why it needs a test rather than a comment.
 
 #include "check.hpp"
-#include "continuo/core/buffer.hpp"
-#include "continuo/http/connection.hpp"
-#include "continuo/http/serializer.hpp"
+#include "Mira/core/buffer.hpp"
+#include "Mira/http/connection.hpp"
+#include "Mira/http/serializer.hpp"
 
 #include <algorithm>
 #include <array>
@@ -32,8 +32,8 @@
 #include <utility>
 #include <vector>
 
-using namespace continuo;
-using namespace continuo::http;
+using namespace Mira;
+using namespace Mira::http;
 
 namespace {
 

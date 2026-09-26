@@ -1,10 +1,10 @@
-#include "continuo/http/message.hpp"
+#include "Mira/http/message.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cctype>
 
-namespace continuo::http {
+namespace Mira::http {
 namespace {
 
 /// ASCII-only lowercase.
@@ -155,4 +155,4 @@ std::string_view default_reason(unsigned status) noexcept {
     return "";
 }
 
-}  // namespace continuo::http
+}  // namespace Mira::http

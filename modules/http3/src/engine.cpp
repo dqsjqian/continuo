@@ -1,22 +1,22 @@
-#include "continuo/http3/engine.hpp"
+#include "Mira/http3/engine.hpp"
 
 #include <nghttp3/nghttp3.h>
 #if NGHTTP3_VERSION_NUM < 0x010f00
-    #error "continuo::http3 requires nghttp3 >= 1.15.0"
+    #error "Mira::http3 requires nghttp3 >= 1.15.0"
 #endif
 #include <algorithm>
 #include <array>
 #include <exception>
 #include <map>
 
-namespace continuo::http3 {
+namespace Mira::http3 {
 namespace {
 // 引擎自有错误码，远离 nghttp3 原生负码区间，避免与依赖库冲突。
 constexpr int invalid = -110000;
 
 class Http3Category final : public std::error_category {
 public:
-    const char* name() const noexcept override { return "continuo.http3"; }
+    const char* name() const noexcept override { return "Mira.http3"; }
     std::string message(int code) const override {
         if (code == invalid) return "invalid HTTP/3 argument or state";
         return nghttp3_strerror(code);
@@ -479,4 +479,4 @@ Result<quic::Bytes> Engine::close(std::uint64_t code, std::uint64_t now) {
     impl_->failed = true;
     return impl_->transport.close(code, now);
 }
-}  // namespace continuo::http3
+}  // namespace Mira::http3

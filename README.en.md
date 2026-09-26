@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🎵 Continuo
+# 🎵 Mira
 
 **Coroutine-native C++23 networking · transport first, protocols on top** · TCP / UDP / TLS / HTTP/1.1 / HTTP/2 · experimental QUIC / HTTP/3
 
@@ -8,7 +8,7 @@ One completion-shaped I/O API across kqueue, epoll, and IOCP — so protocols ne
 
 [![C++23](https://img.shields.io/badge/C%2B%2B-23-blue.svg)](https://en.cppreference.com/w/cpp/23)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![CI](https://github.com/dqsjqian/continuo/actions/workflows/ci.yml/badge.svg)](https://github.com/dqsjqian/continuo/actions/workflows/ci.yml)
+[![CI](https://github.com/dqsjqian/Mira/actions/workflows/ci.yml/badge.svg)](https://github.com/dqsjqian/Mira/actions/workflows/ci.yml)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20iOS%20%7C%20Android-lightgrey.svg)](#platforms--evidence-boundary)
 
 简体中文 | [English](README.en.md)
@@ -17,28 +17,28 @@ One completion-shaped I/O API across kqueue, epoll, and IOCP — so protocols ne
 
 ---
 
-> *Basso continuo*: the continuously played bass line that carries an entire piece.
-> Continuo aims to be that foundation for network software — not another HTTP framework that does everything.
+> *Basso Mira*: the continuously played bass line that carries an entire piece.
+> Miras to be that foundation for network software — not another HTTP framework that does everything.
 
 **Current status: phase-one protocol implementation in progress, not a production-ready stack.** The API will keep evolving as contracts harden; ABI stability is not promised yet.
 
-## 🚀 Continuo in 30 seconds
+## 🚀 Mira30 seconds
 
 A TCP echo is the whole worldview: **you await a completion, the library owns the platform differences.**
 
 ```cpp
-continuo::Task<continuo::Result<void>>
-echo_tcp(continuo::transport::tcp::Socket& socket) {
+Mira::Task<Mira::Result<void>>
+echo_tcp(Mira::transport::tcp::Socket& socket) {
     std::array<std::byte, 4096> buffer{};
     for (;;) {
         auto read = co_await socket.read_some(buffer);   // same shape on kqueue/epoll/IOCP
         if (!read) {
-            if (read.error() == continuo::Errc::eof) co_return continuo::Result<void>{};
-            co_return continuo::fail(read.error());
+            if (read.error() == Mira::Errc::eof) co_return Mira::Result<void>{};
+            co_return Mira::fail(read.error());
         }
-        auto written = co_await continuo::write_all(
+        auto written = co_await Mira::write_all(
             socket, std::span<const std::byte>{buffer}.first(*read));
-        if (!written) co_return continuo::fail(written.error());
+        if (!written) co_return Mira::fail(written.error());
     }
 }
 ```
@@ -46,24 +46,24 @@ echo_tcp(continuo::transport::tcp::Socket& socket) {
 HTTP looks the same — the handler is a template free function, and **switching to a TLS stream changes nothing**:
 
 ```cpp
-template<continuo::AsyncStream Stream>
-continuo::Task<continuo::Result<void>> hello(
-    const continuo::http::Request&,
-    continuo::http::ResponseWriter<Stream>& writer,
+template<Mira::AsyncStream Stream>
+Mira::Task<Mira::Result<void>> hello(
+    const Mira::http::Request&,
+    Mira::http::ResponseWriter<Stream>& writer,
     std::span<const std::byte>) {
-    continuo::http::Response response;
+    Mira::http::Response response;
     response.status = 200;
     response.headers.append("Content-Type", "text/plain; charset=utf-8");
-    std::string_view body = "hello, continuo\n";
+    std::string_view body = "hello, Mira\n";
     co_return co_await writer.send(response, {
         reinterpret_cast<const std::byte*>(body.data()), body.size()});
 }
 
-// TCP:  co_await continuo::http::serve_connection(socket, &hello<tcp::Socket>);
-// TLS:  co_await continuo::http::serve_connection(tls_stream, &hello<tls::Stream<tcp::Socket>>);
+// TCP:  co_await Mira::http::serve_connection(socket, &hello<tcp::Socket>);
+// TLS:  co_await Mira::http::serve_connection(tls_stream, &hello<tls::Stream<tcp::Socket>>);
 ```
 
-## 🎯 Why Continuo
+## 🎯 Why Mira
 
 | Design choice | In one line |
 |---|---|
@@ -97,12 +97,12 @@ Solid arrows are dependency directions; dashed arrows are application-level comp
 
 | Module | Responsibility |
 |---|---|
-| `continuo::core` | Coroutines and task scopes, errors, stream and executor interfaces, buffers, event loop and timers |
-| `continuo::transport` | IP endpoints, TCP (exclusive bind by default), message-boundary UDP, bounded background system resolver |
-| `continuo::tls` | Optional TLS streams, certificate and hostname verification, mTLS client verification, multi-protocol ALPN |
-| `continuo::http` | HTTP/1 request/response parsing, serialization, per-connection serving (incl. chunked streaming) and client |
-| `continuo::http2` | Optional nghttp2 session, multi-stream state, generic stream adaptation |
-| `continuo::quic` / `continuo::http3` | Experimental QUIC v1 and nghttp3 / QPACK engines |
+| `Mira::core` | Coroutines and task scopes, errors, stream and executor interfaces, buffers, event loop and timers |
+| `Mira::transport` | IP endpoints, TCP (exclusive bind by default), message-boundary UDP, bounded background system resolver |
+| `Mira::tls` | Optional TLS streams, certificate and hostname verification, mTLS client verification, multi-protocol ALPN |
+| `Mira::http` | HTTP/1 request/response parsing, serialization, per-connection serving (incl. chunked streaming) and client |
+| `Mira::http2` | Optional nghttp2 session, multi-stream state, generic stream adaptation |
+| `Mira::quic` / `Mira::http3` | Experimental QUIC v1 and nghttp3 / QPACK engines |
 
 Layering is enforced by `tools/ci/check_layering.py`: no reverse dependencies, no host-framework headers, platform detection centralized in `platform.hpp`, and no OS headers inside protocol modules.
 
@@ -112,9 +112,9 @@ Layering is enforced by `tools/ci/check_layering.py`: no reverse dependencies, n
 <summary><b>TaskScope: structured concurrency with explicit lifecycles</b></summary>
 
 ```cpp
-continuo::Task<int> count_after_delay(continuo::EventLoop& loop) {
+Mira::Task<int> count_after_delay(Mira::EventLoop& loop) {
     int count = 0;
-    continuo::TaskScope scope;
+    Mira::TaskScope scope;
     scope.spawn(delayed_increment(loop, scope.get_stop_token(), count));
     co_await scope.join();          // returns only after every child frame is gone
     co_return count;                // count lives in this frame — no dangling
@@ -132,7 +132,7 @@ continuo::Task<int> count_after_delay(continuo::EventLoop& loop) {
 ```cpp
 co_return co_await loop.read(handle, into,
     {.stop    = std::move(stop),
-     .deadline = continuo::EventLoop::Clock::now() + 5s});
+     .deadline = Mira::EventLoop::Clock::now() + 5s});
 ```
 
 | Situation | Outcome |
@@ -150,14 +150,14 @@ co_return co_await loop.read(handle, into,
 
 ```cpp
 // Server: cert + key, optional mandatory client verification (mTLS), min version
-auto ctx = continuo::tls::Context::server({
+auto ctx = Mira::tls::Context::server({
     .cert_file = "server.pem", .key_file = "server-key.pem",
     .client_ca_file = "ca.pem",      // non-empty = enforce mTLS
     .min_version = "1.2",            // "1.2" / "1.3"
 });
 
 // Client: chain + hostname verification; optional client certificate
-auto client = continuo::tls::Context::client({
+auto client = Mira::tls::Context::client({
     .ca_file = "ca.pem", .cert_file = "client.pem", .key_file = "client-key.pem",
 });
 ```
@@ -219,8 +219,8 @@ Requires **CMake 3.20+ and a C++23 compiler**. The library itself compiles on GC
 Non-TLS builds have zero third-party dependencies.
 
 ```bash
-git clone https://github.com/dqsjqian/continuo.git
-cd continuo
+git clone https://github.com/dqsjqian/Mira.git
+cd Mira
 cmake -S . -B build/debug -DCMAKE_BUILD_TYPE=Debug
 cmake --build build/debug -j
 ctest --test-dir build/debug --output-on-failure
@@ -233,7 +233,7 @@ cmake -S . -B build/tls -DCMAKE_BUILD_TYPE=Debug -DCONTINUO_ENABLE_TLS=ON
 cmake --build build/tls -j && ctest --test-dir build/tls --output-on-failure
 ```
 
-Optional higher protocols: `CONTINUO_ENABLE_HTTP2=ON` / `CONTINUO_ENABLE_HTTP3=ON` (off by default, never auto-downloads; dependency versions are SHA256-pinned via `tools/ci/build_protocol_deps.py`).
+Optional higher protocols: `MIRA_ENABLE_HTTP2=ON` / `MIRA_ENABLE_HTTP3=ON` (off by default, never auto-downloads; dependency versions are SHA256-pinned via `tools/ci/build_protocol_deps.py`).
 
 ### 📦 Using it in your project
 
@@ -242,19 +242,19 @@ The recommended pattern — the one Aria and AriaAgent use — is a **hash-pinne
 ```cmake
 include(ariaFetchPinned)  # or your repo's equivalent download + SHA256 primitive
 aria_fetch_pinned_archive(
-    NAME      continuo
+    NAME      Mira
     VERSION   0.1.2
-    URL       "https://github.com/dqsjqian/continuo/releases/download/v0.1.2/continuo-0.1.2.tar.gz"
+    URL       "https://github.com/dqsjqian/Mira/releases/download/v0.1.2/Mira-0.1.2.tar.gz"
     SHA256    508c56092c004bda7e7e606e2c266fab8a918b38bab46c96b37604862681dafa
 )
-set(CONTINUO_BUILD_TESTS OFF)
-set(CONTINUO_BUILD_EXAMPLES OFF)
-add_subdirectory(${ARIA_PINNED_CONTINUO_SOURCE_DIR} continuo)
-target_link_libraries(my_app PRIVATE continuo::transport continuo::http)
-# TLS: also set(CONTINUO_ENABLE_TLS ON) and additionally link continuo::tls
+set(MIRA_BUILD_TESTS OFF)
+set(MIRA_BUILD_EXAMPLES OFF)
+add_subdirectory(${ARIA_PINNED_MIRA_SOURCE_DIR} Mira)
+target_link_libraries(my_app PRIVATE Mira::transport Mira::http)
+# TLS: also set(MIRA_ENABLE_TLS ON) and additionally link Mira::tls
 ```
 
-For local development, pointing at a source tree works too: `add_subdirectory(vendor/continuo)` (`CONTINUO_BUILD_TESTS` defaults off in subdirectory mode). Installed consumption uses `find_package(continuo REQUIRED COMPONENTS core transport http)`, add the `tls` component when needed.
+For local development, pointing at a source tree works too: `add_subdirectory(vendor/Mira)` (`MIRA_BUILD_TESTS` defaults off in subdirectory mode). Installed consumption uses `find_package(Mira REQUIRED COMPONENTS core transport http)`, add the `tls` component when needed.
 
 Android requires **NDK 29 or newer**: NDK 27/28's libc++ gates `std::stop_token` off; NDK 29 (clang 21) builds on API 24 as tested.
 
@@ -278,7 +278,7 @@ Start from a reproducible problem, a crisp contract, or a targeted test. Keep mo
 
 ## 📄 License
 
-[MIT](LICENSE) © 2026 continuo contributors
+[MIT](LICENSE) © 2026 Mira contributors
 
 ---
 

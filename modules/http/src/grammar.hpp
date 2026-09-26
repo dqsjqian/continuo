@@ -19,7 +19,7 @@
 #include <string_view>
 #include <vector>
 
-namespace continuo::http::grammar {
+namespace Mira::http::grammar {
 
 /// `tchar` — the characters allowed in a field name or a method token.
 ///
@@ -97,4 +97,4 @@ namespace continuo::http::grammar {
     return items;
 }
 
-}  // namespace continuo::http::grammar
+}  // namespace Mira::http::grammar

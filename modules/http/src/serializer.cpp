@@ -1,4 +1,4 @@
-#include "continuo/http/serializer.hpp"
+#include "Mira/http/serializer.hpp"
 
 #include "grammar.hpp"
 
@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <string>
 
-namespace continuo::http {
+namespace Mira::http {
 namespace {
 
 void append(Buffer& out, std::string_view text) {
@@ -53,7 +53,7 @@ void append(Buffer& out, std::string_view text) {
 
 class SerializeCategory final : public std::error_category {
 public:
-    [[nodiscard]] const char* name() const noexcept override { return "continuo.http.serialize"; }
+    [[nodiscard]] const char* name() const noexcept override { return "Mira.http.serialize"; }
 
     [[nodiscard]] std::string message(int value) const override {
         switch (static_cast<SerializeError>(value)) {
@@ -306,4 +306,4 @@ void write_last_chunk(Buffer& out) {
     append(out, "0\r\n\r\n");
 }
 
-}  // namespace continuo::http
+}  // namespace Mira::http

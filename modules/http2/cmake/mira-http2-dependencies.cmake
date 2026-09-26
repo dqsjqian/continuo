@@ -1,0 +1,6 @@
+include(CMakeFindDependencyMacro)
+set(_mira_http2_saved_module_path "${CMAKE_MODULE_PATH}")
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
+find_dependency(NGHTTP2 1.61)
+set(CMAKE_MODULE_PATH "${_mira_http2_saved_module_path}")
+unset(_mira_http2_saved_module_path)

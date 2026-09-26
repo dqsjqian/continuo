@@ -1,6 +1,6 @@
 #include "check.hpp"
-#include "continuo/core/event_loop.hpp"
-#include "continuo/core/task_scope.hpp"
+#include "Mira/core/event_loop.hpp"
+#include "Mira/core/task_scope.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -10,7 +10,7 @@
 #include <string>
 #include <string_view>
 
-using namespace continuo;
+using namespace Mira;
 using namespace std::chrono_literals;
 
 namespace {

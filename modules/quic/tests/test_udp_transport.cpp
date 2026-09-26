@@ -3,8 +3,8 @@
 // payload discipline — but the packets now traverse the kernel's UDP stack
 // and the event loop's datagram operations.
 
-#include "continuo/core/task_scope.hpp"
-#include "continuo/quic/connection.hpp"
+#include "Mira/core/task_scope.hpp"
+#include "Mira/quic/connection.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -13,7 +13,7 @@
 #include <stdexcept>
 #include <stop_token>
 
-using namespace continuo;
+using namespace Mira;
 using namespace std::chrono_literals;
 using transport::Endpoint;
 using quic::Connection;

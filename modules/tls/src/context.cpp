@@ -1,13 +1,13 @@
-#include "continuo/tls/context.hpp"
+#include "Mira/tls/context.hpp"
 
 #include "context_impl.hpp"
-#include "continuo/tls/error.hpp"
+#include "Mira/tls/error.hpp"
 
 #include <openssl/err.h>
 #include <string>
 #include <unordered_set>
 
-namespace continuo::tls {
+namespace Mira::tls {
 namespace {
 Result<SSL_CTX*> make_context() {
     ERR_clear_error();
@@ -35,7 +35,7 @@ Result<std::string> encode_protocols(std::span<const std::string_view> protocols
     for (const auto protocol : protocols) {
         if (protocol.empty() || protocol.size() > 255 ||
             protocol.size() + 1 > 65535 - wire.size() || !seen.insert(protocol).second)
-            return fail(continuo::Errc::invalid_argument);
+            return fail(Mira::Errc::invalid_argument);
         wire += static_cast<char>(protocol.size());
         wire += protocol;
     }
@@ -107,7 +107,7 @@ Result<void> apply_min_version(SSL_CTX* handle, std::string_view min_version) {
     const int version = min_version == "1.2"   ? TLS1_2_VERSION
                         : min_version == "1.3" ? TLS1_3_VERSION
                                                : 0;
-    if (version == 0) return fail(continuo::Errc::invalid_argument);
+    if (version == 0) return fail(Mira::Errc::invalid_argument);
     ERR_clear_error();
     if (SSL_CTX_set_min_proto_version(handle, version) != 1)
         return fail(make_error_code(Errc::configuration_error));
@@ -147,7 +147,7 @@ Result<Context> Context::client(std::string_view ca_file, std::string_view proto
 Result<Context> Context::client_alpn(std::string_view ca_file,
                                      std::span<const std::string_view> protocols) {
     if (!ca_file.empty() && !valid_path(ca_file))
-        return fail(continuo::Errc::invalid_argument);
+        return fail(Mira::Errc::invalid_argument);
     auto wire = encode_protocols(protocols);
     if (!wire) return fail(wire.error());
     auto impl = std::make_unique<Impl>();
@@ -184,7 +184,7 @@ Result<Context> Context::server_alpn(std::string_view cert_file,
                                      std::string_view key_file,
                                      std::span<const std::string_view> protocols) {
     if (!valid_path(cert_file) || !valid_path(key_file))
-        return fail(continuo::Errc::invalid_argument);
+        return fail(Mira::Errc::invalid_argument);
     auto impl = std::make_unique<Impl>();
     auto handle = make_context();
     if (!handle) return fail(handle.error());
@@ -198,7 +198,7 @@ Result<Context> Context::server_alpn(std::string_view cert_file,
 
 Result<Context> Context::server(ServerConfig config) {
     if (!config.client_ca_file.empty() && !valid_path(config.client_ca_file))
-        return fail(continuo::Errc::invalid_argument);
+        return fail(Mira::Errc::invalid_argument);
     auto protocols = config.protocol.empty()
                          ? std::span<const std::string_view>{}
                          : std::span<const std::string_view>{&config.protocol, 1};
@@ -223,7 +223,7 @@ Result<Context> Context::server(ServerConfig config) {
 Result<Context> Context::client(ClientConfig config) {
     const bool has_cert = !config.cert_file.empty();
     const bool has_key = !config.key_file.empty();
-    if (has_cert != has_key) return fail(continuo::Errc::invalid_argument);
+    if (has_cert != has_key) return fail(Mira::Errc::invalid_argument);
     auto protocols = config.protocol.empty()
                          ? std::span<const std::string_view>{}
                          : std::span<const std::string_view>{&config.protocol, 1};
@@ -236,4 +236,4 @@ Result<Context> Context::client(ClientConfig config) {
     return std::move(*base);
 }
 
-}  // namespace continuo::tls
+}  // namespace Mira::tls

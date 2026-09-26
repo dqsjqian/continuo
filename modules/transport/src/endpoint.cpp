@@ -1,11 +1,11 @@
-#include "continuo/transport/endpoint.hpp"
+#include "Mira/transport/endpoint.hpp"
 
 #include "socket_compat.hpp"
 
 #include <charconv>
 #include <cstdio>
 
-namespace continuo::transport {
+namespace Mira::transport {
 namespace {
 
 [[nodiscard]] int to_native_family(Family family) noexcept {
@@ -49,7 +49,7 @@ Result<Endpoint> Endpoint::parse(std::string_view address, std::uint16_t port) {
                 // A digits-only overflow is not an interface name.
                 if (scope.find_first_not_of("0123456789") == std::string_view::npos)
                     return fail(Errc::invalid_argument);
-#if CONTINUO_PLATFORM_WINDOWS
+#if MIRA_PLATFORM_WINDOWS
                 // Numeric scopes are portable. Interface names are POSIX-only
                 // until the Windows adapter-name mapping is implemented.
                 return fail(Errc::invalid_argument);
@@ -201,4 +201,4 @@ std::string Endpoint::to_string() const {
     return host + ":" + port_text;
 }
 
-}  // namespace continuo::transport
+}  // namespace Mira::transport

@@ -1,4 +1,4 @@
-# Continuo — architecture
+# Mirarchitecture
 
 ## What this library is
 
@@ -20,7 +20,7 @@ and protocols that ride on it. HTTP is one protocol family, not the purpose.
 - Evaluate correctness, API usability, performance and resource bounds through
   executable tests, interoperability checks and reproducible benchmarks.
   Existing libraries are comparison evidence, not the specification.
-- Current phase develops Continuo only. Consumer migration, removal of old
+- Current phase develops Miray. Consumer migration, removal of old
   dependencies, and public release are later phases; keep this repository
   private for now.
 
@@ -47,7 +47,7 @@ be specified and measured end to end.
 
 ## The decision everything else follows from: completion, not readiness
 
-Continuo targets macOS, Linux, Windows, iOS, and Android. Those platforms do
+Miragets macOS, Linux, Windows, iOS, and Android. Those platforms do
 not agree on what an asynchronous I/O API *is*:
 
 | | Model | Shape |
@@ -76,7 +76,7 @@ std::size_t n = (co_await loop.read(handle, buffer)).value();   // all platforms
 ```
 
 Readiness is still exposed, but fenced: `wait_readable` / `wait_writable` exist
-behind `#if CONTINUO_HAS_READINESS_API` for embedding a descriptor owned by
+behind `#if MIRA_HAS_READINESS_API` for embedding a descriptor owned by
 another library. Code that calls them does not compile on Windows — the honest
 outcome, and better than an emulation whose semantics quietly differ.
 
@@ -126,12 +126,12 @@ These static checks do not prove lifetime safety or runtime substitutability:
    protocol headers; transport must not include protocol headers. Reaching *up*
    a layer is precisely the move that makes a library unable to grow a second
    protocol later.
-2. **No host framework dependency.** Continuo never includes `aria/…`. Hosts
+2. **No host framework dependency.** Miraer includes `aria/…`. Hosts
    integrate through the executor and stream seams, so the library stays usable
    standalone.
 3. **Platform detection has exactly one home.** Only `platform.hpp` may test
    `_WIN32`, `__linux__`, `__APPLE__` and friends; everything else asks it via
-   `CONTINUO_*`. Scattered `#ifdef _WIN32` is how "supports Windows" decays
+   `MIRA_*`. Scattered `#ifdef _WIN32` is how "supports Windows" decays
    into "compiles on Windows".
 4. **Protocols are platform-agnostic.** A protocol module may not include OS
    headers. The moment a parser knows what a socket is, it can no longer be
@@ -204,7 +204,7 @@ termination and the way slow consumers suspend producers.
 
 ### `TaskScope` — implemented single-threaded child ownership
 
-`TaskScope` in `continuo/core/task_scope.hpp` owns child tasks, not their borrowed
+`TaskScope` in `Mira/core/task_scope.hpp` owns child tasks, not their borrowed
 resources. It is neither copyable nor movable. Scope operations, child completion
 and stop callbacks must all execute on the same thread; the type is not a
 cross-thread scheduler or a complete server-launch facility.
@@ -418,7 +418,7 @@ argument for running tests on every platform rather than building on them.
    maps part of the Winsock space: `WSAEADDRINUSE` is in the table, so the
    exclusive-bind test passed, but `WSAECONNREFUSED` is not. A refused
    connection therefore compared equal to `std::errc::connection_refused` on
-   POSIX and to nothing at all on Windows. Fixed by `continuo::socket_error`,
+   POSIX and to nothing at all on Windows. Fixed by `Mira::socket_error`,
    which translates the Winsock codes that have a portable equivalent.
 
 2. **IOCP completions report NTSTATUS — a third numbering space.**
@@ -568,7 +568,7 @@ request, hit eof, and closed. The parser now advances its own state machine
 and `need_more` means exactly one thing. **A state machine must not export an
 ambiguous "try again".**
 
-**TLS/HTTPS foundation.** Optional `continuo::tls` (OpenSSL 3) depends on core,
+**TLS/HTTPS foundation.** Optional `Mira::tls` (OpenSSL 3) depends on core,
 not on TCP or HTTP. A bounded memory BIO pair separates synchronous TLS state
 transitions from asynchronous ciphertext reads/writes. No SSL socket BIO or
 `SSL_set_fd` is used; IOCP and POSIX therefore share the same TLS pump.

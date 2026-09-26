@@ -1,9 +1,9 @@
 #include "check.hpp"
-#include "continuo/http/connection.hpp"
-#include "continuo/tls/context.hpp"
-#include "continuo/tls/error.hpp"
-#include "continuo/tls/stream.hpp"
-#include "continuo/transport/tcp.hpp"
+#include "Mira/http/connection.hpp"
+#include "Mira/tls/context.hpp"
+#include "Mira/tls/error.hpp"
+#include "Mira/tls/stream.hpp"
+#include "Mira/transport/tcp.hpp"
 
 #include <algorithm>
 #include <array>
@@ -25,8 +25,8 @@
 #include <utility>
 #include <vector>
 
-using namespace continuo;
-using namespace continuo::transport;
+using namespace Mira;
+using namespace Mira::transport;
 using namespace std::chrono_literals;
 
 namespace {
@@ -152,13 +152,13 @@ struct Certificates {
             suffix += hex[value & 15];
         }
         const auto candidate =
-            std::filesystem::path{CONTINUO_TLS_TEST_BINARY_DIR} / ("certificates-" + suffix);
+            std::filesystem::path{MIRA_TLS_TEST_BINARY_DIR} / ("certificates-" + suffix);
         require(std::filesystem::create_directory(candidate));
         directory = candidate;
         std::filesystem::permissions(
             directory, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace);
         const auto ca_key = generate_key();
-        const auto ca_cert = generate_certificate(ca_key.get(), "Continuo test CA", 1);
+        const auto ca_cert = generate_certificate(ca_key.get(), "Mirat CA", 1);
         const auto unrelated_key = generate_key();
         const auto unrelated_cert = generate_certificate(unrelated_key.get(), "Unrelated CA", 2);
         const auto server_key = generate_key();

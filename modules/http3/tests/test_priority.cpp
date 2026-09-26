@@ -1,8 +1,8 @@
-#include "continuo/http3/engine.hpp"
+#include "Mira/http3/engine.hpp"
 #include <iostream>
 #include <stdexcept>
 
-using namespace continuo;
+using namespace Mira;
 template<class T> T require(quic::Result<T> result) {
     if (!result) throw std::runtime_error(result.error().message());
     return std::move(*result);

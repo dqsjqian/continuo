@@ -1,12 +1,12 @@
-#include "continuo/tls/error.hpp"
+#include "Mira/tls/error.hpp"
 
 #include <string>
 
-namespace continuo::tls {
+namespace Mira::tls {
 namespace {
 class Category final : public std::error_category {
 public:
-    const char* name() const noexcept override { return "continuo.tls"; }
+    const char* name() const noexcept override { return "Mira.tls"; }
     std::string message(int value) const override {
         switch (static_cast<Errc>(value)) {
         case Errc::invalid_state:
@@ -35,4 +35,4 @@ const std::error_category& tls_category() noexcept {
 Error make_error_code(Errc error) noexcept {
     return {static_cast<int>(error), tls_category()};
 }
-}  // namespace continuo::tls
+}  // namespace Mira::tls

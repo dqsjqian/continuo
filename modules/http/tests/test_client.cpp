@@ -1,8 +1,8 @@
 #include "check.hpp"
-#include "continuo/core/task_scope.hpp"
-#include "continuo/http/client.hpp"
-#include "continuo/http/connection.hpp"
-#include "continuo/transport/tcp.hpp"
+#include "Mira/core/task_scope.hpp"
+#include "Mira/http/client.hpp"
+#include "Mira/http/connection.hpp"
+#include "Mira/transport/tcp.hpp"
 
 #include <array>
 #include <cstring>
@@ -11,9 +11,9 @@
 
 #define CHECK_VALUE(expr) CHECK(static_cast<bool>(expr))
 
-using namespace continuo;
-using namespace continuo::http;
-using namespace continuo::transport;
+using namespace Mira;
+using namespace Mira::http;
+using namespace Mira::transport;
 using namespace std::chrono_literals;
 
 namespace {

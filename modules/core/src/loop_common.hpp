@@ -8,8 +8,8 @@
 // where the platforms genuinely differ, instead of drifting apart in code that
 // should be the same.
 
-#include "continuo/core/error.hpp"
-#include "continuo/core/operation.hpp"
+#include "Mira/core/error.hpp"
+#include "Mira/core/operation.hpp"
 
 #include <chrono>
 #include <coroutine>
@@ -24,7 +24,7 @@
 #include <utility>
 #include <vector>
 
-namespace continuo::detail {
+namespace Mira::detail {
 
 using Clock = std::chrono::steady_clock;
 
@@ -202,7 +202,7 @@ rejected_before_submit(const OperationOptions& options) noexcept {
 /// callback it was dispatching, then terminate.
 [[noreturn]] inline void report_dispatch_violation(const char* what) noexcept {
     std::fprintf(stderr,
-                 "continuo::EventLoop: %s.\n"
+                 "Mira::EventLoop: %s.\n"
                  "  The loop is midway through dispatching a batch: operations already taken\n"
                  "  out of its queues are waiting to be delivered, and on Windows a partially\n"
                  "  drained completion batch still refers to loop state. Destroying, replacing\n"
@@ -338,4 +338,4 @@ private:
     std::vector<std::function<void()>> queued_{};
 };
 
-}  // namespace continuo::detail
+}  // namespace Mira::detail

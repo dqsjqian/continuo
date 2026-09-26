@@ -1,8 +1,8 @@
-#include "continuo/transport/udp.hpp"
+#include "Mira/transport/udp.hpp"
 
 #include "socket_compat.hpp"
 
-namespace continuo::transport::udp {
+namespace Mira::transport::udp {
 
 struct Socket::State {
     EventLoop* loop{nullptr};
@@ -25,7 +25,7 @@ Socket& Socket::operator=(Socket&& other) noexcept {
 
 Result<Socket> Socket::bind(EventLoop& loop, const Endpoint& endpoint, BindOptions options) {
     if (endpoint.address_bytes().empty()) return fail(Errc::invalid_argument);
-#if CONTINUO_PLATFORM_WINDOWS
+#if MIRA_PLATFORM_WINDOWS
     const auto handle = ::WSASocketW(
         endpoint.native_family(), SOCK_DGRAM, IPPROTO_UDP, nullptr, 0, WSA_FLAG_OVERLAPPED);
 #else
@@ -36,7 +36,7 @@ Result<Socket> Socket::bind(EventLoop& loop, const Endpoint& endpoint, BindOptio
         detail::socket_t handle;
         ~Guard() { detail::close_socket(handle); }
     } guard{handle};
-#if CONTINUO_PLATFORM_WINDOWS
+#if MIRA_PLATFORM_WINDOWS
     const auto exclusive = detail::set_flag(handle, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, true);
     if (!exclusive) return fail(exclusive.error());
 #else
@@ -118,4 +118,4 @@ Task<Result<Datagram>> Socket::receive(std::shared_ptr<State> state,
     co_return Datagram{result->size, *peer};
 }
 
-}  // namespace continuo::transport::udp
+}  // namespace Mira::transport::udp

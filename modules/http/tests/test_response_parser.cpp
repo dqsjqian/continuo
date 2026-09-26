@@ -1,14 +1,14 @@
 #include "check.hpp"
-#include "continuo/http/response_parser.hpp"
-#include "continuo/http/serializer.hpp"
+#include "Mira/http/response_parser.hpp"
+#include "Mira/http/serializer.hpp"
 
 #include <string>
 #include <vector>
 
 #define CHECK_VALUE(expr) CHECK(static_cast<bool>(expr))
 
-using namespace continuo;
-using namespace continuo::http;
+using namespace Mira;
+using namespace Mira::http;
 
 namespace {
 std::span<const std::byte> bytes(std::string_view text) {

@@ -1,6 +1,6 @@
 # modules/transport — TCP
 
-`Socket` models `continuo::AsyncStream`, so a protocol written against the
+`Socket` models `Mira::AsyncStream`, so a protocol written against the
 concept accepts one without naming it. Implemented here:
 
 - `Endpoint` — numeric IPv4 / IPv6 addresses. No name resolution: DNS is a
@@ -11,7 +11,7 @@ concept accepts one without naming it. Implemented here:
   `shutdown_send`, and `close`.
 - `connect` — an outgoing connection with `ConnectOptions`.
 
-This layer may include `continuo/core/…` and nothing above it; the layering
+This layer may include `Mira/core/…` and nothing above it; the layering
 check in `tools/ci/check_layering.py` fails the build otherwise.
 
 Every operation takes `OperationOptions` and forwards it to the event loop
@@ -30,7 +30,7 @@ process **steal** a port another process is actively bound to — so two servers
 both "successfully" listen on one port and split the incoming connections
 between them.
 
-Continuo therefore does not expose `SO_REUSEADDR` as a portable flag. It
+Mirarefore does not expose `SO_REUSEADDR` as a portable flag. It
 exposes the *intent*, and each platform implements that intent with whatever
 combination of socket options actually produces it. `tcp.hpp` carries the full
 reasoning; this is a summary, not the specification.

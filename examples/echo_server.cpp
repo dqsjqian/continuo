@@ -1,4 +1,4 @@
-// A TCP echo server, in the shape Continuo intends.
+// A TCP echo server, in the shape Miraends.
 //
 // Three things here are the point, and none of them is the echoing:
 //
@@ -10,18 +10,18 @@
 //   * The scope's stop token is threaded into every read. That is what makes
 //     `request_stop()` actually end the connections rather than merely ask.
 //
-// Usage: continuo_echo_server [port] [connection-limit]
+// Usage: mira_echo_server [port] [connection-limit]
 //   port              0 (the default) binds an ephemeral loopback port
 //   connection-limit  total connections to accept, not a concurrency limit;
 //                     0 (the default) serves until the process is interrupted
 // A finite limit stops accepting, then waits for every peer to close its write
 // side. Process interruption uses the default signal behavior, not graceful shutdown.
 
-#include <continuo/core/event_loop.hpp>
-#include <continuo/core/stream.hpp>
-#include <continuo/core/task.hpp>
-#include <continuo/core/task_scope.hpp>
-#include <continuo/transport/tcp.hpp>
+#include <mira/core/event_loop.hpp>
+#include <mira/core/stream.hpp>
+#include <mira/core/task.hpp>
+#include <mira/core/task_scope.hpp>
+#include <mira/transport/tcp.hpp>
 
 #include <array>
 #include <charconv>
@@ -35,13 +35,13 @@
 #include <system_error>
 #include <utility>
 
-using continuo::EventLoop;
-using continuo::Errc;
-using continuo::Result;
-using continuo::Task;
-using continuo::TaskScope;
-using continuo::transport::Endpoint;
-namespace tcp = continuo::transport::tcp;
+using mira::EventLoop;
+using mira::Errc;
+using mira::Result;
+using mira::Task;
+using mira::TaskScope;
+using mira::transport::Endpoint;
+namespace tcp = mira::transport::tcp;
 
 namespace {
 
@@ -74,7 +74,7 @@ Task<void> echo(tcp::Socket socket, std::stop_token stop) {
         }
 
         const Result<void> written =
-            co_await continuo::write_all(socket, std::span{buffer}.first(*read), {.stop = stop});
+            co_await mira::write_all(socket, std::span{buffer}.first(*read), {.stop = stop});
         if (!written) {
             if (written.error() != Errc::cancelled) {
                 std::fprintf(stderr, "write: %s\n", written.error().message().c_str());

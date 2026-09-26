@@ -4,9 +4,9 @@
 // file asks it instead of testing compiler macros directly, and the layering
 // check fails the build on any file that forgets.
 
-#include "continuo/core/platform.hpp"
+#include "Mira/core/platform.hpp"
 
-#if defined(CONTINUO_IO_BACKEND_KQUEUE)
+#if defined(MIRA_IO_BACKEND_KQUEUE)
 
     #include "poller.hpp"
 
@@ -17,7 +17,7 @@
     #include <sys/types.h>
     #include <unistd.h>
 
-namespace continuo::detail {
+namespace Mira::detail {
 namespace {
 
 /// Wrap the current `errno` as an error_code in the system category, so that
@@ -133,6 +133,6 @@ Result<std::size_t> Poller::poll(std::span<ReadyEvent> out, int timeout_ms) noex
     return static_cast<std::size_t>(count);
 }
 
-}  // namespace continuo::detail
+}  // namespace Mira::detail
 
 #endif  // BSD-family

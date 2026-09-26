@@ -1,21 +1,21 @@
-#include "continuo/core/error.hpp"
+#include "Mira/core/error.hpp"
 
-#include "continuo/core/platform.hpp"
+#include "Mira/core/platform.hpp"
 
 #include <string>
 
-#if CONTINUO_PLATFORM_WINDOWS
+#if MIRA_PLATFORM_WINDOWS
 // clang-format off
     #include <winsock2.h>
 // clang-format on
 #endif
 
-namespace continuo {
+namespace Mira {
 namespace {
 
-class ContinuoCategory final : public std::error_category {
+class MiraCategory final : public std::error_category {
 public:
-    [[nodiscard]] const char* name() const noexcept override { return "continuo"; }
+    [[nodiscard]] const char* name() const noexcept override { return "Mira"; }
 
     [[nodiscard]] std::string message(int value) const override {
         switch (static_cast<Errc>(value)) {
@@ -36,10 +36,10 @@ public:
         case Errc::not_supported:
             return "not supported on this platform";
         }
-        return "unknown continuo error (" + std::to_string(value) + ")";
+        return "unknown Mira error (" + std::to_string(value) + ")";
     }
 
-    /// Map Continuo conditions onto the portable `std::errc` equivalents so
+    /// Map Miraditions onto the portable `std::errc` equivalents so
     /// that `ec == std::errc::timed_out` works across library boundaries.
     [[nodiscard]] std::error_condition default_error_condition(int value) const noexcept override {
         switch (static_cast<Errc>(value)) {
@@ -65,17 +65,17 @@ public:
 
 }  // namespace
 
-const std::error_category& continuo_category() noexcept {
-    static const ContinuoCategory category{};
+const std::error_category& mira_category() noexcept {
+    static const MiraCategory category{};
     return category;
 }
 
 std::error_code make_error_code(Errc e) noexcept {
-    return {static_cast<int>(e), continuo_category()};
+    return {static_cast<int>(e), mira_category()};
 }
 
 Error socket_error(int native_code) noexcept {
-#if CONTINUO_PLATFORM_WINDOWS
+#if MIRA_PLATFORM_WINDOWS
     // Translate the Winsock numbers that have a portable equivalent, so that
     // `ec == std::errc::connection_refused` means the same thing on every
     // platform. Anything unlisted keeps its native value — losing information
@@ -147,4 +147,4 @@ Error socket_error(int native_code) noexcept {
 #endif
 }
 
-}  // namespace continuo
+}  // namespace Mira

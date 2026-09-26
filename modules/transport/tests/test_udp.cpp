@@ -1,6 +1,6 @@
 #include "check.hpp"
-#include "continuo/core/stream.hpp"
-#include "continuo/transport/udp.hpp"
+#include "Mira/core/stream.hpp"
+#include "Mira/transport/udp.hpp"
 
 #include <array>
 #include <chrono>
@@ -12,12 +12,12 @@
 #include <thread>
 #include <vector>
 
-#if CONTINUO_HAS_READINESS_API
+#if MIRA_HAS_READINESS_API
     #include <poll.h>
 #endif
 
-using namespace continuo;
-using namespace continuo::transport;
+using namespace Mira;
+using namespace Mira::transport;
 using namespace std::chrono_literals;
 
 namespace {
@@ -105,7 +105,7 @@ Task<void> packets(EventLoop& loop, Family family) {
     std::stop_source stopped;
     stopped.request_stop();
     CHECK((co_await a->send_to(bytes("queued"), peer, budget())).has_value());
-#if CONTINUO_HAS_READINESS_API
+#if MIRA_HAS_READINESS_API
     pollfd queued{b->native_handle(), POLLIN, 0};
     CHECK(::poll(&queued, 1, 1000) == 1);
 #endif
@@ -146,11 +146,11 @@ void concurrency_and_cancel() {
     // 数据已入队时新操作仍不可越过老操作，不能仅在 readiness 挂起时判忙。
     std::optional<Result<std::size_t>> sent;
     collect(b.send_to(bytes("keep"), a.local_endpoint().value(), budget()), sent);
-#if CONTINUO_HAS_READINESS_API
+#if MIRA_HAS_READINESS_API
     pollfd queued{a.native_handle(), POLLIN, 0};
     CHECK(::poll(&queued, 1, 1000) == 1);
 #endif
-#if CONTINUO_PLATFORM_WINDOWS
+#if MIRA_PLATFORM_WINDOWS
     while (!sent)
         CHECK(loop.run_once(10ms).has_value());
     // IOCP 可能同批完成接收；额外挂起一笔再验证方向限制。
@@ -187,7 +187,7 @@ void concurrency_and_cancel() {
     drain(loop);
     CHECK(pending && !*pending && pending->error() == Errc::timed_out);
 
-#if CONTINUO_PLATFORM_WINDOWS
+#if MIRA_PLATFORM_WINDOWS
     // IOCP 即使发送立即完成，也必须等完成包，方向占位不能提前释放。
     std::optional<Result<std::size_t>> send_one, send_two;
     collect(c.send_to(bytes("one"), b.local_endpoint().value(), budget()), send_one);
@@ -246,14 +246,14 @@ void close_ready_batch() {
     std::optional<Result<std::size_t>> sent_a, sent_b;
     collect(sender_a.send_to(bytes("a"), a.local_endpoint().value()), sent_a);
     collect(sender_b.send_to(bytes("b"), b.local_endpoint().value()), sent_b);
-#if CONTINUO_HAS_READINESS_API
+#if MIRA_HAS_READINESS_API
     // 不驱动 loop，先确认两 fd 都已就绪，保证测试真的覆盖同批关闭。
     pollfd readiness[2]{{a.native_handle(), POLLIN, 0}, {b.native_handle(), POLLIN, 0}};
     CHECK(::poll(&readiness[0], 1, 1000) == 1);
     CHECK(::poll(&readiness[1], 1, 1000) == 1);
 #endif
     drain(loop);
-#if CONTINUO_PLATFORM_WINDOWS
+#if MIRA_PLATFORM_WINDOWS
     // IOCP 已分类的完成可成功；关闭尚未分类的完成则返回 cancelled。
     CHECK(success >= 1);
     CHECK(success + cancelled == 2);

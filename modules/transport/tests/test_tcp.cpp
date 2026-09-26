@@ -10,8 +10,8 @@
 // mean the public API leaked a platform detail.
 
 #include "check.hpp"
-#include "continuo/core/stream.hpp"
-#include "continuo/transport/tcp.hpp"
+#include "Mira/core/stream.hpp"
+#include "Mira/transport/tcp.hpp"
 
 #include <array>
 #include <atomic>
@@ -28,8 +28,8 @@
 #include <string_view>
 #include <utility>
 
-using namespace continuo;
-using namespace continuo::transport;
+using namespace Mira;
+using namespace Mira::transport;
 using namespace std::chrono_literals;
 
 namespace {

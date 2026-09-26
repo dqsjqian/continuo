@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enforce Continuo's architectural invariants at build time.
+"""Enforce Mirarchitectural invariants at build time.
 
 These rules exist because the failure mode they prevent is *gradual*. Nobody
 decides to weld the socket layer to the parser; it happens one include at a
@@ -16,7 +16,7 @@ Rule 1 — layering is one-way.
 
 Rule 2 — no host framework dependency.
 
-    Continuo must stay usable without Aria (or any other framework). Hosts
+    Mirat stay usable without Aria (or any other framework). Hosts
     integrate through the executor and stream seams; a single `#include
     <aria/...>` anywhere in the library would turn an optional adapter into a
     hard dependency for every consumer.
@@ -24,7 +24,7 @@ Rule 2 — no host framework dependency.
 Rule 3 — platform detection has exactly one home.
 
     Only `platform.hpp` may test raw compiler macros (`_WIN32`, `__linux__`,
-    `__APPLE__`, ...). Everywhere else asks it via `CONTINUO_*`. Scattered
+    `__APPLE__`, ...). Everywhere else asks it via `MIRA_*`. Scattered
     `#ifdef _WIN32` is how a library ends up with a first-class POSIX path and
     a Windows path nobody can reason about — and why "supports Windows" starts
     meaning "compiles on Windows".
@@ -61,22 +61,22 @@ LAYERS: dict[str, tuple[str, ...]] = {
 
 # Layer -> include path prefixes it is not allowed to reach for.
 FORBIDDEN_INCLUDES: dict[str, tuple[str, ...]] = {
-    "core": ("continuo/tls/", "openssl/", "continuo/transport/", "continuo/http/", "continuo/ws/",
-             "continuo/h2/", "continuo/h3/", "continuo/dns/", "continuo/http2/", "continuo/http3/",
-             "continuo/quic/", "nghttp2/", "nghttp3/", "ngtcp2/"),
-    "transport": ("continuo/tls/", "openssl/", "continuo/http/", "continuo/ws/", "continuo/h2/",
-                  "continuo/h3/", "continuo/dns/", "continuo/http2/", "continuo/http3/",
-                  "continuo/quic/", "nghttp2/", "nghttp3/", "ngtcp2/"),
-    "tls": ("continuo/transport/", "continuo/http/", "continuo/ws/", "continuo/h2/",
-            "continuo/h3/", "continuo/dns/", "continuo/http2/", "continuo/http3/", "continuo/quic/"),
-    "quic": ("continuo/http/", "continuo/http2/", "continuo/http3/", "continuo/h2/",
-             "continuo/h3/", "nghttp2/", "nghttp3/"),
-    "protocol": ("openssl/", "continuo/tls/", "continuo/transport/"),
+    "core": ("Mira/tls/", "openssl/", "Mira/transport/", "Mira/http/", "Mira/ws/",
+             "Mira/h2/", "Mira/h3/", "Mira/dns/", "Mira/http2/", "Mira/http3/",
+             "Mira/quic/", "nghttp2/", "nghttp3/", "ngtcp2/"),
+    "transport": ("Mira/tls/", "openssl/", "Mira/http/", "Mira/ws/", "Mira/h2/",
+                  "Mira/h3/", "Mira/dns/", "Mira/http2/", "Mira/http3/",
+                  "Mira/quic/", "nghttp2/", "nghttp3/", "ngtcp2/"),
+    "tls": ("Mira/transport/", "Mira/http/", "Mira/ws/", "Mira/h2/",
+            "Mira/h3/", "Mira/dns/", "Mira/http2/", "Mira/http3/", "Mira/quic/"),
+    "quic": ("Mira/http/", "Mira/http2/", "Mira/http3/", "Mira/h2/",
+             "Mira/h3/", "nghttp2/", "nghttp3/"),
+    "protocol": ("openssl/", "Mira/tls/", "Mira/transport/"),
 }
 
 # Include prefixes no layer may use, with the reason reported to the user.
 BANNED_EVERYWHERE: dict[str, str] = {
-    "aria/": "Continuo must not depend on Aria; hosts integrate via the executor/stream seams",
+    "aria/": "Mirat not depend on Aria; hosts integrate via the executor/stream seams",
 }
 
 # OS headers a protocol module must never reach for.
@@ -88,14 +88,14 @@ PLATFORM_HEADER_PREFIXES: tuple[str, ...] = (
 )
 
 # Raw compiler macros that only platform.hpp may test. Everything else uses the
-# CONTINUO_* macros it derives.
+# MIRA_* macros it derives.
 RAW_PLATFORM_MACROS: tuple[str, ...] = (
     "_WIN32", "_WIN64", "__linux__", "__APPLE__", "__ANDROID__",
     "__FreeBSD__", "__OpenBSD__", "__NetBSD__", "TARGET_OS_IPHONE",
 )
 
 # The single file allowed to do platform detection, relative to repo root.
-PLATFORM_DETECTION_HOME = "modules/core/include/continuo/core/platform.hpp"
+PLATFORM_DETECTION_HOME = "modules/core/include/Mira/core/platform.hpp"
 
 INCLUDE_RE = re.compile(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]')
 
@@ -150,7 +150,7 @@ def check(repo_root: Path) -> list[str]:
                         if re.search(rf"\b{re.escape(macro)}\b", expression):
                             violations.append(
                                 f"{display}:{lineno}: tests raw platform macro '{macro}' — "
-                                f"use the CONTINUO_* macros from {PLATFORM_DETECTION_HOME}"
+                                f"use the MIRA_* macros from {PLATFORM_DETECTION_HOME}"
                             )
 
             match = INCLUDE_RE.match(line)

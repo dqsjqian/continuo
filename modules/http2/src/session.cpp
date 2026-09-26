@@ -1,4 +1,4 @@
-#include "continuo/http2/session.hpp"
+#include "Mira/http2/session.hpp"
 
 #include <nghttp2/nghttp2.h>
 
@@ -11,11 +11,11 @@
 #include <string_view>
 #include <utility>
 
-namespace continuo::http2 {
+namespace Mira::http2 {
 namespace {
 class EngineCategory final : public std::error_category {
 public:
-    const char* name() const noexcept override { return "continuo.http2"; }
+    const char* name() const noexcept override { return "Mira.http2"; }
     std::string message(int value) const override { return nghttp2_strerror(value); }
 };
 
@@ -483,4 +483,4 @@ std::uint32_t Session::peer_goaway_error() const noexcept { return impl_->peer_e
 bool Session::wants_write() const noexcept {
     return impl_->state != State::closed && impl_->state != State::failed && nghttp2_session_want_write(impl_->session);
 }
-} // namespace continuo::http2
+} // namespace Mira::http2

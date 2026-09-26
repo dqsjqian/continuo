@@ -14,8 +14,8 @@
 // two different requests in one byte stream.
 
 #include "check.hpp"
-#include "continuo/core/buffer.hpp"
-#include "continuo/http/parser.hpp"
+#include "Mira/core/buffer.hpp"
+#include "Mira/http/parser.hpp"
 
 #include <cstddef>
 #include <cstring>
@@ -24,8 +24,8 @@
 #include <string_view>
 #include <vector>
 
-using namespace continuo;
-using namespace continuo::http;
+using namespace Mira;
+using namespace Mira::http;
 
 namespace {
 
@@ -505,7 +505,7 @@ void test_error_reporting() {
     // violation instead of just "400".
     const Error error = make_error_code(ParseError::framing_conflict);
     CHECK(error.category() == parse_category());
-    CHECK(std::string_view{error.category().name()} == "continuo.http");
+    CHECK(std::string_view{error.category().name()} == "Mira.http");
     CHECK(error.message() == "Content-Length conflicts with Transfer-Encoding");
 
     // Implicit conversion through is_error_code_enum.

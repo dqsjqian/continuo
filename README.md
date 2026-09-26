@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🎵 Continuo
+# 🎵 Mira
 
 **C++23 协程网络库 · 传输为基，协议其上** · TCP / UDP / TLS / HTTP/1.1 / HTTP/2 · 实验性 QUIC / HTTP/3
 
@@ -8,7 +8,7 @@
 
 [![C++23](https://img.shields.io/badge/C%2B%2B-23-blue.svg)](https://en.cppreference.com/w/cpp/23)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![CI](https://github.com/dqsjqian/continuo/actions/workflows/ci.yml/badge.svg)](https://github.com/dqsjqian/continuo/actions/workflows/ci.yml)
+[![CI](https://github.com/dqsjqian/Mira/actions/workflows/ci.yml/badge.svg)](https://github.com/dqsjqian/Mira/actions/workflows/ci.yml)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20iOS%20%7C%20Android-lightgrey.svg)](#平台与证据边界)
 
 [English](README.en.md) | 简体中文
@@ -17,28 +17,28 @@
 
 ---
 
-> *Basso continuo*，通奏低音：持续演奏的低音声部，为整首乐曲提供基础。
-> Continuo 想做网络软件的这一层基础 —— 不是又一个包办一切的 HTTP 框架。
+> *Basso Mira*，通奏低音：持续演奏的低音声部，为整首乐曲提供基础。
+> Mira络软件的这一层基础 —— 不是又一个包办一切的 HTTP 框架。
 
 **当前阶段：一期协议实现进行中，还不是生产就绪的网络栈。** API 会随契约完善继续演进，暂不承诺稳定 ABI。
 
-## 🚀 30 秒看懂 Continuo
+## 🚀 30 秒看懂 Mira
 
 一个 TCP echo，就是整个库的世界观：**你 `co_await` 一个完成，库负责跨平台**。
 
 ```cpp
-continuo::Task<continuo::Result<void>>
-echo_tcp(continuo::transport::tcp::Socket& socket) {
+Mira::Task<Mira::Result<void>>
+echo_tcp(Mira::transport::tcp::Socket& socket) {
     std::array<std::byte, 4096> buffer{};
     for (;;) {
         auto read = co_await socket.read_some(buffer);   // kqueue/epoll/IOCP 都长这样
         if (!read) {
-            if (read.error() == continuo::Errc::eof) co_return continuo::Result<void>{};
-            co_return continuo::fail(read.error());
+            if (read.error() == Mira::Errc::eof) co_return Mira::Result<void>{};
+            co_return Mira::fail(read.error());
         }
-        auto written = co_await continuo::write_all(
+        auto written = co_await Mira::write_all(
             socket, std::span<const std::byte>{buffer}.first(*read));
-        if (!written) co_return continuo::fail(written.error());
+        if (!written) co_return Mira::fail(written.error());
     }
 }
 ```
@@ -46,24 +46,24 @@ echo_tcp(continuo::transport::tcp::Socket& socket) {
 HTTP 服务长同一个样子 —— 处理函数是模板自由函数，**换成 TLS 流，代码一个字不用改**：
 
 ```cpp
-template<continuo::AsyncStream Stream>
-continuo::Task<continuo::Result<void>> hello(
-    const continuo::http::Request&,
-    continuo::http::ResponseWriter<Stream>& writer,
+template<Mira::AsyncStream Stream>
+Mira::Task<Mira::Result<void>> hello(
+    const Mira::http::Request&,
+    Mira::http::ResponseWriter<Stream>& writer,
     std::span<const std::byte>) {
-    continuo::http::Response response;
+    Mira::http::Response response;
     response.status = 200;
     response.headers.append("Content-Type", "text/plain; charset=utf-8");
-    std::string_view body = "hello, continuo\n";
+    std::string_view body = "hello, Mira\n";
     co_return co_await writer.send(response, {
         reinterpret_cast<const std::byte*>(body.data()), body.size()});
 }
 
-// TCP 上：co_await continuo::http::serve_connection(socket, &hello<tcp::Socket>);
-// TLS 上：co_await continuo::http::serve_connection(tls_stream, &hello<tls::Stream<tcp::Socket>>);
+// TCP 上：co_await Mira::http::serve_connection(socket, &hello<tcp::Socket>);
+// TLS 上：co_await Mira::http::serve_connection(tls_stream, &hello<tls::Stream<tcp::Socket>>);
 ```
 
-## 🎯 为什么是 Continuo
+## 🎯 为什么是 Mira
 
 | 设计抉择 | 一句话 |
 |---|---|
@@ -97,12 +97,12 @@ flowchart TB
 
 | 模块 | 职责 |
 |---|---|
-| `continuo::core` | 协程与任务作用域、错误、流与执行器接口、缓冲、事件循环和定时器 |
-| `continuo::transport` | IP 端点、TCP（默认独占绑定）、保持消息边界的 UDP、有界后台系统解析器 |
-| `continuo::tls` | 可选 TLS 流、证书与主机名验证、mTLS 客户端验证、多协议 ALPN |
-| `continuo::http` | HTTP/1 请求 / 响应解析、序列化、单连接服务（含 chunked 流式响应）与客户端 |
-| `continuo::http2` | 可选 nghttp2 Session、多流状态与泛型流适配 |
-| `continuo::quic` / `continuo::http3` | 实验性 QUIC v1 与 nghttp3 / QPACK 引擎 |
+| `Mira::core` | 协程与任务作用域、错误、流与执行器接口、缓冲、事件循环和定时器 |
+| `Mira::transport` | IP 端点、TCP（默认独占绑定）、保持消息边界的 UDP、有界后台系统解析器 |
+| `Mira::tls` | 可选 TLS 流、证书与主机名验证、mTLS 客户端验证、多协议 ALPN |
+| `Mira::http` | HTTP/1 请求 / 响应解析、序列化、单连接服务（含 chunked 流式响应）与客户端 |
+| `Mira::http2` | 可选 nghttp2 Session、多流状态与泛型流适配 |
+| `Mira::quic` / `Mira::http3` | 实验性 QUIC v1 与 nghttp3 / QPACK 引擎 |
 
 分层由 `tools/ci/check_layering.py` 强制检查：禁止反向依赖与宿主框架头文件，平台识别集中在 `platform.hpp`，协议模块不包含 OS 头文件。
 
@@ -112,9 +112,9 @@ flowchart TB
 <summary><b>TaskScope：结构化并发，显式生命周期</b></summary>
 
 ```cpp
-continuo::Task<int> count_after_delay(continuo::EventLoop& loop) {
+Mira::Task<int> count_after_delay(Mira::EventLoop& loop) {
     int count = 0;
-    continuo::TaskScope scope;
+    Mira::TaskScope scope;
     scope.spawn(delayed_increment(loop, scope.get_stop_token(), count));
     co_await scope.join();          // 等所有子任务清完才返回
     co_return count;                // count 就在父帧里，不会悬空
@@ -132,7 +132,7 @@ continuo::Task<int> count_after_delay(continuo::EventLoop& loop) {
 ```cpp
 co_return co_await loop.read(handle, into,
     {.stop    = std::move(stop),
-     .deadline = continuo::EventLoop::Clock::now() + 5s});
+     .deadline = Mira::EventLoop::Clock::now() + 5s});
 ```
 
 | 情形 | 结果 |
@@ -150,14 +150,14 @@ co_return co_await loop.read(handle, into,
 
 ```cpp
 // 服务端：证书 + 私钥，可选强制客户端证书（mTLS）与最低协议版本
-auto ctx = continuo::tls::Context::server({
+auto ctx = Mira::tls::Context::server({
     .cert_file = "server.pem", .key_file = "server-key.pem",
     .client_ca_file = "ca.pem",      // 非空 = 强制 mTLS
     .min_version = "1.2",            // "1.2" / "1.3"
 });
 
 // 客户端：验证证书链与主机名；可选出示客户端证书
-auto client = continuo::tls::Context::client({
+auto client = Mira::tls::Context::client({
     .ca_file = "ca.pem", .cert_file = "client.pem", .key_file = "client-key.pem",
 });
 ```
@@ -219,8 +219,8 @@ auto client = continuo::tls::Context::client({
 非 TLS 构建零第三方依赖。
 
 ```bash
-git clone https://github.com/dqsjqian/continuo.git
-cd continuo
+git clone https://github.com/dqsjqian/Mira.git
+cd Mira
 cmake -S . -B build/debug -DCMAKE_BUILD_TYPE=Debug
 cmake --build build/debug -j
 ctest --test-dir build/debug --output-on-failure
@@ -233,7 +233,7 @@ cmake -S . -B build/tls -DCMAKE_BUILD_TYPE=Debug -DCONTINUO_ENABLE_TLS=ON
 cmake --build build/tls -j && ctest --test-dir build/tls --output-on-failure
 ```
 
-可选高版本协议：`CONTINUO_ENABLE_HTTP2=ON` / `CONTINUO_ENABLE_HTTP3=ON`（默认关闭，不自动联网下载；依赖版本由 `tools/ci/build_protocol_deps.py` SHA256 固定）。
+可选高版本协议：`MIRA_ENABLE_HTTP2=ON` / `MIRA_ENABLE_HTTP3=ON`（默认关闭，不自动联网下载；依赖版本由 `tools/ci/build_protocol_deps.py` SHA256 固定）。
 
 ### 📦 在自己的项目中使用
 
@@ -242,19 +242,19 @@ cmake --build build/tls -j && ctest --test-dir build/tls --output-on-failure
 ```cmake
 include(ariaFetchPinned)  # 或你自己仓库里的等价「下载 + SHA256 校验」原语
 aria_fetch_pinned_archive(
-    NAME      continuo
+    NAME      Mira
     VERSION   0.1.2
-    URL       "https://github.com/dqsjqian/continuo/releases/download/v0.1.2/continuo-0.1.2.tar.gz"
+    URL       "https://github.com/dqsjqian/Mira/releases/download/v0.1.2/Mira-0.1.2.tar.gz"
     SHA256    508c56092c004bda7e7e606e2c266fab8a918b38bab46c96b37604862681dafa
 )
-set(CONTINUO_BUILD_TESTS OFF)
-set(CONTINUO_BUILD_EXAMPLES OFF)
-add_subdirectory(${ARIA_PINNED_CONTINUO_SOURCE_DIR} continuo)
-target_link_libraries(my_app PRIVATE continuo::transport continuo::http)
-# TLS：同时 set(CONTINUO_ENABLE_TLS ON) 并额外链接 continuo::tls
+set(MIRA_BUILD_TESTS OFF)
+set(MIRA_BUILD_EXAMPLES OFF)
+add_subdirectory(${ARIA_PINNED_MIRA_SOURCE_DIR} Mira)
+target_link_libraries(my_app PRIVATE Mira::transport Mira::http)
+# TLS：同时 set(MIRA_ENABLE_TLS ON) 并额外链接 Mira::tls
 ```
 
-本地开发也可以直接指向源码树：`add_subdirectory(vendor/continuo)`（子目录模式下 `CONTINUO_BUILD_TESTS` 默认关闭）。安装消费则用 `find_package(continuo REQUIRED COMPONENTS core transport http)`，需要 TLS 时加 `tls` 组件。
+本地开发也可以直接指向源码树：`add_subdirectory(vendor/Mira)`（子目录模式下 `MIRA_BUILD_TESTS` 默认关闭）。安装消费则用 `find_package(Mira REQUIRED COMPONENTS core transport http)`，需要 TLS 时加 `tls` 组件。
 
 Android 需 **NDK 29 或更新**：NDK 27/28 的 libc++ 把 `std::stop_token` 门控关闭了；NDK 29（clang 21）在 API 24 上实测可构建。
 
@@ -278,7 +278,7 @@ Android 需 **NDK 29 或更新**：NDK 27/28 的 libc++ 把 `std::stop_token` �
 
 ## 📄 License
 
-[MIT](LICENSE) © 2026 continuo contributors
+[MIT](LICENSE) © 2026 Mira contributors
 
 ---
 

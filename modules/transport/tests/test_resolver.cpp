@@ -1,5 +1,5 @@
 #include "check.hpp"
-#include "continuo/transport/resolver.hpp"
+#include "Mira/transport/resolver.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -12,8 +12,8 @@
 #include <thread>
 #include <utility>
 
-using namespace continuo;
-using namespace continuo::transport;
+using namespace Mira;
+using namespace Mira::transport;
 using namespace std::chrono_literals;
 
 namespace {

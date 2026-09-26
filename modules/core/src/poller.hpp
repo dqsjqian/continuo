@@ -14,13 +14,13 @@
 // still interested; one-shot pushes that decision back to the caller, which is
 // where it belongs.
 
-#include "continuo/core/error.hpp"
+#include "Mira/core/error.hpp"
 
 #include <cstddef>
 #include <span>
 #include <utility>
 
-namespace continuo::detail {
+namespace Mira::detail {
 
 /// What a waiter is waiting for.
 enum class Interest : unsigned {
@@ -94,4 +94,4 @@ private:
     int handle_{-1};
 };
 
-}  // namespace continuo::detail
+}  // namespace Mira::detail

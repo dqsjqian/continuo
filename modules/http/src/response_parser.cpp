@@ -1,12 +1,12 @@
-#include "continuo/http/response_parser.hpp"
+#include "Mira/http/response_parser.hpp"
 
-#include "continuo/http/serializer.hpp"
+#include "Mira/http/serializer.hpp"
 #include "grammar.hpp"
 
 #include <algorithm>
 #include <charconv>
 
-namespace continuo::http {
+namespace Mira::http {
 namespace {
 struct Line {
     std::string_view text;
@@ -244,4 +244,4 @@ Result<ParseStep> ResponseParser::advance(Buffer& input, bool eof) {
     }
 }
 
-}  // namespace continuo::http
+}  // namespace Mira::http

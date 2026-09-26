@@ -1,6 +1,6 @@
-#include "continuo/http2/session.hpp"
-#include "continuo/http2/connection.hpp"
-#include "continuo/core/event_loop.hpp"
+#include "Mira/http2/session.hpp"
+#include "Mira/http2/connection.hpp"
+#include "Mira/core/event_loop.hpp"
 #include "check.hpp"
 
 #include <nghttp2/nghttp2.h>
@@ -10,8 +10,8 @@
 #include <string>
 #include <vector>
 
-using namespace continuo;
-using namespace continuo::http2;
+using namespace Mira;
+using namespace Mira::http2;
 
 Headers request_headers(std::string method = "GET") {
     return {{":method", std::move(method)}, {":scheme", "https"}, {":authority", "localhost"}, {":path", "/"}};

@@ -15,11 +15,11 @@
 // thing that exercises this file; treat its first green run as the real
 // verification, not this comment.
 
-#include "continuo/core/platform.hpp"
+#include "Mira/core/platform.hpp"
 
-#if CONTINUO_PLATFORM_WINDOWS
+#if MIRA_PLATFORM_WINDOWS
 
-    #include "continuo/core/event_loop.hpp"
+    #include "Mira/core/event_loop.hpp"
 
 // clang-format off
 #    include <winsock2.h>
@@ -46,7 +46,7 @@
     #pragma comment(lib, "ws2_32.lib")
 #endif
 
-namespace continuo {
+namespace Mira {
 namespace {
 
 [[nodiscard]] Error last_os_error() noexcept {
@@ -1232,6 +1232,6 @@ Task<void> EventLoop::yield() {
     co_return;
 }
 
-}  // namespace continuo
+}  // namespace Mira
 
-#endif  // CONTINUO_PLATFORM_WINDOWS
+#endif  // MIRA_PLATFORM_WINDOWS

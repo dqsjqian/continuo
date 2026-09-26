@@ -1,8 +1,8 @@
-#include "continuo/quic/engine.hpp"
+#include "Mira/quic/engine.hpp"
 
 #include <ngtcp2/ngtcp2.h>
 #if NGTCP2_VERSION_NUM < 0x011601
-    #error "continuo::quic requires ngtcp2 >= 1.22.1"
+    #error "Mira::quic requires ngtcp2 >= 1.22.1"
 #endif
 #include <algorithm>
 #include <array>
@@ -16,7 +16,7 @@
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
 
-namespace continuo::quic {
+namespace Mira::quic {
 namespace {
 // 引擎自有错误码，取远离 ngtcp2 原生负码的区间。
 constexpr int invalid = -100000;
@@ -24,7 +24,7 @@ constexpr int budget = -100001;
 
 class QuicCategory final : public std::error_category {
 public:
-    const char* name() const noexcept override { return "continuo.quic"; }
+    const char* name() const noexcept override { return "Mira.quic"; }
     std::string message(int code) const override {
         if (code == invalid) return "invalid QUIC argument or state";
         if (code == budget) return "QUIC resource budget exceeded";
@@ -574,4 +574,4 @@ Result<Bytes> Engine::close(std::uint64_t code, std::uint64_t now) {
     s.ended = true;
     return packet;
 }
-}  // namespace continuo::quic
+}  // namespace Mira::quic

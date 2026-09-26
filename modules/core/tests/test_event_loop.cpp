@@ -10,13 +10,13 @@
 // keeps every test deterministic — no sleeps, no "should be enough time".
 
 #include "check.hpp"
-#include "continuo/core/buffer.hpp"
-#include "continuo/core/error.hpp"
-#include "continuo/core/event_loop.hpp"
-#include "continuo/core/platform.hpp"
-#include "continuo/core/task.hpp"
+#include "Mira/core/buffer.hpp"
+#include "Mira/core/error.hpp"
+#include "Mira/core/event_loop.hpp"
+#include "Mira/core/platform.hpp"
+#include "Mira/core/task.hpp"
 
-#include "continuo/core/operation.hpp"
+#include "Mira/core/operation.hpp"
 
 #include <array>
 #include <atomic>
@@ -37,12 +37,12 @@
 #include <utility>
 #include <vector>
 
-#if !CONTINUO_PLATFORM_WINDOWS
+#if !MIRA_PLATFORM_WINDOWS
     #include <sys/socket.h>
     #include <unistd.h>
 #endif
 
-using namespace continuo;
+using namespace Mira;
 using namespace std::chrono_literals;
 
 namespace {
@@ -104,7 +104,7 @@ bool drive(EventLoop& loop, std::atomic<bool>& finished, Body body, int budget =
 class HandlePair {
 public:
     HandlePair() {
-#if CONTINUO_PLATFORM_WINDOWS
+#if MIRA_PLATFORM_WINDOWS
         // A loopback TCP pair stands in for socketpair(), which Winsock lacks.
         // Only reached on the Windows CI job.
         ok_ = false;
@@ -120,7 +120,7 @@ public:
     HandlePair& operator=(const HandlePair&) = delete;
 
     ~HandlePair() {
-#if !CONTINUO_PLATFORM_WINDOWS
+#if !MIRA_PLATFORM_WINDOWS
         if (first_ >= 0) {
             ::close(first_);
         }
@@ -136,7 +136,7 @@ public:
 
     /// Write directly, bypassing the loop — simulates the peer.
     void peer_send(std::string_view payload) const {
-#if !CONTINUO_PLATFORM_WINDOWS
+#if !MIRA_PLATFORM_WINDOWS
         const ssize_t written = ::write(second_, payload.data(), payload.size());
         (void)written;
 #else
@@ -145,7 +145,7 @@ public:
     }
 
     void peer_close() {
-#if !CONTINUO_PLATFORM_WINDOWS
+#if !MIRA_PLATFORM_WINDOWS
         if (second_ >= 0) {
             ::close(second_);
             second_ = -1;
@@ -162,7 +162,7 @@ public:
     /// registration alone" is an observable claim rather than a hope. Requires
     /// the descriptor to be non-blocking, which `attach` has already ensured.
     [[nodiscard]] std::size_t fill_send_buffer() const {
-#if CONTINUO_PLATFORM_WINDOWS
+#if MIRA_PLATFORM_WINDOWS
         return 0;
 #else
         std::array<std::byte, 4096> block{};
@@ -179,7 +179,7 @@ public:
 
     /// Consume some of what we sent, making room in the send buffer again.
     void peer_drain(std::size_t bytes) const {
-#if CONTINUO_PLATFORM_WINDOWS
+#if MIRA_PLATFORM_WINDOWS
         (void)bytes;
 #else
         std::array<std::byte, 4096> block{};
@@ -636,7 +636,7 @@ void test_options_rejected_before_submit() {
     CHECK(plain_done.load(std::memory_order_acquire) == 1);
     CHECK(plain.value_or(999) == 0);
 
-#if CONTINUO_HAS_READINESS_API
+#if MIRA_HAS_READINESS_API
     // The readiness extension has no syscall of its own to guard, so its only
     // check is the one every submission shares. Without it the wait would
     // park, be cancelled by the callback, and need a pump to come back —
@@ -716,7 +716,7 @@ void test_cancel_in_flight() {
     CHECK(done.load(std::memory_order_acquire) == 1);
 }
 
-#if CONTINUO_HAS_READINESS_API
+#if MIRA_HAS_READINESS_API
 /// Only meaningful where readiness is the mechanism: `wait_readable` and
 /// `wait_writable` are not declared on IOCP, so this is compiled out rather
 /// than skipped, which is the honest shape for a platform extension.
@@ -847,7 +847,7 @@ void test_detach_and_shutdown_resume_waiters() {
         CHECK(write_outcome.error() == Errc::cancelled);
     }
 }
-#endif  // CONTINUO_HAS_READINESS_API
+#endif  // MIRA_HAS_READINESS_API
 
 void test_deadline_on_a_suspended_read() {
     test::section("deadline on a read that never becomes ready");
@@ -1368,7 +1368,7 @@ int run_contract_violation(std::string_view mode) {
         EventLoop& loop = created.value();
         loop.post([&loop] { (void)loop.run_once(0ms); });
         (void)loop.run_once(0ms);
-#if CONTINUO_HAS_READINESS_API
+#if MIRA_HAS_READINESS_API
     } else if (mode == "destroy-during-detach" ||
                mode == "reentrant-run-once-during-detach") {
         // 已释放 mutex 的 system_error 也会触发 terminate；不能误认作契约保护。
@@ -1438,7 +1438,7 @@ int main(int argc, char** argv) {
     test_yield_returns_to_loop();
     test_options_rejected_before_submit();
     test_cancel_in_flight();
-#if CONTINUO_HAS_READINESS_API
+#if MIRA_HAS_READINESS_API
     test_cancel_leaves_other_direction_armed();
     test_detach_and_shutdown_resume_waiters();
 #endif

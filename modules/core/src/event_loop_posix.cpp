@@ -7,11 +7,11 @@
 // emulation, and it is why the Windows backend can be a direct IOCP mapping
 // instead of the other way around.
 
-#include "continuo/core/platform.hpp"
+#include "Mira/core/platform.hpp"
 
-#if CONTINUO_HAS_READINESS_API
+#if MIRA_HAS_READINESS_API
 
-    #include "continuo/core/event_loop.hpp"
+    #include "Mira/core/event_loop.hpp"
     #include "loop_common.hpp"
     #include "poller.hpp"
 
@@ -27,7 +27,7 @@
     #include <utility>
     #include <vector>
 
-namespace continuo {
+namespace Mira {
 namespace {
 
 [[nodiscard]] Error last_os_error() noexcept {
@@ -1014,7 +1014,7 @@ Task<void> EventLoop::yield() {
     co_return;
 }
 
-    #if CONTINUO_HAS_READINESS_API
+    #if MIRA_HAS_READINESS_API
 Task<Result<void>> EventLoop::wait_readable(NativeHandle handle, OperationOptions options) {
     return wait_for(handle, /*writable=*/false, std::move(options));
 }
@@ -1024,6 +1024,6 @@ Task<Result<void>> EventLoop::wait_writable(NativeHandle handle, OperationOption
 }
     #endif
 
-}  // namespace continuo
+}  // namespace Mira
 
-#endif  // CONTINUO_HAS_READINESS_API
+#endif  // MIRA_HAS_READINESS_API

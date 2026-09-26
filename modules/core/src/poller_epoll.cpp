@@ -5,9 +5,9 @@
 // transliteration of the kqueue backend rather than growing Linux-specific
 // cleverness.
 
-#include "continuo/core/platform.hpp"
+#include "Mira/core/platform.hpp"
 
-#if defined(CONTINUO_IO_BACKEND_EPOLL)
+#if defined(MIRA_IO_BACKEND_EPOLL)
 
     #include "poller.hpp"
 
@@ -16,7 +16,7 @@
     #include <sys/epoll.h>
     #include <unistd.h>
 
-namespace continuo::detail {
+namespace Mira::detail {
 namespace {
 
 [[nodiscard]] Error last_os_error() noexcept {
@@ -114,6 +114,6 @@ Result<std::size_t> Poller::poll(std::span<ReadyEvent> out, int timeout_ms) noex
     return static_cast<std::size_t>(count);
 }
 
-}  // namespace continuo::detail
+}  // namespace Mira::detail
 
 #endif  // __linux__

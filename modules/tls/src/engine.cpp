@@ -1,4 +1,4 @@
-#include "continuo/tls/engine.hpp"
+#include "Mira/tls/engine.hpp"
 
 #include "context_impl.hpp"
 
@@ -7,7 +7,7 @@
 #include <openssl/x509v3.h>
 #include <string>
 
-namespace continuo::tls {
+namespace Mira::tls {
 
 struct Engine::Impl {
     SSL* ssl = nullptr;
@@ -53,7 +53,7 @@ Result<Engine> Engine::create(const Context& context, std::string_view peer_name
     if (!context.impl_) return fail(make_error_code(Errc::invalid_state));
     if (context.impl_->client &&
         (peer_name.empty() || peer_name.find('\0') != std::string_view::npos))
-        return fail(continuo::Errc::invalid_argument);
+        return fail(Mira::Errc::invalid_argument);
     auto impl = std::make_unique<Impl>();
     ERR_clear_error();
     impl->ssl = SSL_new(context.impl_->handle);
@@ -187,7 +187,7 @@ Result<std::size_t> Engine::feed(std::span<const std::byte> ciphertext) {
     if (!impl_ || impl_->failed) return fail(make_error_code(Errc::invalid_state));
     if (ciphertext.empty()) return std::size_t{0};
     const auto size = std::min(ciphertext.size(), input_capacity());
-    if (size == 0) return fail(continuo::Errc::would_block);
+    if (size == 0) return fail(Mira::Errc::would_block);
     ERR_clear_error();
     const int count = BIO_write(impl_->wire, ciphertext.data(), static_cast<int>(size));
     if (count <= 0) {
@@ -215,4 +215,4 @@ void Engine::invalidate() noexcept {
     if (impl_) impl_->failed = true;
 }
 
-}  // namespace continuo::tls
+}  // namespace Mira::tls

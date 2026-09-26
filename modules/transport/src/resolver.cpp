@@ -1,4 +1,4 @@
-#include "continuo/transport/resolver.hpp"
+#include "Mira/transport/resolver.hpp"
 
 // GCC 14/15 inlines the expected<vector<Endpoint>, error_code> move out of
 // the job's optional and reports _M_end_of_storage (stl_vector.h:106) as
@@ -22,14 +22,14 @@
 #include <thread>
 #include <utility>
 
-namespace continuo::transport {
+namespace Mira::transport {
 namespace {
 
 class ResolverCategory final : public std::error_category {
 public:
-    const char* name() const noexcept override { return "continuo.resolver"; }
+    const char* name() const noexcept override { return "Mira.resolver"; }
     std::string message(int code) const override {
-#if CONTINUO_PLATFORM_WINDOWS
+#if MIRA_PLATFORM_WINDOWS
         const char* text = ::gai_strerrorA(code);
 #else
         const char* text = ::gai_strerror(code);
@@ -64,7 +64,7 @@ Result<void> append_endpoint(Resolver::Endpoints& out, Endpoint endpoint, std::s
 }
 
 Result<Resolver::Endpoints> system_resolve(const ResolveQuery& query, std::size_t limit) {
-#if CONTINUO_PLATFORM_WINDOWS
+#if MIRA_PLATFORM_WINDOWS
     struct Winsock {
         bool started{false};
         ~Winsock() { if (started) ::WSACleanup(); }
@@ -81,11 +81,11 @@ Result<Resolver::Endpoints> system_resolve(const ResolveQuery& query, std::size_
     hints.ai_protocol = query.transport == ResolveTransport::tcp ? IPPROTO_TCP : IPPROTO_UDP;
     addrinfo* raw = nullptr;
     const int status = ::getaddrinfo(query.hostname.c_str(), query.service.c_str(), &hints, &raw);
-#if !CONTINUO_PLATFORM_WINDOWS
+#if !MIRA_PLATFORM_WINDOWS
     const int saved_errno = errno;
 #endif
     const std::unique_ptr<addrinfo, decltype(&::freeaddrinfo)> addresses{raw, &::freeaddrinfo};
-#if !CONTINUO_PLATFORM_WINDOWS
+#if !MIRA_PLATFORM_WINDOWS
     if (status == EAI_SYSTEM) return fail(socket_error(saved_errno));
 #endif
     if (status != 0) return fail(resolver_error(status));
@@ -305,4 +305,4 @@ Task<Result<Resolver::Endpoints>> Resolver::resolve(EventLoop& loop, ResolveQuer
     return Impl::resolve(impl_ ? impl_->state : nullptr, loop, std::move(query), std::move(options));
 }
 
-}  // namespace continuo::transport
+}  // namespace Mira::transport

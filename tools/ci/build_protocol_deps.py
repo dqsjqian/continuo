@@ -59,7 +59,7 @@ def download(cache: Path, name: str, version: str, project: str,
     # 下载中断或校验失败只删除本次临时文件，不覆盖已有归档。
     with tempfile.TemporaryDirectory(prefix="download-", dir=cache) as temporary:
         candidate = Path(temporary) / filename
-        request = urllib.request.Request(url, headers={"User-Agent": "continuo-protocol-deps"})
+        request = urllib.request.Request(url, headers={"User-Agent": "Mira-protocol-deps"})
         with urllib.request.urlopen(request, timeout=60) as response, candidate.open("wb") as output:
             shutil.copyfileobj(response, output)
         if sha256(candidate) != expected:

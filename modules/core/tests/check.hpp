@@ -2,7 +2,7 @@
 
 // Minimal assertion harness.
 //
-// Continuo's core carries no third-party dependency, and that includes its own
+// Miraore carries no third-party dependency, and that includes its own
 // test build: pulling doctest/Catch2 in just to print "1 assertion passed"
 // would make the zero-dependency claim untrue for anyone vendoring the repo.
 // Roughly forty lines buy pass/fail counting, file:line reporting, and a
@@ -11,7 +11,7 @@
 #include <cstdio>
 #include <string_view>
 
-namespace continuo::test {
+namespace Mira::test {
 
 inline int failures = 0;
 inline int checks = 0;
@@ -39,9 +39,9 @@ inline void section(std::string_view name) {
     return failures == 0 ? 0 : 1;
 }
 
-}  // namespace continuo::test
+}  // namespace Mira::test
 
-#define CHECK(expr) ::continuo::test::report((expr), #expr, __FILE__, __LINE__)
+#define CHECK(expr) ::Mira::test::report((expr), #expr, __FILE__, __LINE__)
 
 #define CHECK_THROWS(expr, exception_type)                                                         \
     do {                                                                                           \
@@ -52,5 +52,5 @@ inline void section(std::string_view name) {
             caught = true;                                                                         \
         } catch (...) {                                                                            \
         }                                                                                          \
-        ::continuo::test::report(caught, #expr " throws " #exception_type, __FILE__, __LINE__);    \
+        ::Mira::test::report(caught, #expr " throws " #exception_type, __FILE__, __LINE__);    \
     } while (false)

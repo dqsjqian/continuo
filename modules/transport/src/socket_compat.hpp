@@ -6,9 +6,9 @@
 // so the rest of the module reads as ordinary C++. Nothing here does I/O; it
 // only creates, configures, and inspects sockets.
 
-#include "continuo/core/platform.hpp"
+#include "Mira/core/platform.hpp"
 
-#if CONTINUO_PLATFORM_WINDOWS
+#if MIRA_PLATFORM_WINDOWS
 // clang-format off
     #include <winsock2.h>
     #include <ws2tcpip.h>
@@ -25,15 +25,15 @@
     #include <unistd.h>
 #endif
 
-#include "continuo/core/error.hpp"
-#include "continuo/core/platform.hpp"
+#include "Mira/core/error.hpp"
+#include "Mira/core/platform.hpp"
 
 #include <cstddef>
 #include <cstring>
 
-namespace continuo::transport::detail {
+namespace Mira::transport::detail {
 
-#if CONTINUO_PLATFORM_WINDOWS
+#if MIRA_PLATFORM_WINDOWS
 using socket_t = SOCKET;
 using socklen_type = int;
 inline constexpr socket_t invalid_socket = INVALID_SOCKET;
@@ -45,7 +45,7 @@ inline constexpr socket_t invalid_socket = -1;
 
 /// Last socket error as an `std::error_code` in the system category.
 [[nodiscard]] inline Error last_socket_error() noexcept {
-#if CONTINUO_PLATFORM_WINDOWS
+#if MIRA_PLATFORM_WINDOWS
     return socket_error(::WSAGetLastError());
 #else
     return socket_error(errno);
@@ -57,7 +57,7 @@ inline void close_socket(socket_t socket) noexcept {
     if (socket == invalid_socket) {
         return;
     }
-#if CONTINUO_PLATFORM_WINDOWS
+#if MIRA_PLATFORM_WINDOWS
     ::closesocket(socket);
 #else
     ::close(socket);
@@ -66,7 +66,7 @@ inline void close_socket(socket_t socket) noexcept {
 
 /// Create a TCP socket suitable for overlapped/non-blocking use.
 [[nodiscard]] inline Result<socket_t> create_tcp_socket(int family) {
-#if CONTINUO_PLATFORM_WINDOWS
+#if MIRA_PLATFORM_WINDOWS
     // WSA_FLAG_OVERLAPPED is required for IOCP; a socket() call without it
     // silently produces a handle the completion port cannot drive.
     const socket_t socket =
@@ -99,7 +99,7 @@ inline void close_socket(socket_t socket) noexcept {
 /// Set a boolean socket option.
 [[nodiscard]] inline Result<void> set_flag(socket_t socket, int level, int option, bool enabled) {
     const int value = enabled ? 1 : 0;
-#if CONTINUO_PLATFORM_WINDOWS
+#if MIRA_PLATFORM_WINDOWS
     const int status =
         ::setsockopt(socket, level, option, reinterpret_cast<const char*>(&value), sizeof(value));
 #else
@@ -122,7 +122,7 @@ inline void close_socket(socket_t socket) noexcept {
 ///     TIME_WAIT reuse is a separate concern handled below.
 [[nodiscard]] inline Result<void>
 apply_exclusive_bind(socket_t socket, bool exclusive, bool reuse_after_close) {
-#if CONTINUO_PLATFORM_WINDOWS
+#if MIRA_PLATFORM_WINDOWS
     // SO_EXCLUSIVEADDRUSE already permits rebinding a port this process left
     // in TIME_WAIT, so Windows needs no separate switch for it — the flag is
     // meaningful only on the POSIX branch below.
@@ -208,7 +208,7 @@ apply_exclusive_bind(socket_t socket, bool exclusive, bool reuse_after_close) {
 
 /// Half-close the sending direction.
 [[nodiscard]] inline Result<void> shutdown_write(socket_t socket) {
-#if CONTINUO_PLATFORM_WINDOWS
+#if MIRA_PLATFORM_WINDOWS
     const int how = SD_SEND;
 #else
     const int how = SHUT_WR;
@@ -219,4 +219,4 @@ apply_exclusive_bind(socket_t socket, bool exclusive, bool reuse_after_close) {
     return Result<void>{};
 }
 
-}  // namespace continuo::transport::detail
+}  // namespace Mira::transport::detail
