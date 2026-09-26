@@ -50,7 +50,9 @@ add_library(continuo_warnings INTERFACE)
 add_library(continuo::warnings ALIAS continuo_warnings)
 
 if(MSVC)
-    target_compile_options(continuo_warnings INTERFACE /W4 /permissive-)
+    # Sources are UTF-8. Without /utf-8, MSVC assumes the active code page
+    # and C4819 (a hard error under /WX) fires on CJK-locale Windows hosts.
+    target_compile_options(continuo_warnings INTERFACE /W4 /permissive- /utf-8)
     if(CONTINUO_WARNINGS_AS_ERRORS)
         target_compile_options(continuo_warnings INTERFACE /WX)
     endif()
