@@ -184,7 +184,7 @@ if(MIRA_INSTALL)
 
     configure_package_config_file(
         cmake/mira-config.cmake.in
-        ${CMAKE_CURRENT_BINARY_DIR}/Mira-config.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/MiraConfig.cmake
         INSTALL_DESTINATION ${MIRA_CMAKE_DESTINATION}
     )
 
@@ -192,13 +192,13 @@ if(MIRA_INSTALL)
     # minor one is where breaking changes land, so 0.2 must not satisfy a
     # request for 0.3. See CHANGELOG.md for the policy this encodes.
     write_basic_package_version_file(
-        ${CMAKE_CURRENT_BINARY_DIR}/Mira-config-version.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/MiraConfigVersion.cmake
         COMPATIBILITY SameMinorVersion
     )
 
     install(FILES
-        ${CMAKE_CURRENT_BINARY_DIR}/Mira-config.cmake
-        ${CMAKE_CURRENT_BINARY_DIR}/Mira-config-version.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/MiraConfig.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/MiraConfigVersion.cmake
         DESTINATION ${MIRA_CMAKE_DESTINATION}
     )
 endif()
