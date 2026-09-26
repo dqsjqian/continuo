@@ -178,12 +178,12 @@ if(MIRA_INSTALL)
     endforeach()
 
     if(MIRA_ENABLE_HTTP3)
-        install(FILES cmake/Mira-http3-dependencies.cmake
+        install(FILES cmake/mira-http3-dependencies.cmake
             DESTINATION ${MIRA_CMAKE_DESTINATION})
     endif()
 
     configure_package_config_file(
-        cmake/Mira-config.cmake.in
+        cmake/mira-config.cmake.in
         ${CMAKE_CURRENT_BINARY_DIR}/Mira-config.cmake
         INSTALL_DESTINATION ${MIRA_CMAKE_DESTINATION}
     )

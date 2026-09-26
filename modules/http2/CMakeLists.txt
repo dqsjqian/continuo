@@ -17,7 +17,7 @@ set_target_properties(mira_http2 PROPERTIES OUTPUT_NAME Mira-http2
     VERSION ${PROJECT_VERSION} EXPORT_NAME http2)
 mira_install_module(mira_http2)
 if(MIRA_INSTALL)
-    install(FILES cmake/FindNGHTTP2.cmake cmake/Mira-http2-dependencies.cmake
+    install(FILES cmake/FindNGHTTP2.cmake cmake/mira-http2-dependencies.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/Mira)
 endif()
 if(MIRA_BUILD_TESTS)
